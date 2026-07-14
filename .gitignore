@@ -34,6 +34,9 @@ references/
 __pycache__/
 *.pyc
 
+# Local scratch / export artifacts
+.tmp/
+
 # Local DB / logs / OS cruft
 *.db
 *.db-wal

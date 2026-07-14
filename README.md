@@ -169,12 +169,10 @@ reads from the one before it, so run them in sequence the first time.
    resource extension. Harvested reference samples remain lossless PCM for voice cloning.
 
    Generation keeps the original TLK text for display/export, but prepares a separate
-   OmniVoice transcript. The default **stage-direction mapper** converts supported cues
+   OmniVoice transcript. The **stage-direction mapper** always converts supported cues
    in place (`*sigh*` → `[sigh]`, laugh/gasp variants likewise). Cues without a model
    control, including `*sniff*` and `*breath*`, are stripped along with unknown `*...*`
-   and game `[...]` annotations. Disable it beside the batch settings if
-   you prefer strip-only behavior; changing it resets completed generation state so clips
-   cannot silently retain the old transcript. Upgrading from a build that emitted unsupported
+   and game `[...]` annotations. Upgrading from a build that emitted unsupported
    `[sniff]` / `[breath]` tags automatically returns affected clips to pending and clears only
    overrides containing those tags.
 
@@ -202,9 +200,9 @@ reads from the one before it, so run them in sequence the first time.
    across sessions. Overrides are local machine state and are not included in
    project-transfer bundles.
 
-   **Leave the mapper checkbox on** on the Generation screen (the default). Most agent
-   work is `review` — marking a unique string as looked-at while the mapper turns supported
-   cues such as `*sigh*` into OmniVoice tags and strips unsupported cues. Use `tag` only when you
+   The mapper always runs for lines without an override. Most agent work is `review` —
+   marking a unique string as looked-at while the mapper turns supported cues such as
+   `*sigh*` into OmniVoice tags and strips unsupported cues. Use `tag` only when you
    want a deliberate override; those always win over the mapper. Review markers do not
    lock in synthesis text — they only track workflow progress on the Review screen.
 

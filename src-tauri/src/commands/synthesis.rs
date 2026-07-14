@@ -11,14 +11,8 @@ use crate::models::{
 };
 use crate::AppState;
 
-fn mapper_enabled(conn: &rusqlite::Connection) -> Result<bool, AppError> {
-    Ok(crate::commands::settings::read_setting(
-        conn,
-        crate::extractor::spoken_text::TAG_MAPPER_SETTING,
-    )?
-    .as_deref()
-    .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
-    .unwrap_or(true))
+fn mapper_enabled() -> bool {
+    true
 }
 
 fn project_id(conn: &rusqlite::Connection, game_dir: &str) -> Result<Option<i64>, AppError> {
@@ -44,7 +38,7 @@ pub async fn get_line_synthesis_preview(
         .optional()?
         .ok_or_else(|| AppError::Other(format!("line {line_id} not found")))?;
     let resolved =
-        crate::synthesis::resolve_synthesis_text(&conn, &display_text, mapper_enabled(&conn)?)?;
+        crate::synthesis::resolve_synthesis_text(&conn, &display_text, mapper_enabled())?;
     Ok(SynthesisPreview {
         shared_line_count: crate::synthesis::shared_line_count(&conn, &display_text)?,
         display_text,
@@ -129,7 +123,7 @@ pub async fn list_synthesis_decisions(
         kind,
         after.unwrap_or(0),
         limit.unwrap_or(50),
-        mapper_enabled(&conn)?,
+        mapper_enabled(),
     )
 }
 
@@ -170,7 +164,7 @@ pub async fn synthesis_corpus_audit_summary(
             stale_reviews_cleared: 0,
         });
     };
-    crate::synthesis::corpus_audit_summary(&conn, project_id, mapper_enabled(&conn)?)
+    crate::synthesis::corpus_audit_summary(&conn, project_id, mapper_enabled())
 }
 
 #[tauri::command]
@@ -193,7 +187,7 @@ pub async fn list_synthesis_flagged(
         project_id,
         after.unwrap_or(0),
         limit.unwrap_or(50),
-        mapper_enabled(&conn)?,
+        mapper_enabled(),
         undecided_only.unwrap_or(true),
     )
 }
@@ -217,7 +211,7 @@ pub async fn list_synthesis_remaining(
         project_id,
         after.unwrap_or(0),
         limit.unwrap_or(50),
-        mapper_enabled(&conn)?,
+        mapper_enabled(),
     )
 }
 
@@ -230,5 +224,5 @@ pub async fn auto_review_synthesis_plain(
     let Some(project_id) = project_id(&conn, &game_dir)? else {
         return Ok(AutoReviewPlainResult { reviewed: 0 });
     };
-    crate::synthesis::auto_review_plain(&conn, project_id, mapper_enabled(&conn)?)
+    crate::synthesis::auto_review_plain(&conn, project_id, mapper_enabled())
 }

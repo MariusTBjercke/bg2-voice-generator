@@ -28,16 +28,6 @@ pub async fn set_setting(
         return Err(AppError::Other("setting key must not be empty".into()));
     }
     let conn = state.db.lock().await;
-    let old_mapper = if key == crate::extractor::spoken_text::TAG_MAPPER_SETTING {
-        Some(
-            read_setting(&conn, key)?
-                .as_deref()
-                .map(setting_enabled)
-                .unwrap_or(true),
-        )
-    } else {
-        None
-    };
     let trimmed = value.trim();
     if trimmed.is_empty() {
         conn.execute(
@@ -51,24 +41,7 @@ pub async fn set_setting(
             rusqlite::params![key, trimmed],
         )?;
     }
-    if let Some(old_enabled) = old_mapper {
-        let new_enabled = read_setting(&conn, key)?
-            .as_deref()
-            .map(setting_enabled)
-            .unwrap_or(true);
-        if old_enabled != new_enabled {
-            conn.execute(
-                "UPDATE generation SET status='pending', output_path=NULL \
-                 WHERE status IN ('done','running')",
-                [],
-            )?;
-        }
-    }
     Ok(())
-}
-
-fn setting_enabled(value: &str) -> bool {
-    value != "0" && !value.eq_ignore_ascii_case("false")
 }
 
 /// Non-command helper: read a setting directly from a held connection. Returns `None`

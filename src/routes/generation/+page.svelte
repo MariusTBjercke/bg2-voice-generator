@@ -71,7 +71,6 @@
   // Batch-tuning settings keys + their backend defaults (mirror generator::batch).
   const KEY_BATCH_SIZE = "omnivoice_batch_size";
   const KEY_CHAR_BUDGET = "omnivoice_batch_char_budget";
-  const KEY_TAG_MAPPER = "synthesis_tag_mapper_enabled";
   const KEY_CHARNAME_STANDIN = "placeholder_charname";
   const DEFAULT_BATCH_SIZE = 8;
   const DEFAULT_CHAR_BUDGET = 800;
@@ -117,7 +116,6 @@
   // these are string|number|null and get normalized back to strings on save.
   let batchSize = $state<string | number | null>("");
   let charBudget = $state<string | number | null>("");
-  let tagMapperEnabled = $state(true);
   let charnameStandIn = $state("");
   let savingSettings = $state(false);
   let settingsError = $state<string | null>(null);
@@ -708,8 +706,6 @@
     try {
       batchSize = (await invoke<string | null>("get_setting", { key: KEY_BATCH_SIZE })) ?? "";
       charBudget = (await invoke<string | null>("get_setting", { key: KEY_CHAR_BUDGET })) ?? "";
-      const mapper = await invoke<string | null>("get_setting", { key: KEY_TAG_MAPPER });
-      tagMapperEnabled = mapper !== "0" && mapper?.toLowerCase() !== "false";
       charnameStandIn =
         (await invoke<string | null>("get_setting", { key: KEY_CHARNAME_STANDIN })) ?? "";
     } catch (e) {
@@ -726,10 +722,6 @@
     try {
       await invoke<void>("set_setting", { key: KEY_BATCH_SIZE, value: String(batchSize ?? "").trim() });
       await invoke<void>("set_setting", { key: KEY_CHAR_BUDGET, value: String(charBudget ?? "").trim() });
-      await invoke<void>("set_setting", {
-        key: KEY_TAG_MAPPER,
-        value: tagMapperEnabled ? "1" : "0",
-      });
     } catch (e) {
       settingsError = String(e);
     } finally {
@@ -1177,10 +1169,6 @@
             bind:value={charBudget}
           />
         </div>
-        <label class="tag-mapper">
-          <input type="checkbox" bind:checked={tagMapperEnabled} />
-          Map supported <code>*sigh*</code> / <code>*laugh*</code> cues to OmniVoice tags
-        </label>
         <Button variant="ghost" onclick={saveBatchSettings} disabled={savingSettings}>
           {savingSettings ? "Saving…" : "Save"}
         </Button>
@@ -1651,12 +1639,6 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-1);
-  }
-  .tag-mapper {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    font-size: 0.85rem;
   }
   .batch-field label {
     font-size: 0.8rem;

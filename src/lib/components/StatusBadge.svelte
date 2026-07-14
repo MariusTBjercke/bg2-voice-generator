@@ -3,13 +3,14 @@
 
   type Props = {
     tone?: "neutral" | "success" | "danger" | "warn" | "info";
+    title?: string;
     children: Snippet;
   };
 
-  let { tone = "neutral", children }: Props = $props();
+  let { tone = "neutral", title, children }: Props = $props();
 </script>
 
-<span class="badge {tone}">{@render children()}</span>
+<span class="badge {tone}" {title}>{@render children()}</span>
 
 <style>
   .badge {

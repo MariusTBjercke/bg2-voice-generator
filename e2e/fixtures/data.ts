@@ -414,7 +414,6 @@ export const settings = new Map<string, string | null>([
   ["omnivoice_batch_size", null],
   ["harvest_parallelism", null],
   ["omnivoice_batch_char_budget", null],
-  ["synthesis_tag_mapper_enabled", null],
   ["omnivoice_install_gpu", null],
   ["placeholder_pc_profile", "neutral"],
   ["placeholder_charname_vocative", ""],

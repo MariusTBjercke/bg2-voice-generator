@@ -8,7 +8,7 @@ test.describe("App shell", () => {
 
   test("footer reports a healthy backend", async ({ page }) => {
     await expect(page.getByText(/Backend v0\.1\.0-e2e/)).toBeVisible();
-    await expect(page.getByText(/schema 2/)).toBeVisible();
+    await expect(page.getByText(/schema 1/)).toBeVisible();
   });
 
   test("pipeline nav reaches every screen", async ({ page }) => {

@@ -318,11 +318,36 @@ pub fn set_decision(
         // needs a human-auditioned pool. `auto_approve_best` remains conservative and
         // still resets each identity scope to one automatic winner.
     }
+    let prior_decision: Option<String> = conn
+        .query_row(
+            "SELECT decision FROM reference_sample WHERE id = ?1",
+            params![sample_id],
+            |r| r.get(0),
+        )
+        .optional()?;
     let n = conn.execute(
         "UPDATE reference_sample SET decision = ?2 WHERE id = ?1",
         params![sample_id, decision],
     )?;
+    if prior_decision.as_deref() == Some("approved") && decision != "approved" {
+        invalidate_clones_referencing_sample(conn, sample_id)?;
+    }
     Ok(n > 0)
+}
+
+/// Reset clones that depend on a sample once it leaves the approved pool.
+fn invalidate_clones_referencing_sample(conn: &Connection, sample_id: i64) -> Result<usize, AppError> {
+    let n = conn.execute(
+        "UPDATE clone SET status = 'pending', primary_sample_id = NULL \
+         WHERE status != 'pending' AND (primary_sample_id = ?1 OR id IN \
+            (SELECT clone_id FROM clone_reference WHERE sample_id = ?1))",
+        params![sample_id],
+    )?;
+    conn.execute(
+        "DELETE FROM clone_reference WHERE sample_id = ?1",
+        params![sample_id],
+    )?;
+    Ok(n)
 }
 
 /// Count of what a decision-reset run cleared, surfaced to the command/UI layer.
@@ -1153,6 +1178,30 @@ mod tests {
         assert_eq!(counts.samples_rejected, 2);
         assert_eq!(decision_of(&conn, a), "rejected");
         assert_eq!(decision_of(&conn, b), "rejected");
+    }
+
+    #[test]
+    fn set_decision_clears_clone_when_deapproving_bound_sample() {
+        use crate::db::generation::{clone_for_speaker, set_clone_status, upsert_clone};
+        use crate::models::{BindingSource, CloneStatus};
+
+        let conn = mem_db();
+        let pid = project(&conn);
+        let sid = speaker(&conn, pid, "anno");
+        conn.execute(
+            "INSERT INTO reference_sample (speaker_id, decision, local_derivative_path) \
+             VALUES (?1, 'approved', 'a.wav')",
+            params![sid],
+        )
+        .unwrap();
+        let sample_id = conn.last_insert_rowid();
+        let clone_id = upsert_clone(&conn, sid, sample_id, BindingSource::Default).unwrap();
+        set_clone_status(&conn, clone_id, CloneStatus::Ready).unwrap();
+
+        assert!(set_decision(&conn, sample_id, "pending").unwrap());
+        let clone = clone_for_speaker(&conn, sid).unwrap().unwrap();
+        assert_eq!(clone.status, CloneStatus::Pending);
+        assert!(clone.primary_sample_id.is_none());
     }
 
     #[test]

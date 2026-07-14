@@ -172,9 +172,9 @@ pub struct BindCloneResult {
 
 /// Bind (or rebind) a speaker's voice clone from its approved reference clip.
 /// With `sample_id` the named approved sample is bound as an explicit `override`;
-/// without it the primary approved sample (newest approved with a derivative) is
-/// bound as the factual `default`. When `identity_key` is set, the group is only
-/// a navigation scope: the clone is attached to the exact variant owning the clip.
+/// without it the best approved sample in the group is bound as the factual `default`.
+/// When `identity_key` is set, the clone is attached to the sample owner and
+/// propagated to every variant in that display group.
 #[tauri::command]
 pub async fn bind_clone(
     state: State<'_, AppState>,
@@ -185,7 +185,9 @@ pub async fn bind_clone(
 ) -> Result<BindCloneResult, AppError> {
     let conn = state.db.lock().await;
     let mut pre_sample: Option<i64> = None;
+    let mut display_identity_key: Option<String> = None;
     let mut speaker_id = if let Some(key) = identity_key {
+        display_identity_key = Some(key.clone());
         let game_dir = game_dir
             .ok_or_else(|| AppError::Other("bind_clone with identity_key requires game_dir".into()))?;
         let project_id: i64 = conn
@@ -248,14 +250,26 @@ pub async fn bind_clone(
         params![speaker_id],
         |row| row.get(0),
     )?;
-    crate::db::speaker_groups::propagate_clone_to_group(
-        &conn,
-        project_id,
-        speaker_id,
-        sample_id,
-        source,
-        CloneStatus::Ready,
-    )?;
+    if let Some(key) = display_identity_key.as_deref() {
+        crate::db::speaker_groups::propagate_clone_to_identity_key(
+            &conn,
+            project_id,
+            key,
+            speaker_id,
+            sample_id,
+            source,
+            CloneStatus::Ready,
+        )?;
+    } else {
+        crate::db::speaker_groups::propagate_clone_to_group(
+            &conn,
+            project_id,
+            speaker_id,
+            sample_id,
+            source,
+            CloneStatus::Ready,
+        )?;
+    }
     let clone = clone_for_speaker(&conn, speaker_id)?
         .ok_or_else(|| AppError::Other("clone vanished after upsert".into()))?;
     Ok(BindCloneResult {
@@ -302,18 +316,9 @@ pub async fn auto_bind_all(
         return Ok(AutoBindResult::default());
     };
     let mut result = AutoBindResult::default();
-    let mut stmt = conn.prepare("SELECT id FROM speaker WHERE project_id=?1 ORDER BY id")?;
-    let speaker_ids = stmt
-        .query_map(params![project_id], |row| row.get::<_, i64>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(stmt);
-    let mut seen_identity_keys = std::collections::HashSet::new();
-    for speaker_id in speaker_ids {
-        let identity_key =
-            crate::db::speaker_groups::identity_key_for_speaker(&conn, speaker_id)?;
-        if !seen_identity_keys.insert(identity_key.clone()) {
-            continue;
-        }
+    let display_groups = crate::db::speaker_groups::list_speaker_groups(&conn, project_id)?;
+    for group in display_groups {
+        let identity_key = group.identity_key;
         let member_ids = crate::db::speaker_groups::speaker_ids_in_group(
             &conn,
             project_id,
@@ -384,9 +389,10 @@ pub async fn auto_bind_all(
         match validate_file(Path::new(&derivative)) {
             Ok(_) => {
                 set_clone_status(&conn, clone_id, CloneStatus::Ready)?;
-                crate::db::speaker_groups::propagate_clone_to_group(
+                crate::db::speaker_groups::propagate_clone_to_identity_key(
                     &conn,
                     project_id,
+                    &identity_key,
                     owner_speaker_id,
                     sample_id,
                     source,
@@ -1750,14 +1756,7 @@ fn resolve_job(
         |sample_id| reference_of(conn, sample_id),
     )?;
 
-    let mapper_enabled = crate::commands::settings::read_setting(
-        conn,
-        crate::extractor::spoken_text::TAG_MAPPER_SETTING,
-    )?
-    .as_deref()
-    .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
-    .unwrap_or(true);
-    let spoken = crate::synthesis::resolve_synthesis_text(conn, &text, mapper_enabled)?.text;
+    let spoken = crate::synthesis::resolve_synthesis_text(conn, &text, true)?.text;
     if !crate::extractor::spoken_text::has_speakable_content(&spoken) {
         return Err(AppError::Other(format!(
             "line {line_id} (strref {strref}) has no speakable text after removing stage directions"

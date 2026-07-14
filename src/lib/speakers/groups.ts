@@ -1,4 +1,4 @@
-import type { ReferenceSample, Speaker, SpeakerGroup, SpeakerVariant } from "$lib/types";
+import type { Clone, ReferenceSample, Speaker, SpeakerGroup, SpeakerVariant } from "$lib/types";
 
 /** Identity key for a speaker row (named strref or singleton). */
 export function identityKey(speaker: Pick<Speaker, "id" | "long_name_strref">): string {
@@ -93,6 +93,21 @@ export function representativeVariant(g: SpeakerGroup): SpeakerVariant {
       ? variant
       : best,
   );
+}
+
+/** Personal clone for a display group: representative first, then any sibling variant. */
+export function personalCloneForGroup(
+  group: SpeakerGroup,
+  clonesBySpeaker: Record<number, Clone>,
+): Clone | null {
+  const repId = representativeVariant(group).speaker_id;
+  const repClone = clonesBySpeaker[repId];
+  if (repClone && repClone.binding_source !== "generic") return repClone;
+  for (const variant of group.variants) {
+    const clone = clonesBySpeaker[variant.speaker_id];
+    if (clone && clone.binding_source !== "generic") return clone;
+  }
+  return repClone ?? null;
 }
 
 /** Filter groups by search text (display name or any variant cre_resref). */

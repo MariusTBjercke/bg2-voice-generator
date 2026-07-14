@@ -6,7 +6,7 @@
 //! tags (see `omnivoice_tags`). The stored `line.text` remains untouched; this
 //! generation-time transcript.
 
-/// Default setting key used by the Generation screen and backend.
+/// Default setting key retained for legacy databases; the mapper is always enabled.
 pub const TAG_MAPPER_SETTING: &str = "synthesis_tag_mapper_enabled";
 
 /// Text to send to OmniVoice. With `map_tags`, recognized `*...*` cues become
@@ -71,6 +71,13 @@ pub fn synthesis_text_for_generation(text: &str, map_tags: bool) -> String {
         i += ch.len_utf8();
     }
     collapse_whitespace(&out)
+}
+
+/// True when the mapper strips this unknown `*...*` cue as a non-verbal sound
+/// rather than speaking it as emphasis. Exposed so the corpus audit can tell
+/// "cleanly-stripped non-verbal cue" apart from a genuinely ambiguous one.
+pub fn mapper_strips_unknown_cue(inner: &str) -> bool {
+    should_strip_unknown_asterisk(inner)
 }
 
 fn should_strip_unknown_asterisk(inner: &str) -> bool {

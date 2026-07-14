@@ -4,8 +4,8 @@
 //! Does not mutate generation text — flagging only.
 
 use crate::extractor::spoken_text::{
-    has_speakable_dialogue, intentionally_stripped_cue, omnivoice_tag, stage_direction_cues,
-    synthesis_text_for_generation,
+    has_speakable_dialogue, intentionally_stripped_cue, mapper_strips_unknown_cue, omnivoice_tag,
+    stage_direction_cues, synthesis_text_for_generation,
 };
 use crate::models::CorpusAuditFlag;
 
@@ -46,9 +46,7 @@ pub fn audit_source_and_mapped_text(
     let plain = synthesis_text_for_generation(trimmed, false);
 
     if mapper_enabled && !cues.is_empty() {
-        let has_unknown = cues
-            .iter()
-            .any(|cue| omnivoice_tag(cue).is_none() && !intentionally_stripped_cue(cue));
+        let has_unknown = cues.iter().any(|cue| !mapper_handles_cue_cleanly(cue));
         if has_unknown {
             flags.push(CorpusAuditFlag::StrippedUnknownCue);
         }
@@ -74,9 +72,7 @@ pub fn audit_source_and_mapped_text(
             flags.push(CorpusAuditFlag::PlainOk);
         } else if mapper_enabled
             && !cues.is_empty()
-            && cues
-                .iter()
-                .all(|cue| omnivoice_tag(cue).is_some() || intentionally_stripped_cue(cue))
+            && cues.iter().all(|cue| mapper_handles_cue_cleanly(cue))
         {
             flags.push(CorpusAuditFlag::MappedOk);
         } else if !mapper_enabled && mapped == plain {
@@ -87,10 +83,35 @@ pub fn audit_source_and_mapped_text(
     flags
 }
 
+/// True when the enabled mapper resolves a `*...*` cue deterministically: it is
+/// mapped to a base tag, intentionally stripped, stripped as a denylisted
+/// non-verbal sound, or otherwise preserved verbatim as spoken emphasis (ordinary
+/// words the model voices without agent judgment). Only empty inner text — which
+/// `stage_direction_cues` never surfaces — is treated as unresolved.
+fn mapper_handles_cue_cleanly(cue: &str) -> bool {
+    let resolved_as_tag_or_strip = omnivoice_tag(cue).is_some()
+        || intentionally_stripped_cue(cue)
+        || mapper_strips_unknown_cue(cue);
+    // Any remaining non-empty cue is spoken verbatim as emphasis — also a clean,
+    // deterministic outcome that needs no agent judgment.
+    resolved_as_tag_or_strip || !cue.trim().is_empty()
+}
+
 pub fn needs_agent_attention(flags: &[CorpusAuditFlag]) -> bool {
-    !flags
-        .iter()
-        .all(|flag| matches!(flag, CorpusAuditFlag::PlainOk | CorpusAuditFlag::MappedOk))
+    // These buckets do not need agent judgment, so a review on them must persist:
+    // - PlainOk / MappedOk: mapper output is already correct.
+    // - InterpretiveCandidate: advisory only; the plain output is acceptable.
+    // - NonSpeakable: no pronounceable content remains, so generation skips the
+    //   line entirely — re-flagging it would revert a settled review each audit.
+    !flags.iter().all(|flag| {
+        matches!(
+            flag,
+            CorpusAuditFlag::PlainOk
+                | CorpusAuditFlag::MappedOk
+                | CorpusAuditFlag::InterpretiveCandidate
+                | CorpusAuditFlag::NonSpeakable
+        )
+    })
 }
 
 fn has_unterminated_asterisk(text: &str) -> bool {
@@ -163,9 +184,20 @@ mod tests {
     }
 
     #[test]
-    fn unknown_cue_is_stripped_unknown() {
+    fn denylisted_nonverbal_cue_is_mapped_ok() {
+        // `hic` is a denylisted non-verbal cue the mapper strips cleanly; it is a
+        // clean mapper outcome, not an unknown cue needing agent attention.
         let flags = audit_source_text("*hic* Hello there.", true);
-        assert!(flags.contains(&CorpusAuditFlag::StrippedUnknownCue));
+        assert!(!flags.contains(&CorpusAuditFlag::StrippedUnknownCue));
+        assert!(!needs_agent_attention(&flags));
+    }
+
+    #[test]
+    fn emphasis_asterisk_is_mapped_ok() {
+        // `*you*` is spoken verbatim as emphasis — a clean, deterministic outcome.
+        let flags = audit_source_text("How *dare* you.", true);
+        assert!(!flags.contains(&CorpusAuditFlag::StrippedUnknownCue));
+        assert!(!needs_agent_attention(&flags));
     }
 
     #[test]
@@ -194,7 +226,15 @@ mod tests {
     fn needs_attention_excludes_ok_buckets() {
         assert!(!needs_agent_attention(&[CorpusAuditFlag::PlainOk]));
         assert!(!needs_agent_attention(&[CorpusAuditFlag::MappedOk]));
-        assert!(needs_agent_attention(&[CorpusAuditFlag::StrippedUnknownCue]));
+        // InterpretiveCandidate is advisory only and must not block a plain review.
+        assert!(!needs_agent_attention(&[
+            CorpusAuditFlag::InterpretiveCandidate
+        ]));
+        // NonSpeakable lines are skipped at generation; a review must persist.
+        assert!(!needs_agent_attention(&[CorpusAuditFlag::NonSpeakable]));
+        assert!(needs_agent_attention(&[
+            CorpusAuditFlag::TtsUnfriendlySpelling
+        ]));
     }
 
     #[test]

@@ -26,6 +26,7 @@
   import SpeakerGroupLabel from "$lib/components/SpeakerGroupLabel.svelte";
   import {
     groupForSpeaker,
+    personalCloneForGroup,
     representativeVariant,
     samplesForSpeakerFromCache,
   } from "$lib/speakers/groups";
@@ -59,7 +60,7 @@
   // Binding: turn a speaker's APPROVED reference samples into a bound voice clone
   // (the prerequisite for generation). bind_clone validates the chosen derivative
   // and returns the Clone with its status; it does NOT require the engine. Without
-  // a sample id it binds the best (newest) approved sample as the `default` tier;
+  // Without a sample id it binds the best approved sample in the group as the `default` tier;
   // naming a specific approved sample binds it as an explicit `override`. Approved
   // samples reuse the per-speaker cache the Harvest screen fills. Clone status is
   // cached in the results store so it survives tab switches.
@@ -441,8 +442,11 @@
   const representativeSpeakerId = $derived(
     selected ? representativeVariant(selected).speaker_id : null,
   );
-  const selectedClone = $derived(
-    representativeSpeakerId !== null ? (clones[representativeSpeakerId] ?? null) : null,
+  const selectedClone = $derived(selected ? personalCloneForGroup(selected, clones) : null);
+  const boundSampleId = $derived(
+    selectedClone && selectedClone.binding_source !== "generic"
+      ? selectedClone.primary_sample_id
+      : null,
   );
   // Only APPROVED samples are bindable; highest overall first (matches auto-approve).
   const approvedSamples = $derived(
@@ -765,7 +769,7 @@
         gameDir: dir,
         sampleId,
       });
-      if (repId !== null) setClone(repId, res.clone);
+      setClone(res.clone.speaker_id, res.clone);
       bindWarning = res.duration_warning;
       if (hadClone && repId !== null) reboundIds = new Set(reboundIds).add(repId);
       await Promise.all([loadClones(), loadSpeakersWithLines()]);
@@ -1549,7 +1553,7 @@
           <p class="hint">Select a character to bind its voice clone.</p>
         {:else}
           {@const repId = representativeSpeakerId}
-          {@const clone = repId !== null ? clones[repId] : undefined}
+          {@const clone = selectedClone}
           {@const effective = repId !== null ? effectiveBySpeaker[repId] : undefined}
           <div class="head">
             <h3>{selected.display_name}</h3>
@@ -1624,10 +1628,7 @@
                 {#each approvedSamples as sample (sample.id)}
                   {@const score = scoreOf(sample)}
                   {@const prov = provenanceOf(sample)}
-                  {@const isBound =
-                    !!clone &&
-                    clone.binding_source !== "generic" &&
-                    clone.primary_sample_id === sample.id}
+                  {@const isBound = boundSampleId === sample.id}
                   <li class="pick" class:bound={isBound}>
                     <div class="pick-main">
                       <div class="pick-meta">
@@ -1685,7 +1686,7 @@
                   {:else if clone.binding_source === "override"}
                     Voice: a specific approved sample you picked.
                   {:else}
-                    Voice: the best (newest) approved sample.
+                    Voice: the best approved sample (automatic dialogue preferred, then highest score).
                   {/if}
                 </p>
                 {#if clone.binding_source === "generic"}

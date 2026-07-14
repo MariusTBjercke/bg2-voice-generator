@@ -8,6 +8,7 @@
     setSelectedIdentityKey,
     setGroupSamples,
     clearGroupSamples,
+    setClones,
   } from "$lib/stores/results";
   import { loadSpeakerGroups, invalidateSpeakerGroups } from "$lib/stores/speakerGroups";
   import SpeakerGroupList from "$lib/components/SpeakerGroupList.svelte";
@@ -22,6 +23,7 @@
   import SearchFilterBar from "$lib/components/SearchFilterBar.svelte";
   import { filterItems, type FilterConfig, type FilterValues } from "$lib/filters";
   import {
+    bestApprovedSampleForBinding,
     parseSampleScore,
     sortSamplesByOverallScore,
   } from "$lib/speakers/samples";
@@ -35,6 +37,7 @@
   import { get } from "svelte/store";
   import type {
     AutoApproveResult,
+    Clone,
     HarvestResult,
     ReferenceSample,
     ResetDecisionsResult,
@@ -163,6 +166,23 @@
     selected ? ($results.harvest.samplesByGroup[selected.identity_key] ?? []) : [],
   );
   const sortedSamples = $derived(sortSamplesByOverallScore(samples));
+  const autoBindPick = $derived(bestApprovedSampleForBinding(samples));
+  const clonesBySpeaker = $derived($results.binding.clonesBySpeaker);
+  const boundSampleIds = $derived.by(() => {
+    if (!selected) return new Set<number>();
+    const ids = new Set<number>();
+    for (const variant of selected.variants) {
+      const clone = clonesBySpeaker[variant.speaker_id];
+      if (
+        clone?.status === "ready" &&
+        clone.primary_sample_id !== null &&
+        clone.binding_source !== "generic"
+      ) {
+        ids.add(clone.primary_sample_id);
+      }
+    }
+    return ids;
+  });
   const variantCreBySpeakerId = $derived(
     new Map(
       (selected?.variants ?? []).map((v) => [v.speaker_id, v.cre_resref] as const),
@@ -281,6 +301,16 @@
     }
   }
 
+  async function loadClones() {
+    if (!dir) return;
+    try {
+      const clones = await invoke<Clone[]>("list_clones", { gameDir: dir });
+      setClones(clones);
+    } catch {
+      // Best-effort: bound pill is informational only.
+    }
+  }
+
   async function decide(sample: ReferenceSample, decision: SampleDecision) {
     if (!selected) return;
     const key = selected.identity_key;
@@ -291,7 +321,7 @@
     );
     try {
       await invoke<boolean>("set_sample_decision", { sampleId: sample.id, decision });
-      await loadGroups();
+      await Promise.all([loadGroups(), loadClones()]);
     } catch (e) {
       error = String(e);
       if (selected) {
@@ -459,13 +489,6 @@
   }
 
   const approvedCount = $derived(samples.filter((s) => s.decision === "approved").length);
-  // The sample Binding treats as the speaker's best/default: the NEWEST approved
-  // one with a playable derivative (mirrors approved_primary_sample in the backend).
-  const primarySampleId = $derived(
-    samples
-      .filter((s) => s.decision === "approved" && s.local_derivative_path)
-      .reduce<number | null>((max, s) => (max === null || s.id > max ? s.id : max), null),
-  );
 
   const decisionTone = { approved: "success", rejected: "danger", pending: "neutral" } as const;
 
@@ -475,6 +498,10 @@
 
   $effect(() => {
     if (dir) void loadGroups();
+  });
+
+  $effect(() => {
+    if (dir) void loadClones();
   });
 
   $effect(() => {
@@ -745,8 +772,16 @@
                   <div class="sample-main">
                     <div class="sample-meta">
                       <StatusBadge tone={decisionTone[sample.decision]}>{sample.decision}</StatusBadge>
-                      {#if sample.id === primarySampleId}
-                        <StatusBadge tone="info">binding default</StatusBadge>
+                      {#if autoBindPick && sample.id === autoBindPick.id}
+                        <StatusBadge
+                          tone="info"
+                          title="This sample would be bound if you choose Bind best approved on the Binding screen. Use Bind this there to pick a different approved clip."
+                        >
+                          auto-bind pick
+                        </StatusBadge>
+                      {/if}
+                      {#if boundSampleIds.has(sample.id)}
+                        <StatusBadge tone="success">bound</StatusBadge>
                       {/if}
                       {#if score}
                         <span class="overall">Overall {pct(score.overall)}</span>
@@ -821,6 +856,11 @@
                     >
                       Approve
                     </Button>
+                    {#if sample.decision === "approved" || sample.decision === "rejected"}
+                      <Button variant="ghost" onclick={() => decide(sample, "pending")}>
+                        Clear
+                      </Button>
+                    {/if}
                     <Button
                       variant="danger"
                       onclick={() => decide(sample, "rejected")}
@@ -836,8 +876,12 @@
               {/each}
             </ul>
             <p class="hint audio-note">
-              Preview clips with ▶ Play to pick the best reference. Never share these clips
-              (copyright).
+              <strong>Approve</strong> keeps a clip in the audition pool (multiple approved
+              clips are fine for composite tuning on Binding). <strong>Auto-bind pick</strong>
+              is what <strong>Bind best approved</strong> on Binding would choose; use
+              <strong>Bind this</strong> there to override. <strong>Clear</strong> returns a
+              clip to undecided. Preview clips with ▶ Play to pick the best reference. Never
+              share these clips (copyright).
             </p>
           {/if}
         {/if}

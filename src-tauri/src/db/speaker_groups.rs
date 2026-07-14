@@ -269,17 +269,15 @@ fn rollup_clone(
     }
 }
 
-/// Propagate one speaker's ready clone to every variant in its identity group.
-pub fn propagate_clone_to_group(
+/// Copy one speaker's ready clone to every other member in `member_ids`.
+fn propagate_clone_to_members(
     conn: &Connection,
-    project_id: i64,
     source_speaker_id: i64,
+    member_ids: &[i64],
     primary_sample_id: i64,
     binding_source: BindingSource,
     clone_status: CloneStatus,
 ) -> Result<usize, AppError> {
-    let key = identity_key_for_speaker(conn, source_speaker_id)?;
-    let member_ids = speaker_ids_in_group(conn, project_id, &key)?;
     let source_clone = crate::db::generation::clone_for_speaker(conn, source_speaker_id)?
         .ok_or_else(|| AppError::Other(format!("source speaker {source_speaker_id} has no clone")))?;
     // Validate before copying so one corrupt JSON blob cannot spread across a group.
@@ -287,10 +285,10 @@ pub fn propagate_clone_to_group(
     let source_references = crate::generator::reference::members_for_clone(conn, source_clone.id)?;
     let mut propagated = 0usize;
     for sid in member_ids {
-        if sid == source_speaker_id {
+        if *sid == source_speaker_id {
             continue;
         }
-        if let Some(existing) = crate::db::generation::clone_for_speaker(conn, sid)? {
+        if let Some(existing) = crate::db::generation::clone_for_speaker(conn, *sid)? {
             if existing.primary_sample_id == Some(primary_sample_id)
                 && existing.binding_source == binding_source
                 && existing.status == clone_status
@@ -316,7 +314,7 @@ pub fn propagate_clone_to_group(
                 params![sid, primary_sample_id, binding_source, clone_status, source_clone.render_settings_json],
             )?;
         }
-        let target_clone = crate::db::generation::clone_for_speaker(conn, sid)?
+        let target_clone = crate::db::generation::clone_for_speaker(conn, *sid)?
             .ok_or_else(|| AppError::Other(format!("clone for speaker {sid} vanished")))?;
         conn.execute("DELETE FROM clone_reference WHERE clone_id=?1", [target_clone.id])?;
         for reference in &source_references {
@@ -328,6 +326,48 @@ pub fn propagate_clone_to_group(
         propagated += 1;
     }
     Ok(propagated)
+}
+
+/// Propagate one speaker's ready clone to every variant in its operational identity group.
+pub fn propagate_clone_to_group(
+    conn: &Connection,
+    project_id: i64,
+    source_speaker_id: i64,
+    primary_sample_id: i64,
+    binding_source: BindingSource,
+    clone_status: CloneStatus,
+) -> Result<usize, AppError> {
+    let key = identity_key_for_speaker(conn, source_speaker_id)?;
+    let member_ids = speaker_ids_in_group(conn, project_id, &key)?;
+    propagate_clone_to_members(
+        conn,
+        source_speaker_id,
+        &member_ids,
+        primary_sample_id,
+        binding_source,
+        clone_status,
+    )
+}
+
+/// Propagate one speaker's ready clone to every variant in a UI display group.
+pub fn propagate_clone_to_identity_key(
+    conn: &Connection,
+    project_id: i64,
+    identity_key: &str,
+    source_speaker_id: i64,
+    primary_sample_id: i64,
+    binding_source: BindingSource,
+    clone_status: CloneStatus,
+) -> Result<usize, AppError> {
+    let member_ids = speaker_ids_in_group(conn, project_id, identity_key)?;
+    propagate_clone_to_members(
+        conn,
+        source_speaker_id,
+        &member_ids,
+        primary_sample_id,
+        binding_source,
+        clone_status,
+    )
 }
 
 /// Whether any variant in the speaker's identity group has a personal (`default`/`override`) clone.
@@ -498,6 +538,40 @@ mod tests {
         assert_eq!(jaheira.long_name_strref, Some(100));
         assert_eq!(jaheira.approved_sample_count, 2);
         assert!(jaheira.variants.iter().all(|v| v.approved_sample_count == 1));
+    }
+
+    #[test]
+    fn propagate_clone_to_display_group_without_companion_proof() {
+        let conn = mem_db();
+        let pid = insert_project(&conn);
+        let s1 = insert_speaker(&conn, pid, "anno1", Some(100), Some("Announcer"));
+        let s2 = insert_speaker(&conn, pid, "anno2", Some(100), Some("Announcer"));
+        conn.execute(
+            "INSERT INTO reference_sample (speaker_id, decision, local_derivative_path) \
+             VALUES (?1, 'approved', 'a.wav')",
+            params![s2],
+        )
+        .unwrap();
+        let sample_id = conn.last_insert_rowid();
+        let clone_id = upsert_clone(&conn, s2, sample_id, BindingSource::Override).unwrap();
+        set_clone_status(&conn, clone_id, CloneStatus::Ready).unwrap();
+        let n = propagate_clone_to_identity_key(
+            &conn,
+            pid,
+            "100",
+            s2,
+            sample_id,
+            BindingSource::Override,
+            CloneStatus::Ready,
+        )
+        .unwrap();
+        assert_eq!(n, 1);
+        let sibling = crate::db::generation::clone_for_speaker(&conn, s1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sibling.primary_sample_id, Some(sample_id));
+        assert_eq!(sibling.binding_source, BindingSource::Override);
+        assert_eq!(sibling.status, CloneStatus::Ready);
     }
 
     #[test]
