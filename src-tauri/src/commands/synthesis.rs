@@ -31,12 +31,20 @@ pub async fn get_line_synthesis_preview(
     line_id: i64,
 ) -> Result<SynthesisPreview, AppError> {
     let conn = state.db.lock().await;
-    let display_text: String = conn
-        .query_row("SELECT text FROM line WHERE id=?1", params![line_id], |r| {
-            r.get(0)
-        })
+    let (stored_text, original_text): (String, String) = conn
+        .query_row(
+            "SELECT text, original_text FROM line WHERE id=?1",
+            params![line_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .optional()?
         .ok_or_else(|| AppError::Other(format!("line {line_id} not found")))?;
+    let reps = crate::extractor::token_resolve::read_token_replacements(&conn)?;
+    let display_text = crate::extractor::token_resolve::effective_spoken_text(
+        &original_text,
+        &stored_text,
+        &reps,
+    );
     let resolved =
         crate::synthesis::resolve_synthesis_text(&conn, &display_text, mapper_enabled())?;
     Ok(SynthesisPreview {

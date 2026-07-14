@@ -1721,16 +1721,37 @@ fn resolve_job(
     db_path: &Path,
     line_id: i64,
 ) -> Result<(LineJob, PathBuf, i64), AppError> {
-    let (project_id, strref, text, speaker_id): (i64, i64, String, Option<i64>) = conn
+    let (project_id, strref, stored_text, original_text, speaker_id): (
+        i64,
+        i64,
+        String,
+        String,
+        Option<i64>,
+    ) = conn
         .query_row(
-            "SELECT project_id, strref, text, speaker_id FROM line WHERE id = ?1",
+            "SELECT project_id, strref, text, original_text, speaker_id FROM line WHERE id = ?1",
             params![line_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?
         .ok_or_else(|| AppError::Other(format!("no line with id {line_id}")))?;
     let speaker_id = speaker_id
         .ok_or_else(|| AppError::Other(format!("line {line_id} has no attributed speaker")))?;
+
+    let reps = crate::extractor::token_resolve::read_token_replacements(conn)?;
+    let text = crate::extractor::token_resolve::effective_spoken_text(
+        &original_text,
+        &stored_text,
+        &reps,
+    );
+    if text != stored_text {
+        conn.execute("UPDATE line SET text=?2 WHERE id=?1", params![line_id, &text])?;
+        conn.execute(
+            "UPDATE generation SET status='pending', output_path=NULL \
+             WHERE line_id=?1 AND status IN ('done', 'running')",
+            params![line_id],
+        )?;
+    }
 
     if !crate::extractor::spoken_text::has_speakable_dialogue(&text) {
         return Err(AppError::Other(format!(

@@ -389,10 +389,38 @@ fn replace_global_tokens(text: &str, global: &str) -> String {
                 }
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        // Never cast a raw UTF-8 byte to `char`; multi-byte punctuation becomes mojibake.
+        let ch = text[i..].chars().next().expect("i is within text");
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
+}
+
+/// Spoken text for synthesis/export-side consumers. When a line still has token
+/// source text, re-run stand-in resolution so stale or corrupted `line.text`
+/// self-heals after bugfixes without a full re-scan.
+pub fn effective_spoken_text(
+    original_text: &str,
+    stored_text: &str,
+    reps: &TokenReplacements,
+) -> String {
+    let raw = if !original_text.is_empty() {
+        original_text
+    } else if tokens::has_dynamic_token(stored_text) {
+        stored_text
+    } else {
+        return stored_text.to_string();
+    };
+    if !tokens::has_dynamic_token(raw) {
+        return stored_text.to_string();
+    }
+    let resolved = resolve_tokens(raw, reps);
+    if resolved.unresolved.is_empty() {
+        resolved.spoken
+    } else {
+        stored_text.to_string()
+    }
 }
 
 fn replace_ci_fixing_article(haystack: &str, needle: &str, replacement: &str) -> String {
@@ -588,6 +616,29 @@ mod tests {
         let res = resolve_tokens("Tell <CHARNAME> the truth.", &r);
         assert!(res.unresolved.is_empty());
         assert_eq!(res.spoken, "Tell Hero the truth.");
+    }
+
+    #[test]
+    fn global_token_pass_preserves_unicode_punctuation() {
+        let r = reps();
+        let raw = "I would like that, <CHARNAME>, and—and it would make Quayle proud.";
+        let res = resolve_tokens(raw, &r);
+        assert!(res.unresolved.is_empty());
+        assert_eq!(
+            res.spoken,
+            "I would like that, friend, and—and it would make Quayle proud."
+        );
+    }
+
+    #[test]
+    fn effective_spoken_text_reresolves_from_original() {
+        let r = reps();
+        let original = "I would like that, <CHARNAME>, and—and it would make Quayle proud.";
+        let corrupted = "I would like that, friend, andâ\u{0080}\u{0094}and it would make Quayle proud.";
+        assert_eq!(
+            effective_spoken_text(original, corrupted, &r),
+            "I would like that, friend, and—and it would make Quayle proud."
+        );
     }
 
     #[test]
