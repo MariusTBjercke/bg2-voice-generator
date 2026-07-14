@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "description": "Audio-free example corpus for controlled local OmniVoice quality comparisons. Replace every reference path and transcript in a private copy before running.",
+  "voices": [
+    {
+      "id": "voice_a",
+      "reference_audio": "%BG2_BENCH_VOICE_A%",
+      "reference_text": "EDIT THIS: exact transcript of voice A reference audio."
+    },
+    {
+      "id": "voice_b",
+      "reference_audio": "%BG2_BENCH_VOICE_B%",
+      "reference_text": "EDIT THIS: exact transcript of voice B reference audio."
+    },
+    {
+      "id": "voice_c",
+      "reference_audio": "%BG2_BENCH_VOICE_C%",
+      "reference_text": "EDIT THIS: exact transcript of voice C reference audio."
+    },
+    {
+      "id": "voice_d",
+      "reference_audio": "%BG2_BENCH_VOICE_D%",
+      "reference_text": "EDIT THIS: exact transcript of voice D reference audio."
+    }
+  ],
+  "lines": [
+    { "id": "a_short", "voice_id": "voice_a", "category": "short", "text": "The gate is open." },
+    { "id": "a_medium", "voice_id": "voice_a", "category": "medium", "text": "Meet me beside the old fountain when the market closes." },
+    { "id": "a_long", "voice_id": "voice_a", "category": "long", "text": "We followed the river until dusk, crossed the narrow bridge, and found the missing cart exactly where the merchant said it would be." },
+    { "id": "a_emotional", "voice_id": "voice_a", "category": "emotional", "text": "I cannot believe you came back for me!" },
+    { "id": "a_punctuation", "voice_id": "voice_a", "category": "punctuation_heavy", "text": "Wait—did you hear that? No... perhaps it was only the wind." },
+
+    { "id": "b_short", "voice_id": "voice_b", "category": "short", "text": "Keep your lantern lit." },
+    { "id": "b_medium", "voice_id": "voice_b", "category": "medium", "text": "The captain expects our report before the morning bell." },
+    { "id": "b_long", "voice_id": "voice_b", "category": "long", "text": "Although the road appears quiet, the fresh tracks beside the milestone suggest that several riders passed this way less than an hour ago." },
+    { "id": "b_emotional", "voice_id": "voice_b", "category": "emotional", "text": "Please, do not leave me alone in this place." },
+    { "id": "b_punctuation", "voice_id": "voice_b", "category": "punctuation_heavy", "text": "Three keys, two doors, one chance—which lock do we try first?" },
+
+    { "id": "c_short", "voice_id": "voice_c", "category": "short", "text": "Nothing moves below." },
+    { "id": "c_medium", "voice_id": "voice_c", "category": "medium", "text": "Bring the sealed letter directly to the northern watchtower." },
+    { "id": "c_long", "voice_id": "voice_c", "category": "long", "text": "If the storm reaches us before sunrise, secure the shutters, move the supplies upstairs, and keep everyone away from the flooded courtyard." },
+    { "id": "c_emotional", "voice_id": "voice_c", "category": "emotional", "text": "At last, the whole village is safe!" },
+    { "id": "c_punctuation", "voice_id": "voice_c", "category": "punctuation_heavy", "text": "You promised—twice—that this was safe; now look around!" },
+
+    { "id": "d_short", "voice_id": "voice_d", "category": "short", "text": "Take the second path." },
+    { "id": "d_medium", "voice_id": "voice_d", "category": "medium", "text": "A warm meal and a quiet room are waiting inside." },
+    { "id": "d_long", "voice_id": "voice_d", "category": "long", "text": "Before you sign the agreement, read the final paragraph carefully, because its smallest promise may carry the greatest consequence." },
+    { "id": "d_emotional", "voice_id": "voice_d", "category": "emotional", "text": "No! This cannot be how our story ends." },
+    { "id": "d_punctuation", "voice_id": "voice_d", "category": "punctuation_heavy", "text": "Well, then: maps, rope, water—and absolutely no singing." }
+  ]
+}

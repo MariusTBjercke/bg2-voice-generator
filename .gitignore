@@ -1,0 +1,49 @@
+# Node / SvelteKit
+node_modules/
+/build/
+/.svelte-kit/
+/dist/
+.vite/
+
+# Rust / Tauri
+/src-tauri/target/
+
+# Local-only execution plans (see docs/plans/README.md)
+/docs/plans/**
+!/docs/plans/README.md
+
+# Local-only architecture notes (see docs/adr/README.md)
+/docs/adr/**
+!/docs/adr/README.md
+
+# Local-only (not published; entire tree ignored)
+references/
+
+# Vendored tool binaries + engine runtime (materialized by fetch-tools.ps1;
+# never committed - see AGENTS.md).
+/tools/python/
+/tools/ffmpeg.exe
+/tools/ffprobe.exe
+/tools/weidu.exe
+/tools/THIRD-PARTY-LICENSES/
+/vendor/*.zip
+/vendor/*.tar.gz
+/engine-runtime/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Local DB / logs / OS cruft
+*.db
+*.db-wal
+*.db-shm
+*.log
+tts-check.txt
+Thumbs.db
+.DS_Store
+
+# Playwright (snapshot baselines under e2e/ are committed)
+/test-results/
+/playwright-report/
+/blob-report/

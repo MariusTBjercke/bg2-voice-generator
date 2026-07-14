@@ -1,0 +1,12 @@
+{
+  "identifier": "default",
+  "description": "Default capability for the main window: core IPC plus the dialog/fs/opener/log plugins.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "fs:default",
+    "opener:default",
+    "log:default"
+  ]
+}

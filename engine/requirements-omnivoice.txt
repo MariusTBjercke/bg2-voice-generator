@@ -1,0 +1,16 @@
+# Pinned Python dependencies for the OmniVoice engine, installed into the
+# engine-runtime/ venv on first run (the InstallOmnivoice step: `pip install -r`).
+#
+# torch/torchaudio are NOT listed here: they are installed by a separate step so the
+# wheel index + CUDA tag can vary per GPU (see tts/install.rs `torch_install_args`).
+# Verify these pins against current PyPI on release.
+#
+# omnivoice is pinned EXACTLY (0.1.5): the version the server pipeline is written against.
+transformers==5.3.0
+omnivoice==0.1.5
+fastapi>=0.115
+uvicorn>=0.30
+pydantic>=2.7
+# Neural VAD for the optional harvest speech-verification pass (/vad_batch). Tiny
+# package; runs on the already-installed torch stack (no onnxruntime needed).
+silero-vad==6.2.1

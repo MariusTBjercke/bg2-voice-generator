@@ -1,0 +1,13 @@
+[package]
+name = "bg2-synthesis-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+
+[[bin]]
+name = "bg2-synthesis"
+path = "src/main.rs"
+
+[dependencies]
+bg2-voice-generator = { path = ".." }

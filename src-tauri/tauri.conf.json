@@ -1,0 +1,53 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "BG2 Voice Generator",
+  "version": "0.1.0",
+  "identifier": "com.bg2voicegen.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "BG2 Voice Generator",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 960,
+        "minHeight": 640,
+        "resizable": true,
+        "backgroundColor": "#0c0d0b"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost https://asset.localhost; media-src 'self' asset: blob: http://asset.localhost https://asset.localhost; connect-src 'self' ipc: http://ipc.localhost",
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$TEMP/bg2-voice-generator-*/**/*",
+          "$APPDATA/workspaces/**/*",
+          "$APPLOCALDATA/workspaces/**/*"
+        ]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "shortDescription": "Native WeiDU voice-pack generator for BG2EE.",
+    "longDescription": "Scans an installed BG2EE setup, generates missing dialogue voiceovers with local OmniVoice cloning, and exports a native WeiDU-installed voice pack.",
+    "externalBin": [],
+    "resources": []
+  },
+  "plugins": {}
+}

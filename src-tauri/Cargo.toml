@@ -1,0 +1,50 @@
+[package]
+name = "bg2-voice-generator"
+version = "0.1.0"
+description = "BG2 Voice Generator"
+edition = "2021"
+# tao -> dlopen2 -> dlopen2_derive ships edition 2024, which only parses on Rust
+# >= 1.85; building with an older toolchain fails inside that crate with a cryptic
+# `feature edition2024 is required`. Floor the toolchain here so the error is clear.
+rust-version = "1.85"
+
+# The library is what the Tauri shell links against; the binary is a thin shim
+# that calls `bg2_voice_generator_lib::run()`.
+[lib]
+name = "bg2_voice_generator_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[workspace]
+members = ["bg2-synthesis-cli"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-log = { version = "2", features = ["colored"] }
+
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Local storage (SQLite compiled from source). Schema is defined in item-05; the
+# scaffold ships a versioned migration runner with a single initial migration.
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio = { version = "1", features = ["full"] }
+
+# HTTP - rustls only (no OpenSSL). Used by the OmniVoice subprocess client (item-08).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Export/harvest helpers (used from item-07 onward; declared here so the domain
+# module stubs compile with their intended dependencies available).
+sha2 = "0.10"
+zip = "2"
+tempfile = "3"
+walkdir = "2"
+wait-timeout = "0.2"
