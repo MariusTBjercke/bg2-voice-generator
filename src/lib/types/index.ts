@@ -712,6 +712,7 @@ export interface CompletedGeneration {
   line_id: number;
   output_path: string;
   voice_changed: boolean;
+  text_changed: boolean;
 }
 
 /** Mirror of `commands::generate::RemoveGenerationsResult`. */
@@ -762,6 +763,36 @@ export interface DictionaryWriteResult {
   reset_generations: number;
 }
 
+export type TagMatchKind = "stage_cue" | "whole_word";
+
+export interface TagRule {
+  id: number;
+  find_text: string;
+  tag: string;
+  match_kind: TagMatchKind;
+  enabled: boolean;
+  is_default: boolean;
+  updated_at: string;
+}
+
+export interface TagAppliedRule {
+  id: number;
+  find_text: string;
+  tag: string;
+  match_kind: TagMatchKind;
+}
+
+export interface TagRulesPreview {
+  before: string;
+  after: string;
+  applied_rules: TagAppliedRule[];
+}
+
+export interface TagRuleWriteResult {
+  rule: TagRule | null;
+  reset_generations: number;
+}
+
 export type SynthesisTextSource = "override" | "mapper" | "plain";
 
 /** Generation-only transcript; the displayed/exported TLK text is unchanged. */
@@ -771,6 +802,7 @@ export interface SynthesisPreview {
   source: SynthesisTextSource;
   shared_line_count: number;
   applied_rules: DictionaryAppliedRule[];
+  applied_tag_rules: TagAppliedRule[];
 }
 
 export interface SynthesisWriteResult {
@@ -782,6 +814,8 @@ export interface SynthesisTaggingSummary {
   overridden: number;
   reviewed: number;
   remaining: number;
+  /** Overrides whose generation text fails the override audit (true corpus total). */
+  suspicious: number;
 }
 
 export type SynthesisDecisionKind = "override" | "reviewed" | "suspicious";
@@ -811,6 +845,7 @@ export type CorpusAuditFlag =
   | "plain_ok"
   | "mapped_ok"
   | "stripped_unknown_cue"
+  | "spoken_stage_direction"
   | "unterminated_asterisk"
   | "placement_candidate"
   | "interpretive_candidate"
@@ -822,6 +857,7 @@ export interface SynthesisCorpusAuditSummary {
   plain_ok: number;
   mapped_ok: number;
   stripped_unknown_cue: number;
+  spoken_stage_direction: number;
   unterminated_asterisk: number;
   placement_candidate: number;
   interpretive_candidate: number;

@@ -15,6 +15,7 @@
   import ProgressBar from "$lib/components/ProgressBar.svelte";
   import Pager from "$lib/components/Pager.svelte";
   import SearchFilterBar from "$lib/components/SearchFilterBar.svelte";
+  import ExpandableText from "$lib/components/ExpandableText.svelte";
   import { filterItems, type FilterConfig, type FilterValues } from "$lib/filters";
   import { progress } from "$lib/stores/progress";
   import {
@@ -230,11 +231,6 @@
     }
   }
 
-  function preview(text: string): string {
-    const t = text.replace(/\s+/g, " ").trim();
-    return t.length > 120 ? t.slice(0, 120) + "…" : t;
-  }
-
   const tokenBlockedCount = $derived(
     blocked.filter((l) => l.has_tokens || l.kind === "token").length,
   );
@@ -245,15 +241,6 @@
       if (labels.length) return labels.join(", ");
     }
     return line.has_tokens || line.kind === "token" ? "yes" : "—";
-  }
-
-  function spokenPreview(line: Line): string {
-    return preview(line.text);
-  }
-
-  function originalPreview(line: Line): string | null {
-    if (!line.original_text) return null;
-    return preview(line.original_text);
   }
 </script>
 
@@ -367,8 +354,16 @@
                     <td>{blockedReason(line)}</td>
                     <td>{speakerLabel(line.speaker_id)}</td>
                     <td class="token-labels">{tokenLabels(line)}</td>
-                    <td class="text">{spokenPreview(line)}</td>
-                    <td class="text original">{originalPreview(line) ?? "—"}</td>
+                    <td class="text">
+                      <ExpandableText text={line.text} collapseWhitespace />
+                    </td>
+                    <td class="text original">
+                      {#if line.original_text}
+                        <ExpandableText text={line.original_text} collapseWhitespace />
+                      {:else}
+                        —
+                      {/if}
+                    </td>
                   </tr>
                 {/each}
               </tbody>

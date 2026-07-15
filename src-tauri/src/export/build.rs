@@ -48,12 +48,16 @@ fn assert_generated_ogg(src: &Path) -> Result<(), AppError> {
 /// Write the pack under `out_dir`. `generator_version`/`export_version` stamp the
 /// manifest + tp2. Returns the built pack (root dir + manifest). Overwrites a prior
 /// pack of the same name (re-export is idempotent from the caller's perspective).
+///
+/// When `on_progress` is set it is called once per staged audio line as
+/// `(index_1based, line_total, resref)`.
 pub fn write_pack(
     plan: &PackPlan,
     out_dir: &Path,
     generator_version: &str,
     export_version: &str,
     created_at: &str,
+    mut on_progress: Option<&mut dyn FnMut(usize, usize, &str)>,
 ) -> Result<BuiltPack, AppError> {
     let pack_dir = out_dir.join(&plan.pack_name);
     let audio_dir = pack_dir.join("audio");
@@ -64,10 +68,14 @@ pub fn write_pack(
 
     // Stage each Ogg stream as <RESREF>.wav, validating it first. BG2EE uses the
     // resource extension for lookup and sniffs the Ogg content during playback.
-    for l in &plan.lines {
+    let line_total = plan.lines.len();
+    for (i, l) in plan.lines.iter().enumerate() {
         let src = Path::new(&l.audio_source_path);
         assert_generated_ogg(src)?;
         std::fs::copy(src, audio_dir.join(format!("{}.wav", l.entry.resref)))?;
+        if let Some(progress) = &mut on_progress {
+            progress(i + 1, line_total, &l.entry.resref);
+        }
     }
 
     std::fs::write(tra_dir.join("setup.tra"), tp2::emit_tra(plan))?;
@@ -147,7 +155,7 @@ mod tests {
         let source = tiny_ogg();
         std::fs::write(&src, &source).unwrap();
         let out = dir.path().join("exports");
-        let built = write_pack(&plan_with(&src), &out, "0.1.0", "1", "now").unwrap();
+        let built = write_pack(&plan_with(&src), &out, "0.1.0", "1", "now", None).unwrap();
         let p = &built.pack_dir;
         assert!(p.join("BG2VG.tp2").exists());
         assert!(p.join("audio/Z0H6A00.wav").exists());
@@ -164,7 +172,7 @@ mod tests {
         let src = dir.path().join("legacy.wav");
         std::fs::write(&src, b"RIFF legacy PCM").unwrap();
         let err =
-            write_pack(&plan_with(&src), &dir.path().join("o"), "0.1.0", "1", "now").unwrap_err();
+            write_pack(&plan_with(&src), &dir.path().join("o"), "0.1.0", "1", "now", None).unwrap_err();
         assert!(err
             .to_string()
             .contains("not generated ogg_vorbis_q6_22050_mono"));

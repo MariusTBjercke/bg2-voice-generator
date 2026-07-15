@@ -1,6 +1,12 @@
 import type { DemographicGroup, EffectiveSpeakerBinding, Line, Speaker } from "$lib/types";
 
-export type GenerationRenderState = "missing" | "generated" | "voice_changed" | "running" | "failed";
+export type GenerationRenderState =
+  | "missing"
+  | "generated"
+  | "voice_changed"
+  | "text_changed"
+  | "running"
+  | "failed";
 export type GenerationBindingMode = "demographic" | "personal";
 export type GenerationPackAudio = "absent" | "present";
 
@@ -27,7 +33,10 @@ export interface GenerationScopeItem {
   speaker: Speaker | null;
   demographic: DemographicGroup | null;
   binding: EffectiveSpeakerBinding | null;
+  /** Primary state for display/sort. */
   renderState: GenerationRenderState;
+  /** All applicable render facets (a line can be both voice- and text-changed). */
+  renderStates: GenerationRenderState[];
 }
 
 export type GenerationScopeArrayKey =
@@ -209,7 +218,10 @@ export function matchesGenerationScope(item: GenerationScopeItem, scope: Generat
   if (!matchesSelected(scope.bindingModes, binding?.clone_id ? (binding.inherited ? "demographic" : "personal") : null)) return false;
   if (!matchesSelected(scope.donors, donorToken(item))) return false;
   if (!matchesSelected(scope.dlgs, line.dlg_resref)) return false;
-  if (!matchesSelected(scope.renderStates, item.renderState)) return false;
+  if (scope.renderStates.length > 0
+    && !scope.renderStates.some((value) => item.renderStates.includes(value as GenerationRenderState))) {
+    return false;
+  }
   if (!matchesSelected(scope.lineStates, line.status)) return false;
   if (!matchesSelected(scope.packAudio, line.is_voiced || line.existing_sound_resref ? "present" : "absent")) return false;
 

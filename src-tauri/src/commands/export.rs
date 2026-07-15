@@ -18,6 +18,7 @@ use tauri::{AppHandle, State};
 use crate::commands::progress::{ProgressEmitter, OP_EXPORT};
 use crate::db::export::{insert_fingerprint, list_export_candidates, record_export};
 use crate::error::AppError;
+use crate::export::zip::count_zip_entries;
 use crate::export::{assemble, write_pack, zip_pack};
 use crate::fingerprint;
 use crate::AppState;
@@ -25,6 +26,11 @@ use crate::AppState;
 /// The export format version. Bump when the tp2/pack layout contract changes so a
 /// pack's `export_version` is meaningful across app releases.
 const EXPORT_VERSION: &str = "3";
+
+/// Fixed progress units outside the per-line staging and per-entry ZIP loops.
+const EXPORT_PLANNING_STEPS: u64 = 1;
+const EXPORT_METADATA_STEPS: u64 = 1;
+const EXPORT_DB_STEPS: u64 = 1;
 
 /// Outcome of a pack build. Mirror of `ExportResult` in `src/lib/types/index.ts`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,10 +48,9 @@ pub struct ExportResult {
     pub mod_state_hash: String,
 }
 
-/// Build the native WeiDU voice pack for `game_dir`'s project. Emits a coarse
-/// (indeterminate) `operation://progress` phase around the build so the shell can
-/// show a live "exporting" state (item-06b); the pack assembly is a single unit of
-/// work, so only the start + terminal phases are emitted.
+/// Build the native WeiDU voice pack for `game_dir`'s project. Emits determinate
+/// `operation://progress` while staging audio, writing the pack folder, and creating
+/// the self-contained ZIP.
 #[tauri::command]
 pub async fn build_export(
     app: AppHandle,
@@ -55,13 +60,13 @@ pub async fn build_export(
     pack_name: Option<String>,
 ) -> Result<ExportResult, AppError> {
     let mut emitter = ProgressEmitter::new(app, OP_EXPORT);
-    emitter.finish("running", 0, None, Some("Building WeiDU pack…".to_string()));
-    let result = build_export_inner(&state, game_dir, locale, pack_name).await;
+    let result =
+        build_export_inner(&state, game_dir, locale, pack_name, &mut emitter).await;
     match &result {
         Ok(r) => emitter.finish(
             "done",
-            1,
-            None,
+            r.patched_lines as u64,
+            Some(r.patched_lines as u64),
             Some(format!("{} lines patched, {} deferred", r.patched_lines, r.deferred_lines)),
         ),
         Err(e) => emitter.finish("error", 0, None, Some(e.to_string())),
@@ -75,9 +80,12 @@ async fn build_export_inner(
     game_dir: String,
     locale: Option<String>,
     pack_name: Option<String>,
+    emitter: &mut ProgressEmitter,
 ) -> Result<ExportResult, AppError> {
     let generator_version = env!("CARGO_PKG_VERSION");
     let pack_name = pack_name.unwrap_or_else(|| "BG2VG_Voices".to_string());
+
+    emitter.tick(0, None, Some("Planning export…".to_string()));
 
     // Fingerprint capture is IO but holds no DB lock.
     let fp = fingerprint::capture(Path::new(&game_dir), locale.as_deref(), generator_version)?;
@@ -85,6 +93,7 @@ async fn build_export_inner(
     let conn = state.db.lock().await;
     let project_id = resolve_project(&conn, &game_dir)?;
     let candidates = list_export_candidates(&conn, project_id)?;
+    drop(conn);
 
     // No existing-resref set to consult here (the target's live override/ is read at
     // WeiDU install time via FILE_EXISTS_IN_GAME); the plan still dedups within itself.
@@ -96,17 +105,80 @@ async fn build_export_inner(
         )));
     }
 
+    let line_count = plan.lines.len() as u64;
+    let bundle_weidu = state.tools.weidu.as_ref().is_some_and(|w| w.exists());
+    let zip_estimate = (plan.lines.len() + 5 + usize::from(bundle_weidu)) as u64;
+    let mut total = EXPORT_PLANNING_STEPS
+        + line_count
+        + EXPORT_METADATA_STEPS
+        + zip_estimate
+        + EXPORT_DB_STEPS;
+    emitter.tick(
+        EXPORT_PLANNING_STEPS,
+        Some(total),
+        Some(format!("Staging audio… 0 / {line_count} lines")),
+    );
+
     let out_dir = exports_dir(&state.db_path, project_id);
     std::fs::create_dir_all(&out_dir)?;
     let created_at = chrono::Utc::now().to_rfc3339();
-    let built = write_pack(&plan, &out_dir, generator_version, EXPORT_VERSION, &created_at)?;
 
+    let staging_base = EXPORT_PLANNING_STEPS;
+    let built = write_pack(
+        &plan,
+        &out_dir,
+        generator_version,
+        EXPORT_VERSION,
+        &created_at,
+        Some(&mut |done, line_total, resref| {
+            emitter.tick(
+                staging_base + done as u64,
+                Some(total),
+                Some(format!("Staging audio… {resref} ({done}/{line_total})")),
+            );
+        }),
+    )?;
+
+    let after_staging = staging_base + line_count;
+    emitter.tick(
+        after_staging + EXPORT_METADATA_STEPS,
+        Some(total),
+        Some("Creating ZIP…".to_string()),
+    );
+
+    let zip_count = count_zip_entries(&built.pack_dir, bundle_weidu) as u64;
+    total = EXPORT_PLANNING_STEPS
+        + line_count
+        + EXPORT_METADATA_STEPS
+        + zip_count
+        + EXPORT_DB_STEPS;
+
+    let zip_base = after_staging + EXPORT_METADATA_STEPS;
     // Bundle the folder + vendored WeiDU into the self-contained pack ZIP (item-10). In a
     // portable layout `tools.weidu` is the bundled installer; in dev it is None and the ZIP
     // ships without a setup exe (the folder is still a valid WeiDU mod).
-    let zipped = zip_pack(&built.pack_dir, &fp.edition, state.tools.weidu.as_deref())?;
+    let zipped = zip_pack(
+        &built.pack_dir,
+        &fp.edition,
+        state.tools.weidu.as_deref(),
+        Some(&mut |done, entry_total, name| {
+            emitter.tick(
+                zip_base + done as u64,
+                Some(total),
+                Some(format!("Creating ZIP… {name} ({done}/{entry_total})")),
+            );
+        }),
+    )?;
     let pack_zip = Some(zipped.zip_path.to_string_lossy().to_string());
 
+    let after_zip = zip_base + zip_count;
+    emitter.tick(
+        after_zip + EXPORT_DB_STEPS,
+        Some(total),
+        Some("Recording export…".to_string()),
+    );
+
+    let conn = state.db.lock().await;
     let fp_id = insert_fingerprint(&conn, project_id, &fp, EXPORT_VERSION)?;
     let pack_dir = built.pack_dir.to_string_lossy().to_string();
     let export_id = record_export(

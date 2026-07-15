@@ -83,6 +83,10 @@ import type {
   DictionaryAppliedRule,
   DictionaryPreview,
   DictionaryWriteResult,
+  TagRule,
+  TagAppliedRule,
+  TagRulesPreview,
+  TagRuleWriteResult,
   SynthesisPreview,
   SynthesisWriteResult,
   SynthesisTaggingSummary,
@@ -236,8 +240,8 @@ describe('TS<->Rust model contract (mirror of models.rs contract_tests)', () => 
       .toEqual(want('line_id', 'status', 'output_path', 'error'));
     expect(keys(s<BatchGenResult>({ total: 0, generated: 0, resumed: 0, failed: 0, outcomes: [] })))
       .toEqual(want('total', 'generated', 'resumed', 'failed', 'outcomes'));
-    expect(keys(s<CompletedGeneration>({ line_id: 0, output_path: '', voice_changed: false })))
-      .toEqual(want('line_id', 'output_path', 'voice_changed'));
+    expect(keys(s<CompletedGeneration>({ line_id: 0, output_path: '', voice_changed: false, text_changed: false })))
+      .toEqual(want('line_id', 'output_path', 'voice_changed', 'text_changed'));
     expect(keys(s<RemoveGenerationsResult>({ records_removed: 0, files_deleted: 0, files_missing: 0 })))
       .toEqual(want('records_removed', 'files_deleted', 'files_missing'));
     expect(keys(s<InstallResult>({ installed_python: '', steps_run: 0, skipped: false })))
@@ -250,12 +254,20 @@ describe('TS<->Rust model contract (mirror of models.rs contract_tests)', () => 
       .toEqual(want('before', 'after', 'applied_rules'));
     expect(keys(s<DictionaryWriteResult>({ rule: null, reset_generations: 0 })))
       .toEqual(want('rule', 'reset_generations'));
-    expect(keys(s<SynthesisPreview>({ display_text: '', resolved_text: '', source: 'mapper', shared_line_count: 0, applied_rules: [] })))
-      .toEqual(want('display_text', 'resolved_text', 'source', 'shared_line_count', 'applied_rules'));
+    expect(keys(s<TagRule>({ id: 0, find_text: '', tag: '', match_kind: 'stage_cue', enabled: true, is_default: false, updated_at: '' })))
+      .toEqual(want('id', 'find_text', 'tag', 'match_kind', 'enabled', 'is_default', 'updated_at'));
+    expect(keys(s<TagAppliedRule>({ id: 0, find_text: '', tag: '', match_kind: 'whole_word' })))
+      .toEqual(want('id', 'find_text', 'tag', 'match_kind'));
+    expect(keys(s<TagRulesPreview>({ before: '', after: '', applied_rules: [] })))
+      .toEqual(want('before', 'after', 'applied_rules'));
+    expect(keys(s<TagRuleWriteResult>({ rule: null, reset_generations: 0 })))
+      .toEqual(want('rule', 'reset_generations'));
+    expect(keys(s<SynthesisPreview>({ display_text: '', resolved_text: '', source: 'mapper', shared_line_count: 0, applied_rules: [], applied_tag_rules: [] })))
+      .toEqual(want('display_text', 'resolved_text', 'source', 'shared_line_count', 'applied_rules', 'applied_tag_rules'));
     expect(keys(s<SynthesisWriteResult>({ reset_generations: 0 })))
       .toEqual(want('reset_generations'));
-    expect(keys(s<SynthesisTaggingSummary>({ unique_strings: 0, overridden: 0, reviewed: 0, remaining: 0 })))
-      .toEqual(want('unique_strings', 'overridden', 'reviewed', 'remaining'));
+    expect(keys(s<SynthesisTaggingSummary>({ unique_strings: 0, overridden: 0, reviewed: 0, remaining: 0, suspicious: 0 })))
+      .toEqual(want('unique_strings', 'overridden', 'reviewed', 'remaining', 'suspicious'));
     expect(keys(s<SynthesisDecisionRow>({ line_id: 0, strref: 0, source_text: '', mapped_text: '', synthesis_text: '', shared_line_count: 0, audit_reason: '' })))
       .toEqual(want('line_id', 'strref', 'source_text', 'mapped_text', 'synthesis_text', 'shared_line_count', 'audit_reason'));
     expect(keys(s<ListSynthesisDecisionsResult>({ rows: [], next_after: null })))
@@ -264,12 +276,12 @@ describe('TS<->Rust model contract (mirror of models.rs contract_tests)', () => 
       .toEqual(want('overrides_cleared', 'reviews_cleared', 'generations_reset'));
     expect(keys(s<SynthesisCorpusAuditSummary>({
       unique_strings: 0, plain_ok: 0, mapped_ok: 0, stripped_unknown_cue: 0,
-      unterminated_asterisk: 0, placement_candidate: 0, interpretive_candidate: 0,
+      spoken_stage_direction: 0, unterminated_asterisk: 0, placement_candidate: 0, interpretive_candidate: 0,
       tts_unfriendly_spelling: 0, non_speakable: 0, flagged_undecided: 0,
       stale_reviews_cleared: 0,
     }))).toEqual(want(
       'unique_strings', 'plain_ok', 'mapped_ok', 'stripped_unknown_cue',
-      'unterminated_asterisk', 'placement_candidate', 'interpretive_candidate',
+      'spoken_stage_direction', 'unterminated_asterisk', 'placement_candidate', 'interpretive_candidate',
       'tts_unfriendly_spelling', 'non_speakable', 'flagged_undecided',
       'stale_reviews_cleared',
     ));

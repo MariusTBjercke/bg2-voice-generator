@@ -29,6 +29,7 @@ pub fn open_db(data_dir: &Path) -> Result<Connection, AppError> {
     tune_connection(&conn)?;
     schema::run_migrations(&mut conn)?;
     crate::dictionary::ensure_default_rules(&conn)?;
+    crate::tag_rules::ensure_default_rules(&conn)?;
     Ok(conn)
 }
 

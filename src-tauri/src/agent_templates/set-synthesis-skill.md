@@ -11,6 +11,11 @@ directly.
 
 Run `bg2-synthesis catalog` for the full allowed inline tag list.
 
+For **recurring** spoken-word → tag patterns (for example every bare `Bah` should become
+`[dissatisfaction-hnn]`), prefer a machine-wide **Tag rule** via the Dictionary screen or
+`bg2-synthesis tag-rule add --find Bah --tag "[dissatisfaction-hnn]" --match whole_word`
+instead of per-line overrides. Keep `tag --line` / `tag --batch` for one-off delivery.
+
 ## Named pacing presets (rare)
 
 For a line whose pacing is clearly wrong in context, use the bounded presets in
@@ -36,14 +41,18 @@ render candidate audio, audition audio, or accept a candidate: agents cannot hea
    (no `*...*` cues; mapper output equals plain strip).
 3. `list-flagged --project <id> --limit 500 --after <last-id>` — **primary work queue**.
    Each entry shows `original`, `mapped`, and `flags` explaining why it was flagged.
-4. Per flagged entry, compare `original` vs `mapped`:
+4. Optional: `list-untagged --project <id> --limit 500 --after <last-id>` — **every undecided
+   string**, including non-flagged `mapped_ok` lines. Use this only when explicitly asked to
+   sweep beyond flagged work or to spot-check mapper output the audit treats as clean.
+5. Per flagged entry, compare `original` vs `mapped`:
    - **`tag`** (prefer batch JSON) when tag placement should move, a stripped unknown cue
      clearly matches a catalog tag, or a rare interpretive catalog tag is unambiguous.
    - **`review`** when mapper output is acceptable.
-5. **Never** bulk `review` lines with `*` cues without comparing columns.
-6. Run `progress --project <id>` before finishing.
+6. **Never** bulk `review` lines with `*` cues without comparing columns.
+7. Run `progress --project <id>` before finishing.
 
 `list-untagged` remains available for legacy paging, but **`list-flagged` is the main queue**.
+The Review UI also has a **Remaining** tab with the same undecided breadth as `list-untagged`.
 
 ## Overrides are final generation text
 
@@ -83,6 +92,7 @@ For English, attach an inline tag without whitespace before it when it follows p
 |------|---------|----------------|
 | `plain_ok` | No cues; plain strip is fine | Already handled by `auto-review-plain` |
 | `mapped_ok` | Cues handled cleanly (mapped or deliberately stripped) | `review` if you agree |
+| `spoken_stage_direction` | Mapper spoke a `*...*` cue as ordinary words (likely stage direction or onomatopoeia) | Compare columns; `tag` to strip/fix, or `review` if acceptable |
 | `stripped_unknown_cue` | Unknown `*...*` stripped | `tag` if a catalog tag fits; else `review` |
 | `unterminated_asterisk` | Unclosed `*` in source | Inspect; `tag` fix or `review` |
 | `placement_candidate` | Tag spacing after `.?!…` looks suboptimal | Compare columns; `tag` if clearly better |

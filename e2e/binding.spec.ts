@@ -103,17 +103,29 @@ test.describe("Guided voice binding", () => {
   });
 
   test("keeps the demographic page after an in-group action refreshes data", async ({ page }) => {
-    const groupsCard = page.getByRole("heading", { name: /Demographic groups/ }).locator("..");
-    await groupsCard.getByRole("button", { name: "Next page" }).click();
-    await expect(groupsCard.getByText("2 / 2", { exact: true })).toBeVisible();
+    const groupsPanel = page.locator("#demographic-groups-panel");
+    await groupsPanel.getByRole("button", { name: "Next page" }).click();
+    await expect(groupsPanel.getByText("2 / 2", { exact: true })).toBeVisible();
 
-    const group = groupsCard.locator("li.group-row").filter({ hasText: "Fixture sex 30" });
+    const group = groupsPanel.locator("li.group-row").filter({ hasText: "Fixture sex 30" });
     await group.getByRole("button").first().click();
     await group.locator("select.donor-select").first().selectOption("1");
     await group.getByRole("button", { name: "Add", exact: true }).click();
 
-    await expect(groupsCard.getByText("2 / 2", { exact: true })).toBeVisible();
+    await expect(groupsPanel.getByText("2 / 2", { exact: true })).toBeVisible();
     await expect(group).toBeVisible();
+  });
+
+  test("can collapse demographic groups and character lists", async ({ page }) => {
+    const groupsToggle = page.getByRole("button", { name: /Demographic groups/ });
+    await groupsToggle.click();
+    await expect(page.locator("#demographic-groups-panel")).toBeHidden();
+    await expect(groupsToggle).toHaveAttribute("aria-expanded", "false");
+
+    const charactersToggle = page.getByRole("button", { name: /Characters \(2\)/ });
+    await charactersToggle.click();
+    await expect(page.locator("#characters-list-panel")).toBeHidden();
+    await expect(charactersToggle).toHaveAttribute("aria-expanded", "false");
   });
 
   test("keeps the desktop speaker column bounded with vertical-only scrolling", async ({ page }) => {

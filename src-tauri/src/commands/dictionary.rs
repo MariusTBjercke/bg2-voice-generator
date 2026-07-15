@@ -39,6 +39,7 @@ pub async fn upsert_dictionary_rule(
 ) -> Result<DictionaryWriteResult, AppError> {
     let mut conn = state.db.lock().await;
     let (find_text, speak_as) = crate::dictionary::validate_rule_text(&find_text, &speak_as)?;
+    let mut stale_finds = vec![find_text.clone()];
     if let Some(id) = id {
         let existing = crate::dictionary::rule_by_id(&conn, id)?
             .ok_or_else(|| AppError::Other(format!("dictionary rule {id} not found")))?;
@@ -46,6 +47,9 @@ pub async fn upsert_dictionary_rule(
             return Err(AppError::Other(
                 "built-in dictionary rules may only be enabled or disabled".into(),
             ));
+        }
+        if existing.find_text != find_text {
+            stale_finds.push(existing.find_text);
         }
     }
     let tx = conn.transaction()?;
@@ -65,7 +69,9 @@ pub async fn upsert_dictionary_rule(
         )?;
         tx.last_insert_rowid()
     };
-    let reset_generations = crate::dictionary::reset_completed_generations(&tx)?;
+    let find_refs: Vec<&str> = stale_finds.iter().map(String::as_str).collect();
+    let reset_generations =
+        crate::dictionary::mark_matching_generations_synthesis_stale_many(&tx, &find_refs)?;
     tx.commit()?;
     Ok(DictionaryWriteResult {
         rule: crate::dictionary::rule_by_id(&conn, rule_id)?,
@@ -80,9 +86,8 @@ pub async fn set_dictionary_rule_enabled(
     enabled: bool,
 ) -> Result<DictionaryWriteResult, AppError> {
     let mut conn = state.db.lock().await;
-    if crate::dictionary::rule_by_id(&conn, id)?.is_none() {
-        return Err(AppError::Other(format!("dictionary rule {id} not found")));
-    }
+    let existing = crate::dictionary::rule_by_id(&conn, id)?
+        .ok_or_else(|| AppError::Other(format!("dictionary rule {id} not found")))?;
     let tx = conn.transaction()?;
     let changed = tx.execute(
         "UPDATE dictionary_rule SET enabled=?1,updated_at=?2 WHERE id=?3 AND enabled<>?1",
@@ -91,7 +96,7 @@ pub async fn set_dictionary_rule_enabled(
     let reset_generations = if changed == 0 {
         0
     } else {
-        crate::dictionary::reset_completed_generations(&tx)?
+        crate::dictionary::mark_matching_generations_synthesis_stale(&tx, &existing.find_text)?
     };
     tx.commit()?;
     Ok(DictionaryWriteResult {
@@ -114,8 +119,9 @@ pub async fn delete_dictionary_rule(
         ));
     }
     let tx = conn.transaction()?;
+    let reset_generations =
+        crate::dictionary::mark_matching_generations_synthesis_stale(&tx, &existing.find_text)?;
     tx.execute("DELETE FROM dictionary_rule WHERE id=?1", [id])?;
-    let reset_generations = crate::dictionary::reset_completed_generations(&tx)?;
     tx.commit()?;
     Ok(DictionaryWriteResult {
         rule: None,
@@ -138,7 +144,12 @@ pub async fn reset_dictionary_defaults(
             params![speak_as, now, find_text],
         )?;
     }
-    let reset_generations = crate::dictionary::reset_completed_generations(&tx)?;
+    let finds: Vec<&str> = crate::dictionary_defaults::DEFAULT_DICTIONARY_RULES
+        .iter()
+        .map(|(find, _)| *find)
+        .collect();
+    let reset_generations =
+        crate::dictionary::mark_matching_generations_synthesis_stale_many(&tx, &finds)?;
     tx.commit()?;
     Ok(DictionaryWriteResult {
         rule: None,

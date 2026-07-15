@@ -7,7 +7,10 @@
 //! Emotion labels such as `[angry]` / `[sad]` belong to community forks (e.g.
 //! omnivoice-singing), not the base checkpoint this app ships.
 
+use std::collections::HashMap;
+
 use crate::error::AppError;
+use crate::tag_rule_defaults::DEFAULT_STAGE_CUE_TAG_RULES;
 
 /// Every inline tag agents and overrides may emit (full bracket form).
 pub const SUPPORTED_INLINE_TAGS: &[&str] = &[
@@ -26,16 +29,71 @@ pub const SUPPORTED_INLINE_TAGS: &[&str] = &[
     "[dissatisfaction-hnn]",
 ];
 
-/// Map a BG2 `*...*` stage-direction inner string to an OmniVoice inline tag.
+/// True when `tag` is a full bracket form in [`SUPPORTED_INLINE_TAGS`].
+pub fn is_supported_inline_tag(tag: &str) -> bool {
+    SUPPORTED_INLINE_TAGS.contains(&tag)
+}
+
+/// Built-in stage-cue → tag lookup (same rows seeded into `tag_rule`).
+pub fn default_stage_cue_map() -> HashMap<String, &'static str> {
+    DEFAULT_STAGE_CUE_TAG_RULES
+        .iter()
+        .map(|(find, tag)| ((*find).to_owned(), *tag))
+        .collect()
+}
+
+/// Map a BG2 `*...*` stage-direction inner string to an OmniVoice inline tag
+/// using the built-in defaults (tests + fallback when no DB rules are loaded).
 pub fn stage_direction_to_tag(cue: &str) -> Option<&'static str> {
-    match cue.trim().to_ascii_lowercase().as_str() {
-        "sigh" | "sighs" | "sighing" => Some("[sigh]"),
-        "laugh" | "laughs" | "laughing" | "laughter" | "chuckle" | "chuckles" | "chuckling"
-        | "giggle" | "giggles" | "giggling" => Some("[laughter]"),
-        "gasp" | "gasps" | "gasping" => Some("[surprise-ah]"),
-        "surprised" | "surprise" => Some("[surprise-oh]"),
-        "hmm" | "hmph" | "hnn" | "grumble" | "grumbles" => Some("[dissatisfaction-hnn]"),
-        _ => None,
+    stage_direction_to_tag_in(cue, &default_stage_cue_map())
+}
+
+/// Map a cue using an arbitrary normalized-find → tag map (DB-enabled stage_cue rules).
+pub fn stage_direction_to_tag_in<'a>(
+    cue: &str,
+    map: &HashMap<String, &'a str>,
+) -> Option<&'a str> {
+    for variant in cue_lookup_variants(cue) {
+        if let Some(tag) = map.get(&variant) {
+            return Some(*tag);
+        }
+    }
+    None
+}
+
+/// Owned-string variant for maps loaded from SQLite.
+pub fn stage_direction_to_tag_owned(cue: &str, map: &HashMap<String, String>) -> Option<String> {
+    for variant in cue_lookup_variants(cue) {
+        if let Some(tag) = map.get(&variant) {
+            return Some(tag.clone());
+        }
+    }
+    None
+}
+
+/// Normalized cue tokens to try for tag/strip lookup (full cue, then repeated-word head).
+pub(crate) fn cue_lookup_variants(cue: &str) -> Vec<String> {
+    let normalized = normalize_cue_token(cue);
+    let mut variants = vec![normalized.clone()];
+    if let Some(first) = repeated_word_cue(&normalized) {
+        variants.push(first.to_owned());
+    }
+    variants
+}
+
+pub(crate) fn normalize_cue_token(cue: &str) -> String {
+    cue.trim()
+        .trim_end_matches(|c: char| c == '!' || c == '?')
+        .to_ascii_lowercase()
+}
+
+/// When BG2 repeats a stage-direction word (`*grumble grumble*`), map via the first token.
+fn repeated_word_cue(normalized: &str) -> Option<&str> {
+    let words: Vec<&str> = normalized.split_whitespace().collect();
+    if words.len() >= 2 && words.iter().all(|word| *word == words[0]) {
+        Some(words[0])
+    } else {
+        None
     }
 }
 
@@ -131,5 +189,38 @@ mod tests {
     fn maps_gasp_and_hmph_stage_directions() {
         assert_eq!(stage_direction_to_tag("gasp"), Some("[surprise-ah]"));
         assert_eq!(stage_direction_to_tag("hmph"), Some("[dissatisfaction-hnn]"));
+    }
+
+    #[test]
+    fn maps_repeated_word_stage_directions() {
+        assert_eq!(
+            stage_direction_to_tag("grumble grumble"),
+            Some("[dissatisfaction-hnn]")
+        );
+        assert_eq!(
+            stage_direction_to_tag("GRUMBLE GRUMBLE"),
+            Some("[dissatisfaction-hnn]")
+        );
+        assert_eq!(stage_direction_to_tag("sigh sigh"), Some("[sigh]"));
+        assert_eq!(stage_direction_to_tag("does does"), None);
+        assert_eq!(stage_direction_to_tag("cackle"), Some("[laughter]"));
+        assert_eq!(stage_direction_to_tag("Achoo!"), None);
+    }
+
+    #[test]
+    fn cue_lookup_variants_include_repeated_word_head() {
+        let variants = cue_lookup_variants("sob sob");
+        assert!(variants.contains(&"sob sob".to_string()));
+        assert!(variants.contains(&"sob".to_string()));
+    }
+
+    #[test]
+    fn defaults_cover_former_hardcoded_mapper_aliases() {
+        assert!(default_stage_cue_map().contains_key("sighs"));
+        assert!(default_stage_cue_map().contains_key("cackling"));
+        assert_eq!(
+            default_stage_cue_map().get("grumble"),
+            Some(&"[dissatisfaction-hnn]")
+        );
     }
 }

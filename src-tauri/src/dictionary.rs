@@ -86,6 +86,69 @@ pub fn reset_completed_generations(conn: &Connection) -> Result<usize, AppError>
     )?)
 }
 
+/// Mark completed clips whose spoken line text matches `find_text` as
+/// synthesis-stale. Clips stay playable; the Generation screen surfaces them as
+/// "text changed" so the user can re-render selectively.
+pub fn mark_matching_generations_synthesis_stale(
+    conn: &Connection,
+    find_text: &str,
+) -> Result<usize, AppError> {
+    let find = find_text.trim();
+    if find.is_empty() {
+        return Ok(0);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT g.id, l.text FROM generation g \
+         JOIN line l ON l.id = g.line_id \
+         WHERE g.status = 'done' AND g.output_path IS NOT NULL \
+           AND g.synthesis_stale = 0",
+    )?;
+    let candidates = stmt
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    let mut ids = Vec::new();
+    for (id, text) in candidates {
+        if !replacement_ranges(&text, find).is_empty() {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let mut marked = 0usize;
+    for chunk in ids.chunks(500) {
+        let placeholders = chunk
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "UPDATE generation SET synthesis_stale = 1 WHERE id IN ({placeholders})"
+        );
+        marked += conn.execute(&sql, rusqlite::params_from_iter(chunk.iter().copied()))?;
+    }
+    Ok(marked)
+}
+
+/// Mark completed clips matching any of the find strings.
+pub fn mark_matching_generations_synthesis_stale_many(
+    conn: &Connection,
+    find_texts: &[&str],
+) -> Result<usize, AppError> {
+    let mut total = 0usize;
+    let mut seen = HashSet::new();
+    for find in find_texts {
+        let key = find.trim().to_ascii_lowercase();
+        if key.is_empty() || !seen.insert(key) {
+            continue;
+        }
+        total += mark_matching_generations_synthesis_stale(conn, find)?;
+    }
+    Ok(total)
+}
+
 pub fn validate_rule_text(find_text: &str, speak_as: &str) -> Result<(String, String), AppError> {
     let find_text = find_text.trim().to_string();
     let speak_as = speak_as.trim().to_string();
@@ -108,7 +171,8 @@ fn is_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '\''
 }
 
-fn replacement_ranges(text: &str, find: &str) -> Vec<(usize, usize)> {
+/// Whole-word (case-insensitive) match ranges; shared with tag rules.
+pub(crate) fn replacement_ranges(text: &str, find: &str) -> Vec<(usize, usize)> {
     if find.is_empty() {
         return vec![];
     }
@@ -223,5 +287,48 @@ mod tests {
             .collect();
         assert_eq!(matching.len(), 1);
         assert_eq!(matching[0].speak_as, "custom");
+    }
+
+    #[test]
+    fn dictionary_marks_matching_done_clips_text_stale_without_clearing_path() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::run_migrations(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO project(id,game_root,edition,active_language,generator_version,created_at) \
+             VALUES(1,'/g','bg2ee','en_US','0.1.0','now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO line(id,project_id,strref,text,kind,is_voiced,has_tokens,status) \
+             VALUES(1,1,1,'Bah! Fine.','state',0,0,'ready'),\
+                    (2,1,2,'Hello there.','state',0,0,'ready')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO generation(line_id,status,output_path) \
+             VALUES(1,'done','/a.ogg'),(2,'done','/b.ogg')",
+            [],
+        )
+        .unwrap();
+        let marked = mark_matching_generations_synthesis_stale(&conn, "Bah").unwrap();
+        assert_eq!(marked, 1);
+        let bah: (i64, Option<String>) = conn
+            .query_row(
+                "SELECT synthesis_stale,output_path FROM generation WHERE line_id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let other: i64 = conn
+            .query_row(
+                "SELECT synthesis_stale FROM generation WHERE line_id=2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bah, (1, Some("/a.ogg".into())));
+        assert_eq!(other, 0);
     }
 }

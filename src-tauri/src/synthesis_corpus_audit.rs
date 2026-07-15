@@ -4,8 +4,9 @@
 //! Does not mutate generation text — flagging only.
 
 use crate::extractor::spoken_text::{
-    has_speakable_dialogue, intentionally_stripped_cue, mapper_strips_unknown_cue, omnivoice_tag,
-    stage_direction_cues, synthesis_text_for_generation,
+    cue_spoken_stage_direction_risk_with, has_speakable_dialogue, intentionally_stripped_cue,
+    mapper_strips_unknown_cue, omnivoice_tag, stage_direction_cues,
+    synthesis_text_for_generation,
 };
 use crate::models::CorpusAuditFlag;
 
@@ -27,6 +28,15 @@ pub fn audit_source_and_mapped_text(
     mapped: &str,
     mapper_enabled: bool,
 ) -> Vec<CorpusAuditFlag> {
+    audit_source_and_mapped_text_with_cues(source, mapped, mapper_enabled, None)
+}
+
+pub fn audit_source_and_mapped_text_with_cues(
+    source: &str,
+    mapped: &str,
+    mapper_enabled: bool,
+    cue_map: Option<&std::collections::HashMap<String, String>>,
+) -> Vec<CorpusAuditFlag> {
     let trimmed = source.trim();
     if trimmed.is_empty() {
         return vec![CorpusAuditFlag::NonSpeakable];
@@ -46,7 +56,15 @@ pub fn audit_source_and_mapped_text(
     let plain = synthesis_text_for_generation(trimmed, false);
 
     if mapper_enabled && !cues.is_empty() {
-        let has_unknown = cues.iter().any(|cue| !mapper_handles_cue_cleanly(cue));
+        if cues
+            .iter()
+            .any(|cue| cue_spoken_stage_direction_risk_with(cue, cue_map))
+        {
+            flags.push(CorpusAuditFlag::SpokenStageDirection);
+        }
+        let has_unknown = cues
+            .iter()
+            .any(|cue| !mapper_handles_cue_cleanly_with(cue, cue_map));
         if has_unknown {
             flags.push(CorpusAuditFlag::StrippedUnknownCue);
         }
@@ -72,7 +90,9 @@ pub fn audit_source_and_mapped_text(
             flags.push(CorpusAuditFlag::PlainOk);
         } else if mapper_enabled
             && !cues.is_empty()
-            && cues.iter().all(|cue| mapper_handles_cue_cleanly(cue))
+            && cues
+                .iter()
+                .all(|cue| mapper_handles_cue_cleanly_with(cue, cue_map))
         {
             flags.push(CorpusAuditFlag::MappedOk);
         } else if !mapper_enabled && mapped == plain {
@@ -88,10 +108,16 @@ pub fn audit_source_and_mapped_text(
 /// non-verbal sound, or otherwise preserved verbatim as spoken emphasis (ordinary
 /// words the model voices without agent judgment). Only empty inner text — which
 /// `stage_direction_cues` never surfaces — is treated as unresolved.
-fn mapper_handles_cue_cleanly(cue: &str) -> bool {
-    let resolved_as_tag_or_strip = omnivoice_tag(cue).is_some()
-        || intentionally_stripped_cue(cue)
-        || mapper_strips_unknown_cue(cue);
+fn mapper_handles_cue_cleanly_with(
+    cue: &str,
+    cue_map: Option<&std::collections::HashMap<String, String>>,
+) -> bool {
+    let tagged = match cue_map {
+        Some(map) => crate::omnivoice_tags::stage_direction_to_tag_owned(cue, map).is_some(),
+        None => omnivoice_tag(cue).is_some(),
+    };
+    let resolved_as_tag_or_strip =
+        tagged || intentionally_stripped_cue(cue) || mapper_strips_unknown_cue(cue);
     // Any remaining non-empty cue is spoken verbatim as emphasis — also a clean,
     // deterministic outcome that needs no agent judgment.
     resolved_as_tag_or_strip || !cue.trim().is_empty()
@@ -196,8 +222,31 @@ mod tests {
     fn emphasis_asterisk_is_mapped_ok() {
         // `*you*` is spoken verbatim as emphasis — a clean, deterministic outcome.
         let flags = audit_source_text("How *dare* you.", true);
+        assert!(!flags.contains(&CorpusAuditFlag::SpokenStageDirection));
         assert!(!flags.contains(&CorpusAuditFlag::StrippedUnknownCue));
         assert!(!needs_agent_attention(&flags));
+    }
+
+    #[test]
+    fn spoken_stage_direction_flags_unknown_sound_like_cues() {
+        let flags = audit_source_text("That is amusing. *grin*", true);
+        assert!(flags.contains(&CorpusAuditFlag::SpokenStageDirection));
+        assert!(needs_agent_attention(&flags));
+        assert!(!flags.contains(&CorpusAuditFlag::MappedOk));
+    }
+
+    #[test]
+    fn spoken_stage_direction_flags_elongated_onomatopoeia() {
+        let flags = audit_source_text("*Grrrrrowwwwrrr* Work harder!", true);
+        assert!(flags.contains(&CorpusAuditFlag::SpokenStageDirection));
+        assert!(needs_agent_attention(&flags));
+    }
+
+    #[test]
+    fn resolved_cues_are_not_spoken_stage_direction_risks() {
+        let flags = audit_source_text("(Well... it was all right, I suppose.) *clap* *clap*", true);
+        assert!(!flags.contains(&CorpusAuditFlag::SpokenStageDirection));
+        assert_eq!(flags, vec![CorpusAuditFlag::MappedOk]);
     }
 
     #[test]

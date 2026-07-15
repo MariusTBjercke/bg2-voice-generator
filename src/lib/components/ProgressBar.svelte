@@ -41,7 +41,7 @@
     <div class="fill" style={determinate ? `width:${pct}%` : ""}></div>
   </div>
   {#if message}
-    <p class="message">{message}</p>
+    <p class="message" title={message}>{message}</p>
   {/if}
 </div>
 

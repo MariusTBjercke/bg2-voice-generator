@@ -7,7 +7,6 @@ use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
-use crate::extractor::spoken_text::synthesis_text_for_generation;
 use crate::models::{
     AutoReviewPlainResult, CorpusAuditFlag, DictionaryAppliedRule, ListSynthesisDecisionsResult,
     ListSynthesisFlaggedResult, ListSynthesisReviewResult, SynthesisAgentResetResult,
@@ -21,6 +20,7 @@ pub struct ResolvedSynthesisText {
     pub text: String,
     pub source: SynthesisTextSource,
     pub applied_rules: Vec<DictionaryAppliedRule>,
+    pub applied_tag_rules: Vec<crate::models::TagAppliedRule>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,9 +70,11 @@ pub fn resolve_synthesis_text(
             text,
             source: SynthesisTextSource::Override,
             applied_rules: vec![],
+            applied_tag_rules: vec![],
         });
     }
-    let (text, applied_rules) = mapped_synthesis_text(conn, line_text, mapper_enabled)?;
+    let (text, applied_rules, applied_tag_rules) =
+        mapped_synthesis_text(conn, line_text, mapper_enabled)?;
     Ok(ResolvedSynthesisText {
         text,
         source: if mapper_enabled {
@@ -81,6 +83,7 @@ pub fn resolve_synthesis_text(
             SynthesisTextSource::Plain
         },
         applied_rules,
+        applied_tag_rules,
     })
 }
 
@@ -88,14 +91,39 @@ pub fn mapped_synthesis_text(
     conn: &Connection,
     line_text: &str,
     mapper_enabled: bool,
-) -> Result<(String, Vec<DictionaryAppliedRule>), AppError> {
+) -> Result<
+    (
+        String,
+        Vec<DictionaryAppliedRule>,
+        Vec<crate::models::TagAppliedRule>,
+    ),
+    AppError,
+> {
     let rules = crate::dictionary::load_enabled_rules(conn)?;
     let (dictionary_text, applied_rules) =
         crate::dictionary::apply_dictionary_rules(line_text, &rules);
-    Ok((
-        synthesis_text_for_generation(&dictionary_text, mapper_enabled),
-        applied_rules,
-    ))
+    let tag_rules = crate::tag_rules::load_enabled_rules(conn)?;
+    let (text, applied_tag_rules) =
+        crate::tag_rules::apply_tag_rules(&dictionary_text, &tag_rules, mapper_enabled);
+    Ok((text, applied_rules, applied_tag_rules))
+}
+
+fn audit_flags_for_mapped(
+    conn: &Connection,
+    source: &str,
+    mapped: &str,
+    mapper_enabled: bool,
+) -> Result<Vec<CorpusAuditFlag>, AppError> {
+    let tag_rules = crate::tag_rules::load_enabled_rules(conn)?;
+    let cue_map = crate::tag_rules::stage_cue_tag_map(&tag_rules);
+    Ok(
+        crate::synthesis_corpus_audit::audit_source_and_mapped_text_with_cues(
+            source,
+            mapped,
+            mapper_enabled,
+            Some(&cue_map),
+        ),
+    )
 }
 
 fn line_text(conn: &Connection, line_id: i64) -> Result<String, AppError> {
@@ -130,13 +158,18 @@ fn ensure_string(conn: &Connection, source_text: &str) -> Result<String, AppErro
     Ok(hash)
 }
 
-fn reset_generations_for_text(conn: &Connection, source_text: &str) -> Result<usize, AppError> {
-    Ok(conn.execute(
-        "UPDATE generation SET status='pending', output_path=NULL \
-         WHERE line_id IN (SELECT id FROM line WHERE trim(text)=trim(?1)) \
-         AND status IN ('done','running')",
-        params![source_text],
-    )?)
+fn mark_generations_synthesis_stale_for_text(
+    conn: &Connection,
+    source_text: &str,
+) -> Result<usize, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM line WHERE trim(text)=trim(?1)",
+    )?;
+    let line_ids = stmt
+        .query_map(params![source_text], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    crate::db::generation::mark_generations_synthesis_stale_for_line_ids(conn, &line_ids)
 }
 
 pub fn write_override(
@@ -167,7 +200,7 @@ pub fn write_override(
         "DELETE FROM synthesis_text_reviewed WHERE text_hash=?1",
         params![hash],
     )?;
-    let reset_generations = reset_generations_for_text(&tx, &source_text)?;
+    let reset_generations = mark_generations_synthesis_stale_for_text(&tx, &source_text)?;
     tx.commit()?;
     Ok(SynthesisWriteResult { reset_generations })
 }
@@ -180,7 +213,7 @@ pub fn clear_override(conn: &Connection, line_id: i64) -> Result<SynthesisWriteR
         "DELETE FROM synthesis_text_override WHERE text_hash=?1",
         params![hash],
     )?;
-    let reset_generations = reset_generations_for_text(&tx, &source_text)?;
+    let reset_generations = mark_generations_synthesis_stale_for_text(&tx, &source_text)?;
     tx.commit()?;
     Ok(SynthesisWriteResult { reset_generations })
 }
@@ -238,6 +271,7 @@ fn hash_set(conn: &Connection, table: &str) -> Result<HashSet<String>, AppError>
 pub fn tagging_summary(
     conn: &Connection,
     project_id: Option<i64>,
+    mapper_enabled: bool,
 ) -> Result<SynthesisTaggingSummary, AppError> {
     let texts = project_texts(conn, project_id)?;
     let overrides = hash_set(conn, "synthesis_text_override")?;
@@ -248,12 +282,92 @@ pub fn tagging_summary(
         .iter()
         .filter(|hash| !overrides.contains(*hash) && reviewed_hashes.contains(*hash))
         .count();
+    let suspicious = match project_id {
+        Some(id) => count_suspicious(conn, id, mapper_enabled)?,
+        None => 0,
+    };
     Ok(SynthesisTaggingSummary {
         unique_strings: hashes.len(),
         overridden,
         reviewed,
         remaining: hashes.len().saturating_sub(overridden + reviewed),
+        suspicious,
     })
+}
+
+const QUERY_MAX_CHARS: usize = 200;
+
+fn normalize_query(query: Option<&str>) -> Option<String> {
+    let trimmed = query?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let capped: String = trimmed.chars().take(QUERY_MAX_CHARS).collect();
+    Some(capped.to_lowercase())
+}
+
+fn text_fields_match(fields: &[&str], query: &str) -> bool {
+    fields.iter().any(|field| field.to_lowercase().contains(query))
+}
+
+fn decision_matches_query(row: &SynthesisDecisionRow, query: &str) -> bool {
+    let mut fields = vec![
+        row.source_text.as_str(),
+        row.mapped_text.as_str(),
+    ];
+    if let Some(ref synthesis) = row.synthesis_text {
+        fields.push(synthesis.as_str());
+    }
+    if let Some(ref reason) = row.audit_reason {
+        fields.push(reason.as_str());
+    }
+    text_fields_match(&fields, query)
+}
+
+fn parse_flag_filter(flag: Option<&str>) -> Result<Option<CorpusAuditFlag>, AppError> {
+    let Some(raw) = flag.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    serde_json::from_value(serde_json::Value::String(raw.to_string())).map_err(|_| {
+        AppError::Other(format!(
+            "unknown corpus audit flag filter '{raw}'; expected a CorpusAuditFlag snake_case token"
+        ))
+    })
+}
+
+fn flags_match_filter(flags: &[CorpusAuditFlag], flag: Option<CorpusAuditFlag>) -> bool {
+    match flag {
+        None => true,
+        Some(needed) => flags.contains(&needed),
+    }
+}
+
+fn count_suspicious(
+    conn: &Connection,
+    project_id: i64,
+    mapper_enabled: bool,
+) -> Result<usize, AppError> {
+    let mut count = 0usize;
+    let mut cursor = 0i64;
+    const BATCH: usize = 400;
+    loop {
+        let batch = list_override_rows(conn, project_id, cursor, BATCH)?;
+        if batch.is_empty() {
+            break;
+        }
+        let batch_len = batch.len();
+        for query_row in batch {
+            cursor = query_row.line_id;
+            let decision = row_to_decision(conn, query_row, mapper_enabled)?;
+            if decision.audit_reason.is_some() {
+                count += 1;
+            }
+        }
+        if batch_len < BATCH {
+            break;
+        }
+    }
+    Ok(count)
 }
 
 pub fn undecided_corpus(
@@ -423,21 +537,94 @@ pub fn list_decisions(
     after: i64,
     limit: usize,
     mapper_enabled: bool,
+    query: Option<&str>,
 ) -> Result<ListSynthesisDecisionsResult, AppError> {
     let limit = limit.clamp(1, 100);
+    let query = normalize_query(query);
     match kind {
         SynthesisDecisionKind::Suspicious => {
-            list_suspicious_decisions(conn, project_id, after, limit, mapper_enabled)
+            list_suspicious_decisions(conn, project_id, after, limit, mapper_enabled, query.as_deref())
         }
         SynthesisDecisionKind::Override => {
-            let query_rows = list_override_rows(conn, project_id, after, limit)?;
-            build_list_result(conn, query_rows, mapper_enabled, limit)
+            list_filtered_override_or_reviewed(
+                conn,
+                project_id,
+                after,
+                limit,
+                mapper_enabled,
+                query.as_deref(),
+                true,
+            )
         }
         SynthesisDecisionKind::Reviewed => {
-            let query_rows = list_reviewed_rows(conn, project_id, after, limit)?;
-            build_list_result(conn, query_rows, mapper_enabled, limit)
+            list_filtered_override_or_reviewed(
+                conn,
+                project_id,
+                after,
+                limit,
+                mapper_enabled,
+                query.as_deref(),
+                false,
+            )
         }
     }
+}
+
+fn list_filtered_override_or_reviewed(
+    conn: &Connection,
+    project_id: i64,
+    after: i64,
+    limit: usize,
+    mapper_enabled: bool,
+    query: Option<&str>,
+    overrides: bool,
+) -> Result<ListSynthesisDecisionsResult, AppError> {
+    if query.is_none() {
+        let query_rows = if overrides {
+            list_override_rows(conn, project_id, after, limit)?
+        } else {
+            list_reviewed_rows(conn, project_id, after, limit)?
+        };
+        return build_list_result(conn, query_rows, mapper_enabled, limit);
+    }
+    let mut rows = Vec::new();
+    let mut cursor = after;
+    let mut last_scanned = after;
+    let batch_size = limit.saturating_mul(4).clamp(20, 400);
+    loop {
+        let batch = if overrides {
+            list_override_rows(conn, project_id, cursor, batch_size)?
+        } else {
+            list_reviewed_rows(conn, project_id, cursor, batch_size)?
+        };
+        if batch.is_empty() {
+            break;
+        }
+        let batch_len = batch.len();
+        for query_row in batch {
+            last_scanned = query_row.line_id;
+            let decision = row_to_decision(conn, query_row, mapper_enabled)?;
+            if let Some(q) = query {
+                if !decision_matches_query(&decision, q) {
+                    continue;
+                }
+            }
+            rows.push(decision);
+            if rows.len() >= limit {
+                break;
+            }
+        }
+        cursor = last_scanned;
+        if rows.len() >= limit || batch_len < batch_size {
+            break;
+        }
+    }
+    let next_after = if rows.len() >= limit && last_scanned > after {
+        Some(last_scanned)
+    } else {
+        None
+    };
+    Ok(ListSynthesisDecisionsResult { rows, next_after })
 }
 
 fn build_list_result(
@@ -464,6 +651,7 @@ fn list_suspicious_decisions(
     after: i64,
     limit: usize,
     mapper_enabled: bool,
+    query: Option<&str>,
 ) -> Result<ListSynthesisDecisionsResult, AppError> {
     let mut rows = Vec::new();
     let mut cursor = after;
@@ -478,11 +666,17 @@ fn list_suspicious_decisions(
         for query_row in batch {
             last_scanned = query_row.line_id;
             let decision = row_to_decision(conn, query_row, mapper_enabled)?;
-            if decision.audit_reason.is_some() {
-                rows.push(decision);
-                if rows.len() >= limit {
-                    break;
+            if decision.audit_reason.is_none() {
+                continue;
+            }
+            if let Some(q) = query {
+                if !decision_matches_query(&decision, q) {
+                    continue;
                 }
+            }
+            rows.push(decision);
+            if rows.len() >= limit {
+                break;
             }
         }
         cursor = last_scanned;
@@ -515,20 +709,11 @@ fn delete_hashes_from_table(
     Ok(total)
 }
 
-fn reset_generations_for_line_ids(conn: &Connection, line_ids: &[i64]) -> Result<usize, AppError> {
-    let mut total = 0usize;
-    for chunk in line_ids.chunks(500) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let placeholders = (0..chunk.len()).map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "UPDATE generation SET status='pending', output_path=NULL \
-             WHERE status IN ('done','running') AND line_id IN ({placeholders})"
-        );
-        total += conn.execute(&sql, rusqlite::params_from_iter(chunk.iter()))?;
-    }
-    Ok(total)
+fn mark_generations_synthesis_stale_for_line_ids(
+    conn: &Connection,
+    line_ids: &[i64],
+) -> Result<usize, AppError> {
+    crate::db::generation::mark_generations_synthesis_stale_for_line_ids(conn, line_ids)
 }
 
 fn project_text_hashes(conn: &Connection, project_id: i64) -> Result<HashSet<String>, AppError> {
@@ -625,7 +810,7 @@ pub fn reset_agent_state(
         delete_hashes_from_table(&tx, "synthesis_text_override", &override_clear)?;
     let reviews_cleared =
         delete_hashes_from_table(&tx, "synthesis_text_reviewed", &review_clear)?;
-    let generations_reset = reset_generations_for_line_ids(&tx, &line_ids)?;
+    let generations_reset = mark_generations_synthesis_stale_for_line_ids(&tx, &line_ids)?;
     tx.commit()?;
     Ok(SynthesisAgentResetResult {
         overrides_cleared,
@@ -657,6 +842,7 @@ pub fn corpus_audit_summary(
         plain_ok: 0,
         mapped_ok: 0,
         stripped_unknown_cue: 0,
+        spoken_stage_direction: 0,
         unterminated_asterisk: 0,
         placement_candidate: 0,
         interpretive_candidate: 0,
@@ -667,16 +853,13 @@ pub fn corpus_audit_summary(
     };
     for text in texts {
         let mapped = mapped_synthesis_text(conn, &text, mapper_enabled)?.0;
-        let flags = crate::synthesis_corpus_audit::audit_source_and_mapped_text(
-            &text,
-            &mapped,
-            mapper_enabled,
-        );
+        let flags = audit_flags_for_mapped(conn, &text, &mapped, mapper_enabled)?;
         for flag in &flags {
             match flag {
                 CorpusAuditFlag::PlainOk => summary.plain_ok += 1,
                 CorpusAuditFlag::MappedOk => summary.mapped_ok += 1,
                 CorpusAuditFlag::StrippedUnknownCue => summary.stripped_unknown_cue += 1,
+                CorpusAuditFlag::SpokenStageDirection => summary.spoken_stage_direction += 1,
                 CorpusAuditFlag::UnterminatedAsterisk => summary.unterminated_asterisk += 1,
                 CorpusAuditFlag::PlacementCandidate => summary.placement_candidate += 1,
                 CorpusAuditFlag::InterpretiveCandidate => summary.interpretive_candidate += 1,
@@ -717,11 +900,7 @@ pub fn reconcile_stale_reviews(
     let mut stale = Vec::new();
     for (hash, text) in rows {
         let mapped = mapped_synthesis_text(conn, &text, mapper_enabled)?.0;
-        let flags = crate::synthesis_corpus_audit::audit_source_and_mapped_text(
-            &text,
-            &mapped,
-            mapper_enabled,
-        );
+        let flags = audit_flags_for_mapped(conn, &text, &mapped, mapper_enabled)?;
         if crate::synthesis_corpus_audit::needs_agent_attention(&flags) {
             stale.push(hash);
         }
@@ -745,8 +924,12 @@ pub fn list_flagged(
     limit: usize,
     mapper_enabled: bool,
     undecided_only: bool,
+    query: Option<&str>,
+    flag: Option<&str>,
 ) -> Result<ListSynthesisFlaggedResult, AppError> {
     let limit = limit.clamp(1, 100);
+    let query = normalize_query(query);
+    let flag = parse_flag_filter(flag)?;
     let overrides = hash_set(conn, "synthesis_text_override")?;
     let reviewed = hash_set(conn, "synthesis_text_reviewed")?;
     let mut rows = Vec::new();
@@ -767,13 +950,22 @@ pub fn list_flagged(
             }
             let mapped_text =
                 mapped_synthesis_text(conn, &entry.source_text, mapper_enabled)?.0;
-            let flags = crate::synthesis_corpus_audit::audit_source_and_mapped_text(
+            let flags = audit_flags_for_mapped(
+                conn,
                 &entry.source_text,
                 &mapped_text,
                 mapper_enabled,
-            );
+            )?;
             if !crate::synthesis_corpus_audit::needs_agent_attention(&flags) {
                 continue;
+            }
+            if !flags_match_filter(&flags, flag) {
+                continue;
+            }
+            if let Some(ref q) = query {
+                if !text_fields_match(&[entry.source_text.as_str(), mapped_text.as_str()], q) {
+                    continue;
+                }
             }
             rows.push(SynthesisFlaggedRow {
                 line_id: entry.line_id,
@@ -806,8 +998,12 @@ pub fn list_remaining(
     after: i64,
     limit: usize,
     mapper_enabled: bool,
+    query: Option<&str>,
+    flag: Option<&str>,
 ) -> Result<ListSynthesisReviewResult, AppError> {
     let limit = limit.clamp(1, 100);
+    let query = normalize_query(query);
+    let flag = parse_flag_filter(flag)?;
     let overrides = hash_set(conn, "synthesis_text_override")?;
     let reviewed = hash_set(conn, "synthesis_text_reviewed")?;
     let mut rows = Vec::new();
@@ -832,11 +1028,20 @@ pub fn list_remaining(
             }
             let mapped_text =
                 mapped_synthesis_text(conn, &entry.source_text, mapper_enabled)?.0;
-            let flags = crate::synthesis_corpus_audit::audit_source_and_mapped_text(
+            let flags = audit_flags_for_mapped(
+                conn,
                 &entry.source_text,
                 &mapped_text,
                 mapper_enabled,
-            );
+            )?;
+            if !flags_match_filter(&flags, flag) {
+                continue;
+            }
+            if let Some(ref q) = query {
+                if !text_fields_match(&[entry.source_text.as_str(), mapped_text.as_str()], q) {
+                    continue;
+                }
+            }
             rows.push(SynthesisReviewRow {
                 line_id: entry.line_id,
                 strref: entry.strref,
@@ -909,11 +1114,7 @@ pub fn auto_review_plain(
             continue;
         }
         let mapped = mapped_synthesis_text(conn, &text, mapper_enabled)?.0;
-        if crate::synthesis_corpus_audit::audit_source_and_mapped_text(
-            &text,
-            &mapped,
-            mapper_enabled,
-        ) == [CorpusAuditFlag::PlainOk] {
+        if audit_flags_for_mapped(conn, &text, &mapped, mapper_enabled)? == [CorpusAuditFlag::PlainOk] {
             ensure_string(conn, &text)?;
             hashes.push(hash);
         }
@@ -943,6 +1144,7 @@ mod tests {
     fn db() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
         schema::run_migrations(&mut conn).unwrap();
+        crate::tag_rules::ensure_default_rules(&conn).unwrap();
         conn.execute(
             "INSERT INTO project(id,game_root,edition,active_language,generator_version,created_at) \
              VALUES(1,'x','bg2ee','en_US','test','now')",
@@ -986,11 +1188,11 @@ mod tests {
         let overridden = resolve_synthesis_text(&conn, "Hello *sniff* there.", true).unwrap();
         assert_eq!(overridden.text, "[sigh] Hello there.");
         assert_eq!(overridden.source, SynthesisTextSource::Override);
-        assert_eq!(tagging_summary(&conn, Some(1)).unwrap().overridden, 1);
+        assert_eq!(tagging_summary(&conn, Some(1), true).unwrap().overridden, 1);
 
         clear_override(&conn, 1).unwrap();
         set_reviewed(&conn, 1, true).unwrap();
-        assert_eq!(tagging_summary(&conn, Some(1)).unwrap().reviewed, 1);
+        assert_eq!(tagging_summary(&conn, Some(1), true).unwrap().reviewed, 1);
         assert!(undecided_corpus(&conn, Some(1), 0, 10, false)
             .unwrap()
             .is_empty());
@@ -1025,7 +1227,7 @@ mod tests {
         let summary = corpus_audit_summary(&conn, 1, true).unwrap();
         assert_eq!(summary.stale_reviews_cleared, 1);
         assert_eq!(summary.tts_unfriendly_spelling, 1);
-        assert_eq!(tagging_summary(&conn, Some(1)).unwrap().reviewed, 0);
+        assert_eq!(tagging_summary(&conn, Some(1), true).unwrap().reviewed, 0);
     }
 
     #[test]
@@ -1041,6 +1243,7 @@ mod tests {
             0,
             50,
             true,
+            None,
         )
         .unwrap();
         assert_eq!(overrides.rows.len(), 1);
@@ -1057,6 +1260,7 @@ mod tests {
             0,
             50,
             true,
+            None,
         )
         .unwrap();
         assert_eq!(reviewed.rows.len(), 1);
@@ -1065,13 +1269,13 @@ mod tests {
     }
 
     #[test]
-    fn reset_agent_state_clears_overrides_and_reviews() {
+    fn reset_agent_state_clears_overrides_and_marks_text_changed() {
         let conn = db_with_lines();
         write_override(&conn, 1, "[sigh] Hello there.").unwrap();
         set_reviewed(&conn, 2, true).unwrap();
         conn.execute(
-            "INSERT INTO generation(id,line_id,status,attempts,resumable_state_json) \
-             VALUES(1,1,'done',1,'{}')",
+            "INSERT INTO generation(id,line_id,status,output_path,attempts,resumable_state_json) \
+             VALUES(1,1,'done','/ws/1.ogg',1,'{}')",
             [],
         )
         .unwrap();
@@ -1080,7 +1284,40 @@ mod tests {
         assert_eq!(result.overrides_cleared, 1);
         assert_eq!(result.reviews_cleared, 1);
         assert_eq!(result.generations_reset, 1);
-        assert_eq!(tagging_summary(&conn, Some(1)).unwrap().remaining, 3);
+        let (status, path, stale): (String, Option<String>, i64) = conn
+            .query_row(
+                "SELECT status,output_path,synthesis_stale FROM generation WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "done");
+        assert_eq!(path.as_deref(), Some("/ws/1.ogg"));
+        assert_eq!(stale, 1);
+        assert_eq!(tagging_summary(&conn, Some(1), true).unwrap().remaining, 3);
+    }
+
+    #[test]
+    fn override_marks_matching_done_clip_text_changed_without_clearing_path() {
+        let conn = db();
+        conn.execute(
+            "INSERT INTO generation(id,line_id,status,output_path,attempts,resumable_state_json) \
+             VALUES(1,1,'done','/ws/1.ogg',1,'{}')",
+            [],
+        )
+        .unwrap();
+        let result = write_override(&conn, 1, "[sigh] Hello there.").unwrap();
+        assert_eq!(result.reset_generations, 1);
+        let (status, path, stale): (String, Option<String>, i64) = conn
+            .query_row(
+                "SELECT status,output_path,synthesis_stale FROM generation WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "done");
+        assert_eq!(path.as_deref(), Some("/ws/1.ogg"));
+        assert_eq!(stale, 1);
     }
 
     #[test]
@@ -1123,6 +1360,7 @@ mod tests {
             0,
             50,
             true,
+            None,
         )
         .unwrap();
         assert_eq!(first.rows.len(), 50);
@@ -1136,6 +1374,7 @@ mod tests {
             first.next_after.unwrap(),
             50,
             true,
+            None,
         )
         .unwrap();
         assert_eq!(second.rows.len(), 50);
@@ -1147,7 +1386,7 @@ mod tests {
         let conn = db_with_lines();
         let result = auto_review_plain(&conn, 1, true).unwrap();
         assert_eq!(result.reviewed, 1);
-        assert_eq!(tagging_summary(&conn, Some(1)).unwrap().reviewed, 1);
+        assert_eq!(tagging_summary(&conn, Some(1), true).unwrap().reviewed, 1);
     }
 
     #[test]
@@ -1155,15 +1394,128 @@ mod tests {
         let conn = db_with_lines();
         set_reviewed(&conn, 1, true).unwrap();
 
-        let first = list_remaining(&conn, 1, 0, 1, true).unwrap();
+        let first = list_remaining(&conn, 1, 0, 1, true, None, None).unwrap();
         assert_eq!(first.rows.len(), 1);
         assert_eq!(first.rows[0].line_id, 2);
         assert_eq!(first.rows[0].flags, vec![CorpusAuditFlag::PlainOk]);
         assert_eq!(first.next_after, Some(2));
 
         write_override(&conn, 3, "Bad [sigh] line.").unwrap();
-        let second = list_remaining(&conn, 1, first.next_after.unwrap(), 50, true).unwrap();
+        let second =
+            list_remaining(&conn, 1, first.next_after.unwrap(), 50, true, None, None).unwrap();
         assert!(second.rows.is_empty());
         assert_eq!(second.next_after, None);
+    }
+
+    #[test]
+    fn list_remaining_and_flagged_honor_query_and_flag_filters() {
+        let conn = db_with_lines();
+        conn.execute(
+            "INSERT INTO line(id,project_id,strref,text,kind,is_voiced,has_tokens,status) \
+             VALUES(4,1,11,'Broken *cue line.','state',0,0,'ready')",
+            [],
+        )
+        .unwrap();
+
+        let by_query = list_remaining(&conn, 1, 0, 50, true, Some("plain"), None).unwrap();
+        assert_eq!(by_query.rows.len(), 1);
+        assert_eq!(by_query.rows[0].line_id, 2);
+
+        let no_match = list_remaining(&conn, 1, 0, 50, true, Some("zzzz-missing"), None).unwrap();
+        assert!(no_match.rows.is_empty());
+
+        let flagged = list_flagged(
+            &conn,
+            1,
+            0,
+            50,
+            true,
+            true,
+            None,
+            Some("unterminated_asterisk"),
+        )
+        .unwrap();
+        assert_eq!(flagged.rows.len(), 1);
+        assert_eq!(flagged.rows[0].line_id, 4);
+        assert!(flagged.rows[0]
+            .flags
+            .contains(&CorpusAuditFlag::UnterminatedAsterisk));
+
+        let flagged_query = list_flagged(
+            &conn,
+            1,
+            0,
+            50,
+            true,
+            true,
+            Some("broken"),
+            Some("unterminated_asterisk"),
+        )
+        .unwrap();
+        assert_eq!(flagged_query.rows.len(), 1);
+        assert_eq!(flagged_query.rows[0].line_id, 4);
+    }
+
+    #[test]
+    fn list_decisions_query_filters_across_pages() {
+        let conn = db_with_lines();
+        write_override(&conn, 1, "[sigh] Hello there.").unwrap();
+        write_override(&conn, 2, "Plain line.").unwrap();
+
+        let hit = list_decisions(
+            &conn,
+            1,
+            SynthesisDecisionKind::Override,
+            0,
+            50,
+            true,
+            Some("plain line"),
+        )
+        .unwrap();
+        assert_eq!(hit.rows.len(), 1);
+        assert_eq!(hit.rows[0].line_id, 2);
+
+        let miss = list_decisions(
+            &conn,
+            1,
+            SynthesisDecisionKind::Override,
+            0,
+            50,
+            true,
+            Some("no-such-text"),
+        )
+        .unwrap();
+        assert!(miss.rows.is_empty());
+    }
+
+    #[test]
+    fn tagging_summary_counts_suspicious_overrides() {
+        let conn = db_with_lines();
+        write_override(&conn, 1, "[sigh] Hello there.").unwrap();
+        write_override(&conn, 2, "Plain line.").unwrap();
+        // Corrupt one override after write so the override audit flags it as suspicious.
+        conn.execute(
+            "UPDATE synthesis_text_override SET synthesis_text=?1 WHERE text_hash=?2",
+            params![
+                "Hello there. --db C:\\Users\\micro\\AppData\\Roaming\\com.bg2voicegen.desktop\\bg2vg.db",
+                text_hash("Hello *sniff* there.")
+            ],
+        )
+        .unwrap();
+        let summary = tagging_summary(&conn, Some(1), true).unwrap();
+        assert_eq!(summary.overridden, 2);
+        assert_eq!(summary.suspicious, 1);
+        let suspicious = list_decisions(
+            &conn,
+            1,
+            SynthesisDecisionKind::Suspicious,
+            0,
+            100,
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(suspicious.rows.len(), 1);
+        assert_eq!(suspicious.rows[0].line_id, 1);
     }
 }

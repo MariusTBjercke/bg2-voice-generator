@@ -105,6 +105,7 @@ function item(
     demographic: { ...group, race: speaker.race, race_label: speaker.race === 6 ? "Human" : "Halfling" },
     binding: binding(id, donorId, inherited),
     renderState,
+    renderStates: [renderState],
   };
 }
 

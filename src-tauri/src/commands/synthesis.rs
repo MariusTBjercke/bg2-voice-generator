@@ -53,6 +53,7 @@ pub async fn get_line_synthesis_preview(
         resolved_text: resolved.text,
         source: resolved.source,
         applied_rules: resolved.applied_rules,
+        applied_tag_rules: resolved.applied_tag_rules,
     })
 }
 
@@ -105,9 +106,10 @@ pub async fn synthesis_tagging_summary(
             overridden: 0,
             reviewed: 0,
             remaining: 0,
+            suspicious: 0,
         });
     };
-    crate::synthesis::tagging_summary(&conn, Some(project_id))
+    crate::synthesis::tagging_summary(&conn, Some(project_id), mapper_enabled())
 }
 
 #[tauri::command]
@@ -117,6 +119,7 @@ pub async fn list_synthesis_decisions(
     kind: SynthesisDecisionKind,
     after: Option<i64>,
     limit: Option<usize>,
+    query: Option<String>,
 ) -> Result<ListSynthesisDecisionsResult, AppError> {
     let conn = state.db.lock().await;
     let Some(project_id) = project_id(&conn, &game_dir)? else {
@@ -132,6 +135,7 @@ pub async fn list_synthesis_decisions(
         after.unwrap_or(0),
         limit.unwrap_or(50),
         mapper_enabled(),
+        query.as_deref(),
     )
 }
 
@@ -163,6 +167,7 @@ pub async fn synthesis_corpus_audit_summary(
             plain_ok: 0,
             mapped_ok: 0,
             stripped_unknown_cue: 0,
+            spoken_stage_direction: 0,
             unterminated_asterisk: 0,
             placement_candidate: 0,
             interpretive_candidate: 0,
@@ -182,6 +187,8 @@ pub async fn list_synthesis_flagged(
     after: Option<i64>,
     limit: Option<usize>,
     undecided_only: Option<bool>,
+    query: Option<String>,
+    flag: Option<String>,
 ) -> Result<ListSynthesisFlaggedResult, AppError> {
     let conn = state.db.lock().await;
     let Some(project_id) = project_id(&conn, &game_dir)? else {
@@ -197,6 +204,8 @@ pub async fn list_synthesis_flagged(
         limit.unwrap_or(50),
         mapper_enabled(),
         undecided_only.unwrap_or(true),
+        query.as_deref(),
+        flag.as_deref(),
     )
 }
 
@@ -206,6 +215,8 @@ pub async fn list_synthesis_remaining(
     game_dir: String,
     after: Option<i64>,
     limit: Option<usize>,
+    query: Option<String>,
+    flag: Option<String>,
 ) -> Result<ListSynthesisReviewResult, AppError> {
     let conn = state.db.lock().await;
     let Some(project_id) = project_id(&conn, &game_dir)? else {
@@ -220,6 +231,8 @@ pub async fn list_synthesis_remaining(
         after.unwrap_or(0),
         limit.unwrap_or(50),
         mapper_enabled(),
+        query.as_deref(),
+        flag.as_deref(),
     )
 }
 

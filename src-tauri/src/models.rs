@@ -410,6 +410,68 @@ pub struct DictionaryWriteResult {
     pub reset_generations: usize,
 }
 
+/// How a tag rule matches source text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TagMatchKind {
+    #[default]
+    StageCue,
+    WholeWord,
+}
+
+impl TagMatchKind {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "stage_cue" => Ok(Self::StageCue),
+            "whole_word" => Ok(Self::WholeWord),
+            _ => Err(format!("unknown tag match kind {value:?}")),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StageCue => "stage_cue",
+            Self::WholeWord => "whole_word",
+        }
+    }
+}
+
+/// One machine-wide OmniVoice tag rule (stage cue or spoken word → tag).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TagRule {
+    pub id: i64,
+    pub find_text: String,
+    pub tag: String,
+    pub match_kind: TagMatchKind,
+    pub enabled: bool,
+    pub is_default: bool,
+    pub updated_at: String,
+}
+
+/// A tag rule that changed a preview or synthesis transcript.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TagAppliedRule {
+    pub id: i64,
+    pub find_text: String,
+    pub tag: String,
+    pub match_kind: TagMatchKind,
+}
+
+/// Before/after result for the Tag rules test field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TagRulesPreview {
+    pub before: String,
+    pub after: String,
+    pub applied_rules: Vec<TagAppliedRule>,
+}
+
+/// Outcome of changing machine-wide tag rules.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TagRuleWriteResult {
+    pub rule: Option<TagRule>,
+    pub reset_generations: usize,
+}
+
 /// How the generation-time transcript was resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -427,6 +489,7 @@ pub struct SynthesisPreview {
     pub source: SynthesisTextSource,
     pub shared_line_count: usize,
     pub applied_rules: Vec<DictionaryAppliedRule>,
+    pub applied_tag_rules: Vec<TagAppliedRule>,
 }
 
 /// Result of changing a synthesis override.
@@ -442,6 +505,8 @@ pub struct SynthesisTaggingSummary {
     pub overridden: usize,
     pub reviewed: usize,
     pub remaining: usize,
+    /// Overrides whose generation text fails the override audit (true corpus total).
+    pub suspicious: usize,
 }
 
 /// Filter for listing agent-processed synthesis strings.
@@ -487,6 +552,7 @@ pub enum CorpusAuditFlag {
     PlainOk,
     MappedOk,
     StrippedUnknownCue,
+    SpokenStageDirection,
     UnterminatedAsterisk,
     PlacementCandidate,
     InterpretiveCandidate,
@@ -501,6 +567,7 @@ pub struct SynthesisCorpusAuditSummary {
     pub plain_ok: usize,
     pub mapped_ok: usize,
     pub stripped_unknown_cue: usize,
+    pub spoken_stage_direction: usize,
     pub unterminated_asterisk: usize,
     pub placement_candidate: usize,
     pub interpretive_candidate: usize,
@@ -1911,6 +1978,7 @@ mod contract_tests {
                 "source",
                 "shared_line_count",
                 "applied_rules",
+                "applied_tag_rules",
             ],
             keys(&SynthesisPreview {
                 display_text: String::new(),
@@ -1918,6 +1986,51 @@ mod contract_tests {
                 source: SynthesisTextSource::Mapper,
                 shared_line_count: 0,
                 applied_rules: vec![],
+                applied_tag_rules: vec![],
+            }),
+        );
+        expect(
+            vec![
+                "id",
+                "find_text",
+                "tag",
+                "match_kind",
+                "enabled",
+                "is_default",
+                "updated_at",
+            ],
+            keys(&TagRule {
+                id: 0,
+                find_text: String::new(),
+                tag: String::new(),
+                match_kind: TagMatchKind::StageCue,
+                enabled: true,
+                is_default: false,
+                updated_at: String::new(),
+            }),
+        );
+        expect(
+            vec!["id", "find_text", "tag", "match_kind"],
+            keys(&TagAppliedRule {
+                id: 0,
+                find_text: String::new(),
+                tag: String::new(),
+                match_kind: TagMatchKind::WholeWord,
+            }),
+        );
+        expect(
+            vec!["before", "after", "applied_rules"],
+            keys(&TagRulesPreview {
+                before: String::new(),
+                after: String::new(),
+                applied_rules: vec![],
+            }),
+        );
+        expect(
+            vec!["rule", "reset_generations"],
+            keys(&TagRuleWriteResult {
+                rule: None,
+                reset_generations: 0,
             }),
         );
         expect(
@@ -1927,12 +2040,19 @@ mod contract_tests {
             }),
         );
         expect(
-            vec!["unique_strings", "overridden", "reviewed", "remaining"],
+            vec![
+                "unique_strings",
+                "overridden",
+                "reviewed",
+                "remaining",
+                "suspicious",
+            ],
             keys(&SynthesisTaggingSummary {
                 unique_strings: 0,
                 overridden: 0,
                 reviewed: 0,
                 remaining: 0,
+                suspicious: 0,
             }),
         );
         expect(
@@ -1976,6 +2096,7 @@ mod contract_tests {
                 "plain_ok",
                 "mapped_ok",
                 "stripped_unknown_cue",
+                "spoken_stage_direction",
                 "unterminated_asterisk",
                 "placement_candidate",
                 "interpretive_candidate",
@@ -1989,6 +2110,7 @@ mod contract_tests {
                 plain_ok: 0,
                 mapped_ok: 0,
                 stripped_unknown_cue: 0,
+                spoken_stage_direction: 0,
                 unterminated_asterisk: 0,
                 placement_candidate: 0,
                 interpretive_candidate: 0,

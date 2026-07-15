@@ -10,6 +10,7 @@ use crate::db::generation::{
     approved_primary_sample, fallback_donor_pool, set_clone_status, upsert_clone,
 };
 use crate::db::metadata_binding::{donors_for_key, metadata_apply_targets};
+use crate::db::speaker_groups::{identity_key_for_speaker, speaker_ids_in_group};
 use crate::error::AppError;
 use crate::generator::binding::{best_donor, Demographics, DemographicMatch, DonorCandidate};
 use crate::generator::clone::validate_file;
@@ -177,6 +178,67 @@ fn apply_one(
         matched_class: m.class,
         from_pool,
     }))
+}
+
+fn donor_sample_owner_ids(
+    conn: &Connection,
+    project_id: i64,
+    donor_speaker_id: i64,
+) -> Result<Vec<i64>, AppError> {
+    let key = identity_key_for_speaker(conn, donor_speaker_id)?;
+    speaker_ids_in_group(conn, project_id, &key)
+}
+
+/// Point every demographic (`generic`) clone that currently inherits a reference
+/// sample owned by `donor_speaker_id` (or a variant in the same identity group)
+/// at `sample_id`. Completed generations keep their stored reference snapshot, so
+/// affected lines surface as voice-changed on the Generation screen.
+pub fn refresh_generic_clones_for_donor(
+    conn: &Connection,
+    project_id: i64,
+    donor_speaker_id: i64,
+    sample_id: i64,
+    derivative_path: &Path,
+) -> Result<usize, AppError> {
+    validate_file(derivative_path)?;
+    let owner_ids = donor_sample_owner_ids(conn, project_id, donor_speaker_id)?;
+    if owner_ids.is_empty() {
+        return Ok(0);
+    }
+    let owner_placeholders = owner_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT DISTINCT c.speaker_id FROM clone c \
+         JOIN speaker s ON s.id = c.speaker_id \
+         JOIN reference_sample rs ON rs.id = c.primary_sample_id \
+         WHERE s.project_id = ?1 AND c.binding_source = 'generic' \
+           AND rs.speaker_id IN ({owner_placeholders}) \
+           AND c.speaker_id NOT IN ({owner_placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(project_id)];
+    for id in &owner_ids {
+        params.push(Box::new(*id));
+    }
+    for id in &owner_ids {
+        params.push(Box::new(*id));
+    }
+    let consumer_ids = stmt
+        .query_map(rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())), |r| {
+            r.get::<_, i64>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut refreshed = 0usize;
+    for consumer_id in consumer_ids {
+        let clone_id = upsert_clone(conn, consumer_id, sample_id, BindingSource::Generic)?;
+        set_clone_status(conn, clone_id, CloneStatus::Ready)?;
+        refreshed += 1;
+    }
+    Ok(refreshed)
 }
 
 /// Materialize one speaker's currently configured demographic default.
@@ -373,5 +435,113 @@ mod tests {
         .unwrap();
         assert_eq!(assignment.donor_speaker_id, donor);
         assert_eq!(clone_for_speaker(&conn, target).unwrap().unwrap().binding_source, BindingSource::Generic);
+    }
+
+    #[test]
+    fn donor_rebind_marks_demographic_consumers_voice_changed() {
+        use crate::audio::wav::build_pcm_wav;
+        use crate::db::generation::{
+            completed_generations_for_project, get_or_create_generation, mark_done,
+            upsert_clone,
+        };
+        use crate::generator::clone::REFERENCE_SAMPLE_RATE;
+        use crate::models::BindingSource;
+
+        let dir = tempfile::tempdir().unwrap();
+        let old_wav = dir.path().join("old.wav");
+        let new_wav = dir.path().join("new.wav");
+        let samples: Vec<i16> = (0..REFERENCE_SAMPLE_RATE).map(|_| 8_000).collect();
+        std::fs::write(&old_wav, build_pcm_wav(REFERENCE_SAMPLE_RATE, &samples)).unwrap();
+        std::fs::write(&new_wav, build_pcm_wav(REFERENCE_SAMPLE_RATE, &samples)).unwrap();
+
+        let conn = mem_db();
+        let pid = project(&conn);
+        let donor = speaker(&conn, pid, "donor", 1, 2, 0, 3);
+        conn.execute(
+            "INSERT INTO reference_sample (speaker_id, decision, local_derivative_path) \
+             VALUES (?1, 'approved', ?2)",
+            rusqlite::params![donor, old_wav.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        let old_sample = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO reference_sample (speaker_id, decision, local_derivative_path) \
+             VALUES (?1, 'approved', ?2)",
+            rusqlite::params![donor, new_wav.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        let new_sample = conn.last_insert_rowid();
+
+        let consumer = speaker(&conn, pid, "consumer", 1, 2, 0, 3);
+        let consumer_clone = upsert_clone(&conn, consumer, old_sample, BindingSource::Generic).unwrap();
+        set_clone_status(&conn, consumer_clone, CloneStatus::Ready).unwrap();
+
+        let personal = speaker(&conn, pid, "named", 1, 2, 0, 3);
+        let personal_clone = upsert_clone(&conn, personal, old_sample, BindingSource::Override).unwrap();
+        set_clone_status(&conn, personal_clone, CloneStatus::Ready).unwrap();
+
+        conn.execute(
+            "INSERT INTO line (project_id, strref, text, speaker_id, status) \
+             VALUES (?1, 1, 'Hi', ?2, 'ready')",
+            rusqlite::params![pid, consumer],
+        )
+        .unwrap();
+        let consumer_line = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO line (project_id, strref, text, speaker_id, status) \
+             VALUES (?1, 2, 'Hey', ?2, 'ready')",
+            rusqlite::params![pid, personal],
+        )
+        .unwrap();
+        let personal_line = conn.last_insert_rowid();
+
+        let consumer_gen = get_or_create_generation(&conn, consumer_line, consumer_clone).unwrap();
+        mark_done(
+            &conn,
+            consumer_gen.id,
+            consumer_clone,
+            old_sample,
+            BindingSource::Generic,
+            "/ws/consumer.ogg",
+            "{}",
+            &crate::models::OmniVoiceRenderSettings::default(),
+            "old-ref",
+        )
+        .unwrap();
+        let personal_gen = get_or_create_generation(&conn, personal_line, personal_clone).unwrap();
+        mark_done(
+            &conn,
+            personal_gen.id,
+            personal_clone,
+            old_sample,
+            BindingSource::Override,
+            "/ws/personal.ogg",
+            "{}",
+            &crate::models::OmniVoiceRenderSettings::default(),
+            "old-ref",
+        )
+        .unwrap();
+
+        let refreshed = refresh_generic_clones_for_donor(
+            &conn,
+            pid,
+            donor,
+            new_sample,
+            &new_wav,
+        )
+        .unwrap();
+        assert_eq!(refreshed, 1);
+
+        let completed = completed_generations_for_project(&conn, pid).unwrap();
+        let consumer_state = completed
+            .iter()
+            .find(|(line_id, _, _, _)| *line_id == consumer_line)
+            .map(|(_, _, voice_changed, _)| *voice_changed);
+        let personal_state = completed
+            .iter()
+            .find(|(line_id, _, _, _)| *line_id == personal_line)
+            .map(|(_, _, voice_changed, _)| *voice_changed);
+        assert_eq!(consumer_state, Some(true));
+        assert_eq!(personal_state, Some(false));
     }
 }

@@ -1,6 +1,13 @@
 <script lang="ts">
+  import { get } from "svelte/store";
   import { invoke } from "$lib/utils/invoke";
   import { project } from "$lib/stores/project";
+  import {
+    ensureFiltersGameDir,
+    filterCache,
+    getSavedFilter,
+    setSavedFilter,
+  } from "$lib/stores/filters";
   import type {
     AutoReviewPlainResult,
     ListSynthesisDecisionsResult,
@@ -11,11 +18,12 @@
     SynthesisDecisionKind,
     SynthesisDecisionRow,
     SynthesisFlaggedRow,
+    SynthesisPreview,
     SynthesisReviewRow,
     SynthesisTaggingSummary,
     SynthesisWriteResult,
   } from "$lib/types";
-  import { emptyValues, filterItems, type FilterConfig, type FilterValues } from "$lib/filters";
+  import { emptyValues, FACET_ALL, isEmpty, type FilterConfig, type FilterValues } from "$lib/filters";
   import Section from "$lib/components/Section.svelte";
   import Card from "$lib/components/Card.svelte";
   import Button from "$lib/components/Button.svelte";
@@ -27,22 +35,50 @@
   const PAGE_SIZE = 50;
   const REVIEWED_DEFER_THRESHOLD = 1000;
   const INVOKE_TIMEOUT_MS = 30_000;
+  const SEARCH_DEBOUNCE_MS = 300;
+  const FLAG_FACET = "flag";
 
   type ReviewTab = SynthesisDecisionKind | "flagged" | "remaining";
 
+  const ATTENTION_FLAG_OPTIONS: { value: string; label: string }[] = [
+    { value: "stripped_unknown_cue", label: "unknown cues" },
+    { value: "spoken_stage_direction", label: "spoken stage dirs" },
+    { value: "unterminated_asterisk", label: "unterminated asterisk" },
+    { value: "placement_candidate", label: "placement" },
+    { value: "interpretive_candidate", label: "interpretive" },
+    { value: "tts_unfriendly_spelling", label: "TTS spelling" },
+    { value: "non_speakable", label: "non-speakable" },
+  ];
+
+  const queueFilter: FilterConfig<SynthesisFlaggedRow | SynthesisReviewRow> = {
+    textPlaceholder: "Search subtitle or generation text across the corpus…",
+    text: (row) => [row.source_text, row.mapped_text, row.strref],
+    facets: [
+      {
+        key: FLAG_FACET,
+        label: "Flag",
+        allLabel: "All flags",
+        value: () => null,
+        options: ATTENTION_FLAG_OPTIONS,
+      },
+    ],
+  };
+
   const decisionFilter: FilterConfig<SynthesisDecisionRow> = {
-    textPlaceholder: "Filter loaded page by subtitle or synthesis text…",
-    text: (row) => [row.source_text, row.mapped_text, row.synthesis_text, row.audit_reason],
+    textPlaceholder: "Search subtitle, override, or audit reason across the corpus…",
+    text: (row) => [row.source_text, row.mapped_text, row.synthesis_text, row.audit_reason, row.strref],
   };
 
   let summary = $state<SynthesisTaggingSummary | null>(null);
   let auditSummary = $state<SynthesisCorpusAuditSummary | null>(null);
   let auditLoading = $state(false);
+  let statsLoading = $state(false);
   let loading = $state(false);
   let launching = $state<string | null>(null);
   let revealing = $state(false);
   let yolo = $state(false);
   let error = $state<string | null>(null);
+  let auditError = $state<string | null>(null);
 
   let decisionKind = $state<ReviewTab>("flagged");
   let decisionRows = $state<SynthesisDecisionRow[]>([]);
@@ -53,25 +89,28 @@
   let decisionNextAfter = $state<number | null>(null);
   let decisionHistory = $state<number[]>([0]);
   let decisionPage = $state(0);
-  let filterValues = $state<FilterValues>(emptyValues(decisionFilter));
+  let filterValues = $state<FilterValues>(emptyValues(queueFilter));
+  let filtersHydrated = $state(false);
   let rowActionId = $state<number | null>(null);
   let resetting = $state(false);
   let autoReviewing = $state(false);
   let reviewedLoadRequested = $state(false);
   let actionNote = $state<string | null>(null);
-  let suspiciousCount = $state<number | null>(null);
   let editingLineId = $state<number | null>(null);
+  let editPreviews = $state<Record<number, SynthesisPreview | "loading" | "error">>({});
+  let searchDebounce: ReturnType<typeof setTimeout> | null = null;
+  let skipFilterReload = false;
 
   const dir = $derived($project.gameDir);
-  const filteredRows = $derived(filterItems(decisionRows, decisionFilter, filterValues));
   const kindTotal = $derived.by(() => {
     if (!summary) return 0;
     if (decisionKind === "override") return summary.overridden;
     if (decisionKind === "reviewed") return summary.reviewed;
     if (decisionKind === "flagged") return auditSummary?.flagged_undecided ?? 0;
     if (decisionKind === "remaining") return summary.remaining;
-    return suspiciousCount ?? 0;
+    return summary.suspicious;
   });
+  const filtersActive = $derived(!isEmpty(filterValues));
   const pageFrom = $derived.by(() => {
     const count = decisionKind === "flagged" || decisionKind === "remaining" ? queueRows.length : decisionRows.length;
     return count === 0 ? 0 : decisionPage * PAGE_SIZE + 1;
@@ -88,6 +127,12 @@
   const activeRowCount = $derived(
     decisionKind === "flagged" || decisionKind === "remaining" ? queueRows.length : decisionRows.length,
   );
+  const serverQuery = $derived(filterValues.search.trim() || undefined);
+  const serverFlag = $derived.by(() => {
+    if (decisionKind !== "flagged" && decisionKind !== "remaining") return undefined;
+    const selected = filterValues.facets[FLAG_FACET] ?? FACET_ALL;
+    return selected === FACET_ALL ? undefined : selected;
+  });
 
   function invokeWithTimeout<T>(command: string, args: Record<string, unknown>): Promise<T> {
     return Promise.race([
@@ -113,60 +158,37 @@
   function flagTone(flag: string): "neutral" | "info" | "warn" {
     if (flag === "plain_ok") return "neutral";
     if (flag === "mapped_ok") return "info";
+    if (flag === "interpretive_candidate") return "info";
     return "warn";
   }
 
-  async function loadAuditSummary() {
-    if (!dir) {
-      auditSummary = null;
-      return;
-    }
-    auditLoading = true;
-    try {
-      auditSummary = await invoke<SynthesisCorpusAuditSummary>("synthesis_corpus_audit_summary", {
-        gameDir: dir,
-      });
-    } catch {
-      auditSummary = null;
-    } finally {
-      auditLoading = false;
-    }
-  }
-
-  async function loadSummary() {
+  async function refreshAllStats() {
     if (!dir) {
       summary = null;
+      auditSummary = null;
       return;
     }
     const showSpinner = summary === null;
     if (showSpinner) loading = true;
+    statsLoading = true;
+    auditLoading = true;
     error = null;
+    auditError = null;
     try {
-      summary = await invoke<SynthesisTaggingSummary>("synthesis_tagging_summary", {
-        gameDir: dir,
-      });
+      const [nextSummary, nextAudit] = await Promise.all([
+        invoke<SynthesisTaggingSummary>("synthesis_tagging_summary", { gameDir: dir }),
+        invoke<SynthesisCorpusAuditSummary>("synthesis_corpus_audit_summary", { gameDir: dir }),
+      ]);
+      summary = nextSummary;
+      auditSummary = nextAudit;
     } catch (e) {
-      error = String(e);
+      const message = String(e);
+      error = message;
+      auditError = message;
     } finally {
       if (showSpinner) loading = false;
-    }
-  }
-
-  async function loadSuspiciousCount() {
-    if (!dir) {
-      suspiciousCount = null;
-      return;
-    }
-    try {
-      const result = await invoke<ListSynthesisDecisionsResult>("list_synthesis_decisions", {
-        gameDir: dir,
-        kind: "suspicious",
-        after: 0,
-        limit: 100,
-      });
-      suspiciousCount = result.rows.length;
-    } catch {
-      suspiciousCount = null;
+      statsLoading = false;
+      auditLoading = false;
     }
   }
 
@@ -194,12 +216,16 @@
     decisionLoading = true;
     decisionError = null;
     try {
+      const query = serverQuery;
+      const flag = serverFlag;
       if (decisionKind === "flagged") {
         const result = await invokeWithTimeout<ListSynthesisFlaggedResult>("list_synthesis_flagged", {
           gameDir: dir,
           after: decisionAfter,
           limit: PAGE_SIZE,
           undecidedOnly: true,
+          query,
+          flag,
         });
         queueRows = result.rows;
         decisionNextAfter = result.next_after ?? null;
@@ -208,6 +234,8 @@
           gameDir: dir,
           after: decisionAfter,
           limit: PAGE_SIZE,
+          query,
+          flag,
         });
         queueRows = result.rows;
         decisionNextAfter = result.next_after ?? null;
@@ -217,12 +245,10 @@
           kind: decisionKind,
           after: decisionAfter,
           limit: PAGE_SIZE,
+          query,
         });
         decisionRows = result.rows;
         decisionNextAfter = result.next_after ?? null;
-        if (decisionKind === "suspicious") {
-          suspiciousCount = result.rows.length;
-        }
       }
     } catch (e) {
       decisionError = String(e);
@@ -239,50 +265,36 @@
     await loadDecisions(true);
   }
 
-  async function autoReviewPlainLines() {
-    if (!dir) return;
-    const detail =
-      "Mark every undecided plain dialogue string (no stage directions) as reviewed? " +
-      "This clears the largest bucket so agents can focus on flagged lines.";
-    if (!window.confirm(`${detail}\n\nContinue?`)) return;
-    autoReviewing = true;
-    decisionError = null;
-    actionNote = null;
-    try {
-      const result = await invoke<AutoReviewPlainResult>("auto_review_synthesis_plain", {
-        gameDir: dir,
-      });
-      actionNote = `Auto-reviewed ${result.reviewed} plain line(s).`;
-      await refreshAgentData(true);
-    } catch (e) {
-      decisionError = String(e);
-    } finally {
-      autoReviewing = false;
-    }
-  }
-
   async function refreshAgentData(resetPage = false) {
-    await Promise.all([loadSummary(), loadAuditSummary()]);
+    await refreshAllStats();
     await loadDecisions(resetPage);
   }
 
   function selectKind(kind: ReviewTab) {
     if (decisionKind === kind) return;
+    skipFilterReload = true;
     decisionKind = kind;
     decisionRows = [];
     queueRows = [];
     editingLineId = null;
-    filterValues = emptyValues(decisionFilter);
-    if (kind === "flagged") {
-      void loadAuditSummary();
-    }
-    if (kind === "suspicious") {
-      void loadSuspiciousCount();
+    // Keep search text; reset flag facet when leaving queue tabs that support it.
+    if (kind !== "flagged" && kind !== "remaining") {
+      filterValues = {
+        search: filterValues.search,
+        facets: {},
+      };
+    } else if (!(FLAG_FACET in filterValues.facets)) {
+      filterValues = {
+        search: filterValues.search,
+        facets: { [FLAG_FACET]: FACET_ALL },
+      };
     }
     if (kind !== "reviewed") {
       reviewedLoadRequested = false;
     }
-    void loadDecisions(true);
+    void loadDecisions(true).finally(() => {
+      skipFilterReload = false;
+    });
   }
 
   async function nextDecisionPage() {
@@ -311,12 +323,9 @@
         lineId,
       });
       if (result.reset_generations > 0) {
-        actionNote = `Cleared override; ${result.reset_generations} generation(s) reset to pending.`;
+        actionNote = `Cleared override; marked ${result.reset_generations} clip(s) as text changed (still playable).`;
       }
       await refreshAgentData();
-      if (decisionKind === "suspicious") {
-        await loadSuspiciousCount();
-      }
     } catch (e) {
       decisionError = String(e);
     } finally {
@@ -342,19 +351,17 @@
   async function editorSaved(result: SynthesisWriteResult) {
     editingLineId = null;
     actionNote = result.reset_generations > 0
-      ? `Override saved; ${result.reset_generations} generation(s) returned to pending.`
+      ? `Override saved; marked ${result.reset_generations} clip(s) as text changed (still playable).`
       : "Override saved.";
     await refreshAgentData();
-    await loadSuspiciousCount();
   }
 
   async function editorCleared(result: SynthesisWriteResult) {
     editingLineId = null;
     actionNote = result.reset_generations > 0
-      ? `Override cleared; ${result.reset_generations} generation(s) returned to pending.`
+      ? `Override cleared; marked ${result.reset_generations} clip(s) as text changed (still playable).`
       : "Override cleared.";
     await refreshAgentData();
-    await loadSuspiciousCount();
   }
 
   async function unmarkReview(lineId: number) {
@@ -369,6 +376,28 @@
       decisionError = String(e);
     } finally {
       rowActionId = null;
+    }
+  }
+
+  async function autoReviewPlainLines() {
+    if (!dir) return;
+    const detail =
+      "Mark every undecided plain dialogue string (no stage directions) as reviewed? " +
+      "This clears the largest bucket so you can focus on flagged lines.";
+    if (!window.confirm(`${detail}\n\nContinue?`)) return;
+    autoReviewing = true;
+    decisionError = null;
+    actionNote = null;
+    try {
+      const result = await invoke<AutoReviewPlainResult>("auto_review_synthesis_plain", {
+        gameDir: dir,
+      });
+      actionNote = `Auto-reviewed ${result.reviewed} plain line(s).`;
+      await refreshAgentData(true);
+    } catch (e) {
+      decisionError = String(e);
+    } finally {
+      autoReviewing = false;
     }
   }
 
@@ -392,9 +421,8 @@
       actionNote =
         `Reset complete: ${result.overrides_cleared} override(s), ` +
         `${result.reviews_cleared} review marker(s), ` +
-        `${result.generations_reset} generation(s) returned to pending.`;
+        `${result.generations_reset} clip(s) marked text changed (still playable).`;
       await refreshAgentData(true);
-      suspiciousCount = 0;
     } catch (e) {
       error = String(e);
     } finally {
@@ -408,7 +436,7 @@
     error = null;
     try {
       await invoke<void>("launch_agent", { gameDir: dir, agent, yolo });
-      await loadSummary();
+      await refreshAllStats();
     } catch (e) {
       error = String(e);
     } finally {
@@ -429,18 +457,69 @@
     }
   }
 
+  async function startEdit(lineId: number, initialFallback: string) {
+    editingLineId = lineId;
+    editPreviews = { ...editPreviews, [lineId]: "loading" };
+    try {
+      const preview = await invoke<SynthesisPreview>("get_line_synthesis_preview", { lineId });
+      editPreviews = { ...editPreviews, [lineId]: preview };
+      void initialFallback;
+    } catch {
+      editPreviews = { ...editPreviews, [lineId]: "error" };
+    }
+  }
+
+  function editPreviewText(lineId: number): string | null {
+    const preview = editPreviews[lineId];
+    if (!preview || preview === "loading" || preview === "error") return null;
+    return preview.resolved_text;
+  }
+
   let hydratedDir = $state<string | null>(null);
   $effect(() => {
     const gameDir = dir;
     if (!gameDir || hydratedDir === gameDir) return;
     hydratedDir = gameDir;
-    void refreshAgentData(true);
+    ensureFiltersGameDir(gameDir);
+    const saved = getSavedFilter(get(filterCache), "agent");
+    skipFilterReload = true;
+    if (saved) {
+      filterValues = {
+        search: saved.search,
+        facets: { [FLAG_FACET]: saved.facets[FLAG_FACET] ?? FACET_ALL, ...saved.facets },
+      };
+    } else {
+      filterValues = emptyValues(queueFilter);
+    }
+    filtersHydrated = true;
+    void refreshAgentData(true).finally(() => {
+      skipFilterReload = false;
+    });
+  });
+
+  $effect(() => {
+    const snapshot = { search: filterValues.search, facets: { ...filterValues.facets } };
+    if (!filtersHydrated) return;
+    setSavedFilter("agent", snapshot);
+  });
+
+  $effect(() => {
+    void filterValues.search;
+    void JSON.stringify(filterValues.facets);
+    if (!filtersHydrated || skipFilterReload || !dir) return;
+    if (searchDebounce) clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(() => {
+      void loadDecisions(true);
+    }, SEARCH_DEBOUNCE_MS);
+    return () => {
+      if (searchDebounce) clearTimeout(searchDebounce);
+    };
   });
 </script>
 
 <Section
   title="Dialogue Review"
-  description="Review and correct generation-only OmniVoice text yourself, or optionally ask Codex or Claude for help. Original game text and exported subtitles are never changed. Agents may choose bounded named pacing presets through bg2-synthesis, but cannot tune raw fields, render, audition, or accept audio candidates."
+  description="Review and correct generation-only OmniVoice text yourself. Original game text and exported subtitles never change. Optional AI assistants can help later on this page."
 >
   {#if !dir}
     <Card>
@@ -450,8 +529,12 @@
     <Card>
       <div class="heading">
         <h3>Review progress</h3>
-        <Button variant="ghost" onclick={loadSummary} disabled={loading}>
-          {loading ? "Refreshing…" : "Refresh"}
+        <Button
+          variant="ghost"
+          onclick={() => refreshAgentData()}
+          disabled={statsLoading || decisionLoading || !dir}
+        >
+          {statsLoading || decisionLoading ? "Updating…" : "Refresh"}
         </Button>
       </div>
       {#if summary}
@@ -460,7 +543,11 @@
           <div><strong>{summary.overridden}</strong><span>overridden</span></div>
           <div><strong>{summary.reviewed}</strong><span>reviewed</span></div>
           <div><strong>{summary.remaining}</strong><span>remaining</span></div>
+          <div><strong>{summary.suspicious}</strong><span>suspicious</span></div>
         </div>
+        {#if statsLoading}
+          <p class="hint">Updating…</p>
+        {/if}
       {:else if loading}
         <p class="hint">Loading synthesis review progress…</p>
       {/if}
@@ -469,89 +556,19 @@
 
     <Card>
       <div class="heading">
-        <h3>Corpus audit</h3>
-        <Button variant="ghost" onclick={loadAuditSummary} disabled={auditLoading || !dir}>
-          {auditLoading ? "Refreshing…" : "Refresh audit"}
-        </Button>
-      </div>
-      <p class="hint">
-        Deterministic flags show which unique strings deserve human attention. Plain dialogue
-        can be bulk-reviewed; phonetic screams and stutters that remain after Dictionary rules
-        are sent to the flagged queue. Subtitles stay unchanged.
-      </p>
-      {#if auditSummary}
-        <div class="stats audit-stats">
-          <div><strong>{auditSummary.plain_ok}</strong><span>plain ok</span></div>
-          <div><strong>{auditSummary.mapped_ok}</strong><span>mapped ok</span></div>
-          <div><strong>{auditSummary.flagged_undecided}</strong><span>flagged undecided</span></div>
-          <div><strong>{auditSummary.stripped_unknown_cue}</strong><span>unknown cues</span></div>
-          <div><strong>{auditSummary.placement_candidate}</strong><span>placement</span></div>
-          <div><strong>{auditSummary.interpretive_candidate}</strong><span>interpretive</span></div>
-          <div><strong>{auditSummary.tts_unfriendly_spelling}</strong><span>TTS spelling</span></div>
-        </div>
-        {#if auditSummary.stale_reviews_cleared > 0}
-          <p class="hint">
-            Re-queued {auditSummary.stale_reviews_cleared} previously reviewed string(s) whose
-            current synthesis text now needs attention.
-          </p>
-        {/if}
-        <div class="actions">
-          <Button onclick={autoReviewPlainLines} disabled={autoReviewing || !dir}>
-            {autoReviewing ? "Reviewing plain lines…" : "Auto-review plain lines"}
-          </Button>
-        </div>
-      {:else if auditLoading}
-        <p class="hint">Running corpus audit…</p>
-      {/if}
-    </Card>
-
-    <Card>
-      <h3>AI-assisted review</h3>
-      <p class="hint">
-        The app prepares a project-specific workspace with <code>AGENTS.md</code> (Codex),
-        <code>CLAUDE.md</code> (Claude), the <code>set-synthesis</code> skill under
-        <code>.agents/skills/</code> and <code>.claude/skills/</code>, and the
-        <code>bg2-synthesis</code> CLI. Agents record overrides through that CLI rather
-        than editing the database directly. For rare contextual pacing fixes they can use only
-        its named <code>preset</code> choices; raw render tuning remains manual UI-only.
-      </p>
-      <label class="yolo">
-        <input type="checkbox" bind:checked={yolo} />
-        Allow unattended mode (skip agent confirmation prompts)
-      </label>
-      <div class="actions">
-        <Button onclick={() => launch("codex")} disabled={launching !== null}>
-          {launching === "codex" ? "Launching Codex…" : "Launch Codex"}
-        </Button>
-        <Button onclick={() => launch("claude")} disabled={launching !== null}>
-          {launching === "claude" ? "Launching Claude…" : "Launch Claude"}
-        </Button>
-        <Button variant="ghost" onclick={reveal} disabled={revealing}>
-          {revealing ? "Opening…" : "Reveal workspace"}
-        </Button>
-      </div>
-      <p class="hint">
-        The default mapper converts supported cues such as <code>*sigh*</code> and laughter,
-        while stripping unsupported cues such as <code>*sniff*</code> and <code>*breath*</code>.
-        AI assistance is optional; you can make every decision below.
-        Agents cannot render, audition, or accept candidate audio.
-      </p>
-    </Card>
-
-    <Card>
-      <div class="heading">
         <h3>Review queue and decisions</h3>
         <Button
           variant="ghost"
           onclick={() => refreshAgentData()}
-          disabled={decisionLoading || !dir}
+          disabled={decisionLoading || statsLoading || !dir}
         >
-          {decisionLoading ? "Refreshing…" : "Refresh list"}
+          {decisionLoading || statsLoading ? "Refreshing…" : "Refresh list"}
         </Button>
       </div>
       <p class="hint">
-        Start with flagged strings, or page through every remaining unique string. Accept the
-        current mapper output or write a generation-only override directly.
+        Start with flagged strings, or page through remaining unique strings. Accept the current
+        mapper output or write a generation-only override. Search covers the whole corpus, not
+        just this page.
       </p>
       <div class="tabs" role="tablist" aria-label="Review queue filters">
         <button
@@ -615,20 +632,31 @@
           onclick={() => selectKind("suspicious")}
         >
           Suspicious
-          {#if suspiciousCount !== null && suspiciousCount > 0}
-            <span class="tab-count warn">{suspiciousCount}</span>
+          {#if summary && summary.suspicious > 0}
+            <span class="tab-count warn">{summary.suspicious}</span>
           {/if}
         </button>
       </div>
 
-      {#if decisionKind !== "flagged" && decisionKind !== "remaining" && (decisionRows.length > 0 || filterValues.search.trim())}
+      {#if decisionKind === "flagged" || decisionKind === "remaining"}
+        {#if activeRowCount > 0 || filtersActive || decisionLoading}
+          <SearchFilterBar
+            config={queueFilter}
+            items={queueRows}
+            bind:values={filterValues}
+            shown={activeRowCount}
+            total={filtersActive ? activeRowCount : kindTotal}
+            label={filtersActive ? "matching on this page" : "strings"}
+          />
+        {/if}
+      {:else if activeRowCount > 0 || filtersActive || decisionLoading}
         <SearchFilterBar
           config={decisionFilter}
           items={decisionRows}
           bind:values={filterValues}
-          shown={filteredRows.length}
-          total={decisionRows.length}
-          label="on this page"
+          shown={activeRowCount}
+          total={filtersActive ? activeRowCount : kindTotal}
+          label={filtersActive ? "matching on this page" : "strings"}
         />
       {/if}
 
@@ -644,13 +672,17 @@
         </p>
         <Button onclick={loadReviewedFirstPage}>Load first page</Button>
       {:else if decisionLoading}
-        <p class="hint">Loading processed decisions…</p>
+        <p class="hint">Loading review queue…</p>
       {:else if decisionKind === "flagged" || decisionKind === "remaining"}
         {#if queueRows.length === 0}
           <p class="hint">
-            {decisionKind === "flagged"
-              ? "No flagged undecided strings — check Remaining or existing overrides."
-              : "No undecided strings remain for this install."}
+            {#if filtersActive}
+              No strings match the current search on this page of the corpus.
+            {:else if decisionKind === "flagged"}
+              No flagged undecided strings — check Remaining or existing overrides.
+            {:else}
+              No undecided strings remain for this install.
+            {/if}
           </p>
         {:else}
           <ul class="decision-list">
@@ -679,7 +711,7 @@
                   </Button>
                   <Button
                     variant="ghost"
-                    onclick={() => (editingLineId = row.line_id)}
+                    onclick={() => startEdit(row.line_id, row.mapped_text)}
                     disabled={rowActionId !== null || (editingLineId !== null && editingLineId !== row.line_id)}
                   >Edit generation text</Button>
                 </div>
@@ -688,6 +720,7 @@
                     lineId={row.line_id}
                     initialText={row.mapped_text}
                     sharedLineCount={row.shared_line_count}
+                    previewText={editPreviewText(row.line_id)}
                     onsaved={editorSaved}
                     oncancel={() => (editingLineId = null)}
                   />
@@ -696,17 +729,17 @@
             {/each}
           </ul>
         {/if}
-      {:else if filteredRows.length === 0}
+      {:else if decisionRows.length === 0}
         <p class="hint">
-          {#if decisionRows.length === 0}
-            No {decisionKind} entries for this install yet.
+          {#if filtersActive}
+            No {decisionKind} entries match the current search.
           {:else}
-            No rows match the current filter on this page.
+            No {decisionKind} entries for this install yet.
           {/if}
         </p>
       {:else}
         <ul class="decision-list">
-          {#each filteredRows as row (row.line_id)}
+          {#each decisionRows as row (row.line_id)}
             <li class="decision-row" class:suspicious={!!row.audit_reason}>
               <div class="row-meta">
                 <span>line {row.line_id}</span>
@@ -733,7 +766,7 @@
                 <Button
                   variant="ghost"
                   disabled={rowActionId !== null || (editingLineId !== null && editingLineId !== row.line_id)}
-                  onclick={() => (editingLineId = row.line_id)}
+                  onclick={() => startEdit(row.line_id, row.synthesis_text ?? row.mapped_text)}
                 >Edit generation text</Button>
                 {#if decisionKind === "reviewed"}
                   <Button
@@ -759,6 +792,7 @@
                   initialText={row.synthesis_text ?? row.mapped_text}
                   sharedLineCount={row.shared_line_count}
                   hasOverride={row.synthesis_text !== null}
+                  previewText={editPreviewText(row.line_id)}
                   onsaved={editorSaved}
                   oncleared={editorCleared}
                   oncancel={() => (editingLineId = null)}
@@ -772,7 +806,9 @@
       {#if activeRowCount > 0 || decisionPage > 0}
         <div class="pager">
           <span class="pager-count">
-            {#if kindTotal > 0}
+            {#if filtersActive}
+              Showing {pageFrom}–{pageTo} matching (page {decisionPage + 1})
+            {:else if kindTotal > 0}
               Showing {pageFrom}–{pageTo} of {kindTotal}
             {:else}
               Page {decisionPage + 1}
@@ -808,6 +844,78 @@
           {resetting ? "Resetting…" : "Reset all review state"}
         </Button>
       </div>
+    </Card>
+
+    <Card>
+      <div class="heading">
+        <h3>Corpus audit</h3>
+        <Button
+          variant="ghost"
+          onclick={() => refreshAllStats()}
+          disabled={auditLoading || statsLoading || !dir}
+        >
+          {auditLoading || statsLoading ? "Refreshing…" : "Refresh audit"}
+        </Button>
+      </div>
+      <p class="hint">
+        Deterministic flags show which unique strings deserve attention. Plain dialogue can be
+        bulk-reviewed; phonetic screams and stutters that remain after Dictionary rules go to the
+        flagged queue. Subtitles stay unchanged.
+      </p>
+      {#if auditSummary}
+        <div class="stats audit-stats">
+          <div><strong>{auditSummary.plain_ok}</strong><span>plain ok</span></div>
+          <div><strong>{auditSummary.mapped_ok}</strong><span>mapped ok</span></div>
+          <div><strong>{auditSummary.flagged_undecided}</strong><span>flagged undecided</span></div>
+          <div><strong>{auditSummary.stripped_unknown_cue}</strong><span>unknown cues</span></div>
+          <div><strong>{auditSummary.spoken_stage_direction}</strong><span>spoken stage dirs</span></div>
+          <div><strong>{auditSummary.placement_candidate}</strong><span>placement</span></div>
+          <div><strong>{auditSummary.interpretive_candidate}</strong><span>interpretive</span></div>
+          <div><strong>{auditSummary.tts_unfriendly_spelling}</strong><span>TTS spelling</span></div>
+        </div>
+        {#if auditSummary.stale_reviews_cleared > 0}
+          <p class="hint">
+            Re-queued {auditSummary.stale_reviews_cleared} previously reviewed string(s) whose
+            current synthesis text now needs attention.
+          </p>
+        {/if}
+        <div class="actions">
+          <Button onclick={autoReviewPlainLines} disabled={autoReviewing || !dir}>
+            {autoReviewing ? "Reviewing plain lines…" : "Auto-review plain lines"}
+          </Button>
+        </div>
+      {:else if auditLoading}
+        <p class="hint">Running corpus audit…</p>
+      {/if}
+      <ErrorNotice message={auditError} />
+    </Card>
+
+    <Card>
+      <h3>AI-assisted review</h3>
+      <p class="hint">
+        Optional. Stages a workspace with <code>AGENTS.md</code> / <code>CLAUDE.md</code>, the
+        <code>set-synthesis</code> skill, and the <code>bg2-synthesis</code> CLI so an agent can
+        record overrides without editing the database directly.
+      </p>
+      <label class="yolo">
+        <input type="checkbox" bind:checked={yolo} />
+        Allow unattended mode (skip agent confirmation prompts)
+      </label>
+      <div class="actions">
+        <Button onclick={() => launch("codex")} disabled={launching !== null}>
+          {launching === "codex" ? "Launching Codex…" : "Launch Codex"}
+        </Button>
+        <Button onclick={() => launch("claude")} disabled={launching !== null}>
+          {launching === "claude" ? "Launching Claude…" : "Launch Claude"}
+        </Button>
+        <Button variant="ghost" onclick={reveal} disabled={revealing}>
+          {revealing ? "Opening…" : "Reveal workspace"}
+        </Button>
+      </div>
+      <p class="hint">
+        You can make every decision in the queue above. Agents cannot render, audition, or accept
+        candidate audio.
+      </p>
     </Card>
   {/if}
 </Section>

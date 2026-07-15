@@ -19,10 +19,44 @@ struct Migration {
 }
 
 /// The ordered migration list. Append-only.
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: V1_INITIAL_SCHEMA,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: V1_INITIAL_SCHEMA,
+    },
+    Migration {
+        version: 2,
+        sql: V2_GENERATION_SYNTHESIS_STALE,
+    },
+    Migration {
+        version: 3,
+        sql: V3_TAG_RULE,
+    },
+];
+
+/// v2 — keep completed clips playable when Dictionary / synthesis text drifts.
+/// `synthesis_stale=1` means preview stays available but Generation can filter
+/// "text changed" lines for selective re-render.
+const V2_GENERATION_SYNTHESIS_STALE: &str = r#"
+ALTER TABLE generation ADD COLUMN synthesis_stale INTEGER NOT NULL DEFAULT 0
+    CHECK (synthesis_stale IN (0, 1));
+"#;
+
+/// v3 — machine-wide OmniVoice tag rules (stage cues + optional spoken words).
+const V3_TAG_RULE: &str = r#"
+CREATE TABLE IF NOT EXISTS tag_rule (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    find_text   TEXT NOT NULL,
+    tag         TEXT NOT NULL,
+    match_kind  TEXT NOT NULL DEFAULT 'stage_cue'
+        CHECK (match_kind IN ('whole_word', 'stage_cue')),
+    enabled     INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    is_default  INTEGER NOT NULL DEFAULT 0 CHECK (is_default IN (0, 1)),
+    updated_at  TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_tag_rule_find
+    ON tag_rule(lower(find_text), match_kind, is_default);
+"#;
 
 /// v1 - the initial release schema.
 ///

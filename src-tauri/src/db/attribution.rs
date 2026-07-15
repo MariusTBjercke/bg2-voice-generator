@@ -413,8 +413,8 @@ fn write_attribution(
 }
 
 /// Re-run token stand-ins on every line in `project_id` that was tokenized (or still
-/// carries tokens). Updates spoken `text`, status, and resets `done` generations when
-/// the spoken transcript changes.
+/// carries tokens). Updates spoken `text`, status, and marks `done` generations as
+/// text-changed (still playable) when the spoken transcript changes.
 pub fn reapply_token_standins(
     conn: &mut Connection,
     project_id: i64,
@@ -539,10 +539,9 @@ pub fn reapply_token_standins(
         }
 
         if text_changed {
-            let n = tx.execute(
-                "UPDATE generation SET status='pending', output_path=NULL \
-                 WHERE line_id=?1 AND status IN ('done', 'running')",
-                params![row.id],
+            let n = crate::db::generation::mark_generations_synthesis_stale_for_line_ids(
+                &tx,
+                &[row.id],
             )?;
             reset_generations += n;
         }

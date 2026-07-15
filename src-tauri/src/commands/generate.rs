@@ -27,9 +27,9 @@ use crate::db::generation::{
     approved_primary_sample, clone_by_id, clone_for_speaker, clones_for_project,
     candidate_for_line, candidates_for_project, completed_generations_for_project, discard_candidate,
     fail_candidate, fallback_donor_pool, finish_candidate, get_or_create_generation,
-    line_render_override_for, prepare_candidate, render_settings_for_clone, set_clone_status,
-    unvoiced_speakers, update_clone_render_settings, upsert_clone, write_line_render_override,
-    mark_done,
+    line_render_override_for, prepare_candidate, recover_orphaned_generation_files,
+    render_settings_for_clone, set_clone_status, unvoiced_speakers, update_clone_render_settings,
+    upsert_clone, write_line_render_override, mark_done,
 };
 use crate::db::queries::{line_from_row, LINE_COLUMNS};
 use crate::error::AppError;
@@ -270,6 +270,13 @@ pub async fn bind_clone(
             CloneStatus::Ready,
         )?;
     }
+    crate::generator::metadata_binding::refresh_generic_clones_for_donor(
+        &conn,
+        project_id,
+        speaker_id,
+        sample_id,
+        Path::new(&derivative),
+    )?;
     let clone = clone_for_speaker(&conn, speaker_id)?
         .ok_or_else(|| AppError::Other("clone vanished after upsert".into()))?;
     Ok(BindCloneResult {
@@ -667,6 +674,22 @@ pub async fn set_clone_references(
             )?;
         let clone = clone_by_id(&conn, clone_id)?
             .ok_or_else(|| AppError::Other(format!("no clone with id {clone_id}")))?;
+        if changed {
+            let donor_speaker_id = clone.speaker_id;
+            let primary_sample_id = sample_ids[0];
+            let derivative: String = conn.query_row(
+                "SELECT local_derivative_path FROM reference_sample WHERE id=?1",
+                [primary_sample_id],
+                |row| row.get(0),
+            )?;
+            crate::generator::metadata_binding::refresh_generic_clones_for_donor(
+                &conn,
+                project_id,
+                donor_speaker_id,
+                primary_sample_id,
+                Path::new(&derivative),
+            )?;
+        }
         (
             clone,
             references,
@@ -1571,6 +1594,7 @@ pub struct CompletedGeneration {
     pub line_id: i64,
     pub output_path: String,
     pub voice_changed: bool,
+    pub text_changed: bool,
 }
 
 /// Result of explicitly removing generated derivatives for one project.
@@ -1604,15 +1628,20 @@ pub async fn list_completed_generations(
     let Some(project_id) = project_id else {
         return Ok(Vec::new());
     };
+    let workspace = workspace_dir(&state.db_path, project_id);
+    let _ = recover_orphaned_generation_files(&conn, project_id, &workspace)?;
     let rows = completed_generations_for_project(&conn, project_id)?;
     Ok(rows
         .into_iter()
-        .filter(|(_, path, _)| Path::new(path).exists())
-        .map(|(line_id, output_path, voice_changed)| CompletedGeneration {
-            line_id,
-            output_path,
-            voice_changed,
-        })
+        .filter(|(_, path, _, _)| Path::new(path).exists())
+        .map(
+            |(line_id, output_path, voice_changed, text_changed)| CompletedGeneration {
+                line_id,
+                output_path,
+                voice_changed,
+                text_changed,
+            },
+        )
         .collect())
 }
 
@@ -1997,6 +2026,23 @@ mod tests {
         insert_clone(&conn, spk, "ready");
         let line_id = insert_line(&conn, pid, 1, Some(spk), "ready");
         conn.execute("UPDATE line SET text='...' WHERE id=?1", params![line_id])
+            .unwrap();
+
+        assert!(generatable_lines(&conn, pid).unwrap().is_empty());
+        let status: String = conn
+            .query_row("SELECT status FROM line WHERE id=?1", params![line_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "ready", "read-time compatibility filter must not rewrite existing data");
+    }
+
+    #[test]
+    fn generatable_lines_omit_angle_annotation_only_rows_without_mutating_them() {
+        let conn = mem_db();
+        let pid = insert_project(&conn);
+        let spk = insert_speaker(&conn, pid, "IMOEN");
+        insert_clone(&conn, spk, "ready");
+        let line_id = insert_line(&conn, pid, 1, Some(spk), "ready");
+        conn.execute("UPDATE line SET text='<losing battle>' WHERE id=?1", params![line_id])
             .unwrap();
 
         assert!(generatable_lines(&conn, pid).unwrap().is_empty());

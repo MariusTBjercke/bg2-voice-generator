@@ -34,10 +34,30 @@ pub struct ZippedPack {
     pub setup_exe: Option<String>,
 }
 
+/// Count every ZIP entry that `zip_pack` would write: one root entry per file and
+/// directory under `pack_dir` (excluding the pack root itself), plus the setup exe
+/// when WeiDU will be bundled.
+pub fn count_zip_entries(pack_dir: &Path, bundle_weidu: bool) -> usize {
+    let pack_entries = walkdir::WalkDir::new(pack_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .strip_prefix(pack_dir)
+                .map(|rel| !rel.as_os_str().is_empty())
+                .unwrap_or(false)
+        })
+        .count();
+    pack_entries + usize::from(bundle_weidu)
+}
+
 /// Stage the bundled WeiDU as `setup-<pack>.exe` BESIDE `pack_dir` (when `weidu` is
 /// `Some` and exists), then archive both into `<pack_name>-<edition>.zip`: the setup
 /// exe at the ZIP root next to the `<pack>/` folder, so extracting the ZIP into the
 /// game directory yields the canonical WeiDU layout.
+///
+/// When `on_progress` is set it is called once per archived entry as
+/// `(index_1based, entry_total, entry_name)`.
 ///
 /// `pack_dir` is the item-09 pack folder (its file name is the pack name). Returns the
 /// written ZIP path + the staged setup exe name. Overwrites a prior ZIP of the same name.
@@ -45,6 +65,7 @@ pub fn zip_pack(
     pack_dir: &Path,
     edition: &str,
     weidu: Option<&Path>,
+    mut on_progress: Option<&mut dyn FnMut(usize, usize, &str)>,
 ) -> Result<ZippedPack, AppError> {
     let pack_name = pack_dir
         .file_name()
@@ -75,6 +96,18 @@ pub fn zip_pack(
         std::fs::remove_file(&zip_path)?;
     }
 
+    let entry_total = count_zip_entries(pack_dir, setup_exe.is_some());
+    let mut entry_index = 0usize;
+    let mut tick = |name: &str| {
+        if entry_total == 0 {
+            return;
+        }
+        entry_index += 1;
+        if let Some(progress) = &mut on_progress {
+            progress(entry_index, entry_total, name);
+        }
+    };
+
     let file = std::fs::File::create(&zip_path)?;
     let mut zip = zip::ZipWriter::new(file);
     let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
@@ -85,6 +118,7 @@ pub fn zip_pack(
             .map_err(|e| AppError::Other(format!("zip start_file {name} failed: {e}")))?;
         let bytes = std::fs::read(out_dir.join(name))?;
         zip.write_all(&bytes)?;
+        tick(name);
     }
 
     // The pack folder sits under one top-level <pack>/ entry; entry names are
@@ -109,6 +143,7 @@ pub fn zip_pack(
             let bytes = std::fs::read(entry.path())?;
             zip.write_all(&bytes)?;
         }
+        tick(&name);
     }
     zip.finish()
         .map_err(|e| AppError::Other(format!("zip finalize failed: {e}")))?;
@@ -139,10 +174,18 @@ mod tests {
     }
 
     #[test]
+    fn count_zip_entries_matches_archived_pack_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = fake_pack(dir.path(), "BG2VG");
+        assert_eq!(count_zip_entries(&pack, false), 5);
+        assert_eq!(count_zip_entries(&pack, true), 6);
+    }
+
+    #[test]
     fn zips_pack_under_one_top_level_folder_with_forward_slashes() {
         let dir = tempfile::tempdir().unwrap();
         let pack = fake_pack(dir.path(), "BG2VG");
-        let z = zip_pack(&pack, "bg2ee", None).unwrap();
+        let z = zip_pack(&pack, "bg2ee", None, None).unwrap();
         assert_eq!(z.zip_path.file_name().unwrap(), "BG2VG-bg2ee.zip");
         assert!(z.setup_exe.is_none());
         let names = entry_names(&z.zip_path);
@@ -158,7 +201,7 @@ mod tests {
         let pack = fake_pack(dir.path(), "BG2VG");
         let weidu = dir.path().join("weidu.exe");
         std::fs::write(&weidu, b"MZfake").unwrap();
-        let z = zip_pack(&pack, "bg2ee", Some(&weidu)).unwrap();
+        let z = zip_pack(&pack, "bg2ee", Some(&weidu), None).unwrap();
         assert_eq!(z.setup_exe.as_deref(), Some("setup-BG2VG.exe"));
         // Staged BESIDE the pack folder (the game-root layout), never inside it.
         assert!(dir.path().join("setup-BG2VG.exe").exists());
@@ -176,7 +219,7 @@ mod tests {
     fn missing_weidu_still_produces_a_valid_zip() {
         let dir = tempfile::tempdir().unwrap();
         let pack = fake_pack(dir.path(), "BG2VG");
-        let z = zip_pack(&pack, "bg2ee", Some(&dir.path().join("nope.exe"))).unwrap();
+        let z = zip_pack(&pack, "bg2ee", Some(&dir.path().join("nope.exe")), None).unwrap();
         assert!(z.setup_exe.is_none());
         assert!(!dir.path().join("setup-BG2VG.exe").exists());
         assert!(z.zip_path.exists());

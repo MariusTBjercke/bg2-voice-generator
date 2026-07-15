@@ -70,7 +70,7 @@ fn stage_workspace(
     game_dir: &str,
 ) -> Result<PathBuf, AppError> {
     let (project_id, game_root) = project_for_game_dir(conn, game_dir)?;
-    let summary = crate::synthesis::tagging_summary(conn, Some(project_id))?;
+    let summary = crate::synthesis::tagging_summary(conn, Some(project_id), true)?;
     let context = WorkspaceContext {
         cli_path: cli_path(),
         db_path: db_path.to_string_lossy().into_owned(),

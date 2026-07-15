@@ -10,6 +10,7 @@
   import Pager from "$lib/components/Pager.svelte";
   import SearchableMultiSelect from "$lib/components/SearchableMultiSelect.svelte";
   import SynthesisTextEditor from "$lib/components/SynthesisTextEditor.svelte";
+  import ExpandableText from "$lib/components/ExpandableText.svelte";
   import {
     DEFAULT_CHARNAME_STANDIN,
     lineUsesCharname,
@@ -78,13 +79,19 @@
     { value: "missing", label: "Missing" },
     { value: "generated", label: "Generated" },
     { value: "voice_changed", label: "Voice changed" },
+    { value: "text_changed", label: "Text changed" },
     { value: "running", label: "Running" },
     { value: "failed", label: "Failed" },
   ] as const;
   // The compute-target setting the in-app installer reads (auto|cpu|cuda; "" = auto).
   const KEY_INSTALL_GPU = "omnivoice_install_gpu";
 
-  type GenState = { status: "running" | "done" | "stale" | "failed"; result?: LineResult; error?: string };
+  type GenState = {
+    status: "running" | "done" | "stale" | "text_stale" | "failed";
+    textChanged?: boolean;
+    result?: LineResult;
+    error?: string;
+  };
 
   let status = $state<EngineStatus | null>(null);
   let starting = $state(false);
@@ -133,6 +140,9 @@
 
   let audio = $state<HTMLAudioElement | null>(null);
   let playingId = $state<number | null>(null);
+  // Webview asset URLs are cached by path; force-regenerate overwrites the same
+  // `.ogg`, so each successful rewrite bumps a token used as `assetUrl` cache-bust.
+  let audioCacheBust = $state<Record<number, number>>({});
   let synthesisPreviews = $state<Record<number, SynthesisPreview | "loading" | "error">>({});
   let editingSynthesisLineId = $state<number | null>(null);
   let synthesisNotes = $state<Record<number, string>>({});
@@ -225,12 +235,34 @@
   const scopeItems = $derived<GenerationScopeItem[]>(lines.map((line) => {
     const speaker = line.speaker_id === null ? null : (speakerById.get(line.speaker_id) ?? null);
     const current = gen[line.id]?.status;
+    const textChanged = gen[line.id]?.textChanged === true || current === "text_stale";
+    const voiceChanged = current === "stale";
+    const renderStates: GenerationScopeItem["renderStates"] = [];
+    if (current === "running") renderStates.push("running");
+    else if (current === "failed") renderStates.push("failed");
+    else if (current === "done" || current === "stale" || current === "text_stale") {
+      renderStates.push("generated");
+      if (voiceChanged) renderStates.push("voice_changed");
+      if (textChanged) renderStates.push("text_changed");
+    } else {
+      renderStates.push("missing");
+    }
+    const renderState = voiceChanged
+      ? "voice_changed"
+      : textChanged
+        ? "text_changed"
+        : current === "done"
+          ? "generated"
+          : current === "running" || current === "failed"
+            ? current
+            : "missing";
     return {
       line,
       speaker,
       demographic: demographicFor(speaker),
       binding: line.speaker_id === null ? null : (bindingBySpeaker.get(line.speaker_id) ?? null),
-      renderState: current === "done" ? "generated" : current === "stale" ? "voice_changed" : current ?? "missing",
+      renderState,
+      renderStates,
     };
   }));
 
@@ -293,7 +325,14 @@
     bindingModes: { demographic: "Demographic default", personal: "Personal override" },
     donors: labelRecord(donorOptions),
     dlgs: labelRecord(dlgOptions),
-    renderStates: { missing: "Missing", generated: "Generated", voice_changed: "Voice changed", running: "Running", failed: "Failed" },
+    renderStates: {
+      missing: "Missing",
+      generated: "Generated",
+      voice_changed: "Voice changed",
+      text_changed: "Text changed",
+      running: "Running",
+      failed: "Failed",
+    },
     lineStates: { ready: "Ready", exported: "Exported" },
     packAudio: { absent: "Pack audio absent", present: "Pack audio present" },
   });
@@ -307,20 +346,37 @@
   const charnameLineCount = $derived(
     lines.filter((line) => lineUsesCharname(line.token_mask)).length,
   );
+
+  function isPlayableGen(state: GenState | undefined): boolean {
+    return state?.status === "done" || state?.status === "stale" || state?.status === "text_stale";
+  }
+
   // Filtered lines with no clip yet - the default batch button's target set.
-  const missingLines = $derived(filteredLines.filter((l) => {
-    const state = gen[l.id]?.status;
-    return state !== "done" && state !== "stale";
-  }));
-  const staleLines = $derived(filteredLines.filter((l) => gen[l.id]?.status === "stale"));
-  const staleReadyLines = $derived(staleLines.filter((line) => {
+  const missingLines = $derived(filteredLines.filter((l) => !isPlayableGen(gen[l.id])));
+
+  const voiceChangedLines = $derived(
+    filteredLines.filter((l) => gen[l.id]?.status === "stale"),
+  );
+  const textChangedLines = $derived(
+    filteredLines.filter((l) => {
+      const state = gen[l.id];
+      return state?.status === "text_stale" || state?.textChanged === true;
+    }),
+  );
+  function lineHasReadyClone(line: Line): boolean {
     if (line.speaker_id === null) return false;
     return bindingBySpeaker.get(line.speaker_id)?.clone_status === "ready";
-  }));
-  const savedFilteredLines = $derived(filteredLines.filter((l) => {
-    const state = gen[l.id]?.status;
-    return state === "done" || state === "stale";
-  }));
+  }
+  const voiceChangedReadyLines = $derived(voiceChangedLines.filter(lineHasReadyClone));
+  const textChangedReadyLines = $derived(textChangedLines.filter(lineHasReadyClone));
+  const changedLines = $derived(
+    filteredLines.filter((l) => {
+      const state = gen[l.id];
+      return state?.status === "stale" || state?.status === "text_stale" || state?.textChanged === true;
+    }),
+  );
+  const changedReadyLines = $derived(changedLines.filter(lineHasReadyClone));
+  const savedFilteredLines = $derived(filteredLines.filter((l) => isPlayableGen(gen[l.id])));
   const prioritizedLines = $derived([...filteredLines].sort((a, b) => Number((diagnostics[b.id]?.flags.length ?? 0) > 0) - Number((diagnostics[a.id]?.flags.length ?? 0))));
   const pagedLines = $derived(
     prioritizedLines.slice(linePage * LINE_PAGE_SIZE, (linePage + 1) * LINE_PAGE_SIZE),
@@ -478,11 +534,19 @@
       });
       const next = { ...gen };
       for (const [lineId, state] of Object.entries(next)) {
-        if (state.status === "done" || state.status === "stale") delete next[Number(lineId)];
+        if (state.status === "done" || state.status === "stale" || state.status === "text_stale") {
+          delete next[Number(lineId)];
+        }
       }
       for (const c of done) {
+        const status = c.voice_changed
+          ? "stale"
+          : c.text_changed
+            ? "text_stale"
+            : "done";
         next[c.line_id] = {
-          status: c.voice_changed ? "stale" : "done",
+          status,
+          textChanged: c.text_changed,
           result: { generation_id: 0, output_path: c.output_path, resumed: true },
         };
       }
@@ -556,6 +620,8 @@
     candidateBusy = { ...candidateBusy, [lineId]: true };
     try {
       const candidate = await invoke<RenderCandidate>("generate_render_candidate", { lineId });
+      stopPlayback(-lineId);
+      bumpAudioCache(-lineId);
       candidates = { ...candidates, [lineId]: candidate };
       candidateNotes = { ...candidateNotes, [lineId]: "Candidate ready. Listen before accepting; your accepted clip is unchanged." };
     } catch (e) { candidateNotes = { ...candidateNotes, [lineId]: String(e) }; }
@@ -566,6 +632,8 @@
     candidateBusy = { ...candidateBusy, [lineId]: true };
     try {
       const result = await invoke<LineResult>("accept_render_candidate", { lineId });
+      stopPlayback(lineId);
+      bumpAudioCache(lineId);
       gen = { ...gen, [lineId]: { status: "done", result } };
       const next = { ...candidates }; delete next[lineId]; candidates = next;
       candidateNotes = { ...candidateNotes, [lineId]: "Candidate accepted." };
@@ -583,19 +651,37 @@
     finally { candidateBusy = { ...candidateBusy, [lineId]: false }; }
   }
 
+  // Webview asset URLs are cached by path; force-regenerate overwrites the same
+  // `.ogg`, so each successful rewrite bumps a token used as `assetUrl` cache-bust.
+  function bumpAudioCache(id: number) {
+    audioCacheBust = { ...audioCacheBust, [id]: Date.now() };
+  }
+
+  function stopPlayback(id: number | null = null) {
+    if (id !== null && playingId !== id) return;
+    if (audio) {
+      audio.pause();
+      audio.removeAttribute("src");
+      audio.load();
+    }
+    playingId = null;
+  }
+
   // The explicit per-line button always RE-renders (force), so a line that already
   // has a clip regenerates instead of silently returning the resumed clip. The batch
   // "Generate all/these" path keeps its resume-skip semantics.
   async function generate(line: Line) {
     const previous = gen[line.id];
+    stopPlayback(line.id);
     gen = { ...gen, [line.id]: { status: "running" } };
     try {
       const result = await invoke<LineResult>("generate_line", { lineId: line.id, force: true });
+      bumpAudioCache(line.id);
       gen = { ...gen, [line.id]: { status: "done", result } };
     } catch (e) {
       gen = {
         ...gen,
-        [line.id]: previous && (previous.status === "done" || previous.status === "stale")
+        [line.id]: previous && isPlayableGen(previous)
           ? { ...previous, error: String(e) }
           : { status: "failed", error: String(e) },
       };
@@ -603,19 +689,32 @@
   }
 
   // Batched generation over the CURRENTLY FILTERED lines. The default (missing-only)
-  // pass skips lines already done; `force` re-renders EVERY filtered line (e.g. after
+  // pass skips lines already done; `all` re-renders EVERY filtered line (e.g. after
   // rebinding a clone to a new reference), overwriting the same stable clip paths.
+  // Text/voice-changed/changed modes force only those stale facets within the current filter.
   // The backend groups lines by speaker/reference and renders each group in GPU
   // batches (capped by the batch-size + char-budget settings), falling back to
   // per-line synthesis if a batch fails - so this is faster than serial while staying
   // resumable. Respecting the filter lets the user generate just one character's
   // lines. Per-line status is updated from the returned outcomes.
-  async function generateAll(force = false, staleOnly = false) {
-    const targets = staleOnly ? staleReadyLines : force ? readyFilteredLines : missingLines;
+  type BatchMode = "missing" | "all" | "text_changed" | "voice_changed" | "changed";
+  async function generateAll(mode: BatchMode) {
+    const targets =
+      mode === "missing"
+        ? missingLines
+        : mode === "all"
+          ? readyFilteredLines
+          : mode === "text_changed"
+            ? textChangedReadyLines
+            : mode === "voice_changed"
+              ? voiceChangedReadyLines
+              : changedReadyLines;
+    const force = mode !== "missing";
     if (targets.length === 0) return;
     const previous = { ...gen };
     genAll = true;
     cancelling = false;
+    for (const l of targets) stopPlayback(l.id);
     // Reflect the pending batch immediately so every targeted line shows "generating".
     const running: Record<number, GenState> = {};
     for (const l of targets) running[l.id] = { status: "running" };
@@ -626,13 +725,17 @@
         force,
       });
       const next = { ...gen };
+      const nextBust = { ...audioCacheBust };
+      const now = Date.now();
       for (const o of res.outcomes) {
         if (o.status === "failed") {
           const prior = previous[o.line_id];
-          next[o.line_id] = prior && (prior.status === "done" || prior.status === "stale")
+          next[o.line_id] = prior && isPlayableGen(prior)
             ? { ...prior, error: o.error ?? "generation failed" }
             : { status: "failed", error: o.error ?? "generation failed" };
         } else {
+          // Resume skips rewrite the same bytes; only bump when a new render landed.
+          if (o.status !== "resumed") nextBust[o.line_id] = now;
           next[o.line_id] = {
             status: "done",
             result: {
@@ -643,6 +746,7 @@
           };
         }
       }
+      audioCacheBust = nextBust;
       // Any targeted line the backend never reported on (e.g. cancelled before its
       // batch ran) falls back from "running" to no state so it can be retried.
       for (const l of targets) {
@@ -657,7 +761,7 @@
       for (const l of targets) {
         if (next[l.id]?.status === "running") {
           const prior = previous[l.id];
-          next[l.id] = prior && (prior.status === "done" || prior.status === "stale")
+          next[l.id] = prior && isPlayableGen(prior)
             ? { ...prior, error: String(e) }
             : { status: "failed", error: String(e) };
         }
@@ -668,17 +772,23 @@
     }
   }
 
-  async function removeGenerated(lineIds: number[], confirmBulk = false) {
+  async function removeGenerated(lineIds: number[]) {
     if (!dir || lineIds.length === 0) return;
-    if (confirmBulk && !window.confirm(`Remove ${lineIds.length} generated clips from this project?`)) return;
+    const message =
+      lineIds.length === 1
+        ? "Remove this generated clip? The audio file will be deleted and the line will need to be generated again."
+        : `Remove ${lineIds.length} generated clips from this project? The audio files will be deleted and those lines will need to be generated again.`;
+    if (!window.confirm(message)) return;
     removing = true;
     linesError = null;
     try {
       await invoke<RemoveGenerationsResult>("remove_generations", { gameDir: dir, lineIds });
       if (playingId !== null && lineIds.includes(playingId)) {
-        audio?.pause();
-        playingId = null;
+        stopPlayback(playingId);
       }
+      const nextBust = { ...audioCacheBust };
+      for (const lineId of lineIds) delete nextBust[lineId];
+      audioCacheBust = nextBust;
       const next = { ...gen };
       for (const lineId of lineIds) delete next[lineId];
       gen = next;
@@ -736,16 +846,12 @@
       return;
     }
     try {
-      audio.src = assetUrl(path);
+      audio.src = assetUrl(path, audioCacheBust[id]);
       await audio.play();
       playingId = id;
     } catch {
       playingId = null;
     }
-  }
-
-  function preview(text: string): string {
-    return text.length > 120 ? `${text.slice(0, 120)}…` : text;
   }
 
   function synthesisSourceLabel(source: SynthesisTextSource): string {
@@ -793,7 +899,7 @@
   ) {
     editingSynthesisLineId = null;
     const reset = result.reset_generations;
-    const detail = reset > 0 ? ` ${reset} generation(s) returned to pending.` : "";
+    const detail = reset > 0 ? ` Marked ${reset} clip(s) as text changed (still playable).` : "";
     synthesisNotes = {
       ...synthesisNotes,
       [lineId]: action === "saved" ? `Override saved.${detail}` : `Override cleared.${detail}`,
@@ -998,7 +1104,7 @@
           {loadingLines ? "Loading…" : "Refresh"}
         </Button>
         <Button
-          onclick={() => generateAll(false)}
+          onclick={() => generateAll("missing")}
           disabled={!canGenerate || genBusy || removing || missingLines.length === 0}
         >
           {#if genBusy}
@@ -1009,21 +1115,35 @@
         </Button>
         <Button
           variant="ghost"
-          onclick={() => generateAll(true, true)}
-          disabled={!canGenerate || genBusy || removing || staleReadyLines.length === 0}
+          onclick={() => generateAll("text_changed")}
+          disabled={!canGenerate || genBusy || removing || textChangedReadyLines.length === 0}
         >
-          Regenerate voice-changed ({staleReadyLines.length})
+          Re-generate text-changed ({textChangedReadyLines.length})
         </Button>
         <Button
           variant="ghost"
-          onclick={() => generateAll(true)}
+          onclick={() => generateAll("voice_changed")}
+          disabled={!canGenerate || genBusy || removing || voiceChangedReadyLines.length === 0}
+        >
+          Re-generate voice-changed ({voiceChangedReadyLines.length})
+        </Button>
+        <Button
+          variant="ghost"
+          onclick={() => generateAll("changed")}
+          disabled={!canGenerate || genBusy || removing || changedReadyLines.length === 0}
+        >
+          Re-generate all changed ({changedReadyLines.length})
+        </Button>
+        <Button
+          variant="ghost"
+          onclick={() => generateAll("all")}
           disabled={!canGenerate || genBusy || removing || readyFilteredLines.length === 0}
         >
           Re-generate all ({readyFilteredLines.length})
         </Button>
         <Button
           variant="ghost"
-          onclick={() => removeGenerated(savedFilteredLines.map((line) => line.id), true)}
+          onclick={() => removeGenerated(savedFilteredLines.map((line) => line.id))}
           disabled={genBusy || removing || savedFilteredLines.length === 0}
         >
           {removing ? "Removing…" : `Remove filtered generated (${savedFilteredLines.length})`}
@@ -1248,10 +1368,17 @@
                   {/if}
                   {#if g?.status === "done"}
                     <StatusBadge tone="success">{g.result?.resumed ? "already done" : "generated"}</StatusBadge>
-                  {:else if g?.status === "stale"}
-                    <span title="This clip uses the speaker's previous bound voice and will still be included in exports until removed or regenerated.">
-                      <StatusBadge tone="warn">voice changed</StatusBadge>
-                    </span>
+                  {:else if g?.status === "stale" || g?.status === "text_stale"}
+                    {#if g.status === "stale"}
+                      <span title="This clip uses the speaker's previous bound voice and will still be included in exports until removed or regenerated.">
+                        <StatusBadge tone="warn">voice changed</StatusBadge>
+                      </span>
+                    {/if}
+                    {#if g.textChanged || g.status === "text_stale"}
+                      <span title="Dictionary or generation text changed after this clip was rendered. Preview still works — use Re-generate to update pronunciation.">
+                        <StatusBadge tone="warn">text changed</StatusBadge>
+                      </span>
+                    {/if}
                   {:else if line.is_voiced}
                     <span title={line.existing_sound_resref ?? undefined}>
                       <StatusBadge tone="info">voiced in game</StatusBadge>
@@ -1272,11 +1399,14 @@
                     </span>
                   {/if}
                 </div>
-                <p class="text">{preview(line.text)}</p>
+                <div class="text">
+                  <ExpandableText text={line.text} />
+                </div>
                 {#if lineUsesCharname(line.token_mask) && line.original_text}
-                  <p class="token-source">
-                    Token source: {preview(line.original_text)}
-                  </p>
+                  <div class="token-source">
+                    <span class="token-source-label">Token source:</span>
+                    <ExpandableText text={line.original_text} />
+                  </div>
                 {/if}
                 {#if lineSynthesisPreview(line.id) && lineSynthesisPreview(line.id) !== "loading" && lineSynthesisPreview(line.id) !== "error"}
                   {@const synth = lineSynthesisPreview(line.id) as SynthesisPreview}
@@ -1285,7 +1415,9 @@
                     <StatusBadge tone={synthesisTone(synth.source)}>
                       {synthesisSourceLabel(synth.source)}
                     </StatusBadge>
-                    <p class="text synth">{preview(synth.resolved_text)}</p>
+                    <div class="text synth">
+                      <ExpandableText text={synth.resolved_text} />
+                    </div>
                     <Button
                       variant="ghost"
                       onclick={() => (editingSynthesisLineId = line.id)}
@@ -1295,12 +1427,22 @@
                     </Button>
                   </div>
                   {#if synth.applied_rules.length}
-                    <p class="synth-note">
-                      Dictionary:
-                      {synth.applied_rules
-                        .map((rule) => `${rule.find_text} → ${rule.speak_as}`)
-                        .join(", ")}
-                    </p>
+                    <div class="synth-note">
+                      <ExpandableText
+                        text={`Dictionary: ${synth.applied_rules
+                          .map((rule) => `${rule.find_text} → ${rule.speak_as}`)
+                          .join(", ")}`}
+                      />
+                    </div>
+                  {/if}
+                  {#if synth.applied_tag_rules?.length}
+                    <div class="synth-note">
+                      <ExpandableText
+                        text={`Tag: ${synth.applied_tag_rules
+                          .map((rule) => `${rule.find_text} → ${rule.tag}`)
+                          .join(", ")}`}
+                      />
+                    </div>
                   {/if}
                   {#if synthesisNotes[line.id]}
                     <p class="synth-note">{synthesisNotes[line.id]}</p>
@@ -1351,7 +1493,7 @@
                   </div>
                 {/if}
                 {#if candidateNotes[line.id]}<p class="synth-note">{candidateNotes[line.id]}</p>{/if}
-                {#if (g?.status === "done" || g?.status === "stale") && g.result}
+                {#if isPlayableGen(g) && g.result}
                   <div class="audio-row">
                     <button
                       class="play"
@@ -1374,7 +1516,7 @@
                   onclick={() => generate(line)}
                   disabled={!canGenerate || !lineHasReadyBinding(line) || genBusy || removing || g?.status === "running"}
                 >
-                  {g?.status === "done" || g?.status === "stale" ? "Re-generate" : "Generate"}
+                  {isPlayableGen(g) ? "Re-generate" : "Generate"}
                 </Button>
                 {#if g?.status === "stale" && !lineHasReadyBinding(line)}
                   <p class="hint binding-needed">Bind a voice to regenerate.</p>
@@ -1434,9 +1576,16 @@
     color: var(--text);
   }
   .token-source {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--space-2);
     margin: var(--space-1) 0 0;
     font-size: 0.8rem;
     color: var(--text-muted);
+  }
+  .token-source-label {
+    flex-shrink: 0;
   }
   .engine {
     display: flex;

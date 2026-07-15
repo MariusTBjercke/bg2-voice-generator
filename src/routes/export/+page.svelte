@@ -24,7 +24,7 @@
 
   const dir = $derived($project.gameDir);
   const cached = $derived($results.export.result);
-  // Live backend progress for the pack build (coarse/indeterminate).
+  // Live backend progress for the pack build (determinate: staging + ZIP).
   const exportProgress = $derived($progress.export ?? null);
 
   let packName = $state("");

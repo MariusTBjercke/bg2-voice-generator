@@ -5,6 +5,10 @@ import type {
   DictionaryPreview,
   DictionaryRule,
   DictionaryWriteResult,
+  TagMatchKind,
+  TagRule,
+  TagRulesPreview,
+  TagRuleWriteResult,
   EffectiveSpeakerBinding,
   EngineStatus,
   HealthReport,
@@ -185,7 +189,7 @@ function line(
 
 /** Lines eligible for generation (speaker 1 has a ready clone in fixtures). */
 export const generatableLines: Line[] = [
-  line(1, 22570, "<losing battle>", 1, "ready"),
+  line(1, 22570, "I cannot hold them much longer.", 1, "ready"),
   line(
     2,
     22571,
@@ -202,7 +206,9 @@ export const generatableLines: Line[] = [
     line(
       100 + index,
       50000 + index,
-      `Fixture scoped generation line ${index + 1}.`,
+      index === 0
+        ? "This is a deliberately long fixture generation line used to verify truncated dialogue can expand to the full subtitle and mapped synthesis text when needed on the Generation screen."
+        : `Fixture scoped generation line ${index + 1}.`,
       1,
       "ready",
       { state_index: index + 10 },
@@ -504,11 +510,120 @@ export function deleteDictionaryRule(id: number): DictionaryWriteResult {
   return { rule: null, reset_generations: 0 };
 }
 
+export let tagRules: TagRule[] = [
+  {
+    id: 1,
+    find_text: "sigh",
+    tag: "[sigh]",
+    match_kind: "stage_cue",
+    enabled: true,
+    is_default: true,
+    updated_at: "now",
+  },
+  {
+    id: 2,
+    find_text: "laugh",
+    tag: "[laughter]",
+    match_kind: "stage_cue",
+    enabled: true,
+    is_default: true,
+    updated_at: "now",
+  },
+  {
+    id: 3,
+    find_text: "Bah",
+    tag: "[dissatisfaction-hnn]",
+    match_kind: "whole_word",
+    enabled: true,
+    is_default: true,
+    updated_at: "now",
+  },
+];
+
+export const supportedInlineTags = [
+  "[laughter]",
+  "[sigh]",
+  "[confirmation-en]",
+  "[question-en]",
+  "[question-ah]",
+  "[question-oh]",
+  "[question-ei]",
+  "[question-yi]",
+  "[surprise-ah]",
+  "[surprise-oh]",
+  "[surprise-wa]",
+  "[surprise-yo]",
+  "[dissatisfaction-hnn]",
+];
+
+export function previewTagRules(text: string): TagRulesPreview {
+  const applied = tagRules.filter((rule) => rule.enabled);
+  let after = text;
+  const applied_rules: TagRulesPreview["applied_rules"] = [];
+  for (const rule of applied.filter((r) => r.match_kind === "stage_cue")) {
+    const re = new RegExp(`\\*${rule.find_text}\\*`, "gi");
+    if (re.test(after)) {
+      after = after.replace(re, rule.tag);
+      applied_rules.push({
+        id: rule.id,
+        find_text: rule.find_text,
+        tag: rule.tag,
+        match_kind: rule.match_kind,
+      });
+    }
+  }
+  for (const rule of applied.filter((r) => r.match_kind === "whole_word")) {
+    const re = new RegExp(`\\b${rule.find_text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "gi");
+    if (re.test(after)) {
+      after = after.replace(re, rule.tag);
+      applied_rules.push({
+        id: rule.id,
+        find_text: rule.find_text,
+        tag: rule.tag,
+        match_kind: rule.match_kind,
+      });
+    }
+  }
+  return { before: text, after, applied_rules };
+}
+
+export function upsertTagRule(args: {
+  id: number | null;
+  findText: string;
+  tag: string;
+  matchKind: TagMatchKind;
+  enabled: boolean;
+}): TagRuleWriteResult {
+  const id = args.id ?? Math.max(0, ...tagRules.map((rule) => rule.id)) + 1;
+  const rule: TagRule = {
+    id,
+    find_text: args.findText,
+    tag: args.tag,
+    match_kind: args.matchKind,
+    enabled: args.enabled,
+    is_default: false,
+    updated_at: "now",
+  };
+  tagRules = [...tagRules.filter((entry) => entry.id !== id), rule];
+  return { rule, reset_generations: 0 };
+}
+
+export function setTagRuleEnabled(id: number, enabled: boolean): TagRuleWriteResult {
+  tagRules = tagRules.map((rule) => (rule.id === id ? { ...rule, enabled } : rule));
+  return { rule: tagRules.find((rule) => rule.id === id) ?? null, reset_generations: 0 };
+}
+
+export function deleteTagRule(id: number): TagRuleWriteResult {
+  tagRules = tagRules.filter((rule) => rule.id !== id);
+  return { rule: null, reset_generations: 0 };
+}
+
 const initialSynthesisSummary: SynthesisTaggingSummary = {
   unique_strings: 120,
   overridden: 2,
   reviewed: 1,
   remaining: 117,
+  suspicious: 1,
 };
 
 const initialSynthesisDecisions: Record<SynthesisDecisionKind, SynthesisDecisionRow[]> = {
@@ -560,6 +675,7 @@ const initialSynthesisAuditSummary: SynthesisCorpusAuditSummary = {
   plain_ok: 100,
   mapped_ok: 10,
   stripped_unknown_cue: 2,
+  spoken_stage_direction: 0,
   unterminated_asterisk: 0,
   placement_candidate: 1,
   interpretive_candidate: 1,
@@ -594,7 +710,7 @@ const initialSynthesisRemaining: SynthesisReviewRow[] = [
     line_id: 46,
     strref: 10046,
     source_text: "<losing battle>",
-    mapped_text: "<losing battle>",
+    mapped_text: "",
     flags: ["non_speakable"],
     shared_line_count: 1,
   },
@@ -615,16 +731,51 @@ const synthesisPreviewOverrides = new Map<number, string>();
 
 export function listSynthesisDecisions(
   kind: SynthesisDecisionKind,
+  query?: string,
 ): ListSynthesisDecisionsResult {
-  return { rows: [...synthesisDecisions[kind]], next_after: null };
+  const needle = query?.trim().toLowerCase() ?? "";
+  const rows = synthesisDecisions[kind].filter((row) => {
+    if (!needle) return true;
+    const fields = [
+      row.source_text,
+      row.mapped_text,
+      row.synthesis_text ?? "",
+      row.audit_reason ?? "",
+      String(row.strref),
+    ];
+    return fields.some((field) => field.toLowerCase().includes(needle));
+  });
+  return { rows: [...rows], next_after: null };
 }
 
-export function listSynthesisFlagged(): ListSynthesisFlaggedResult {
-  return { rows: [...synthesisFlaggedRows], next_after: null };
+export function listSynthesisFlagged(
+  query?: string,
+  flag?: string,
+): ListSynthesisFlaggedResult {
+  const needle = query?.trim().toLowerCase() ?? "";
+  const rows = synthesisFlaggedRows.filter((row) => {
+    if (flag && !row.flags.includes(flag as (typeof row.flags)[number])) return false;
+    if (!needle) return true;
+    return [row.source_text, row.mapped_text, String(row.strref)].some((field) =>
+      field.toLowerCase().includes(needle),
+    );
+  });
+  return { rows: [...rows], next_after: null };
 }
 
-export function listSynthesisRemaining(): ListSynthesisReviewResult {
-  return { rows: [...synthesisRemainingRows], next_after: null };
+export function listSynthesisRemaining(
+  query?: string,
+  flag?: string,
+): ListSynthesisReviewResult {
+  const needle = query?.trim().toLowerCase() ?? "";
+  const rows = synthesisRemainingRows.filter((row) => {
+    if (flag && !row.flags.includes(flag as (typeof row.flags)[number])) return false;
+    if (!needle) return true;
+    return [row.source_text, row.mapped_text, String(row.strref)].some((field) =>
+      field.toLowerCase().includes(needle),
+    );
+  });
+  return { rows: [...rows], next_after: null };
 }
 
 export function autoReviewSynthesisPlain(): AutoReviewPlainResult {
@@ -654,6 +805,7 @@ export function getSynthesisPreview(lineId: number): SynthesisPreview {
     source: override !== undefined ? "override" : text.includes("*") ? "mapper" : "plain",
     shared_line_count: 1,
     applied_rules: [],
+    applied_tag_rules: [],
   };
 }
 
@@ -721,6 +873,7 @@ export function clearSynthesisOverride(lineId: number): SynthesisWriteResult {
     (row) => row.line_id !== lineId,
   );
   synthesisSummary.overridden = synthesisDecisions.override.length + synthesisDecisions.suspicious.length;
+  synthesisSummary.suspicious = synthesisDecisions.suspicious.length;
   synthesisSummary.remaining =
     synthesisSummary.unique_strings - synthesisSummary.overridden - synthesisSummary.reviewed;
   return { reset_generations: 1 };
@@ -741,6 +894,7 @@ export function resetSynthesisAgentState(): SynthesisAgentResetResult {
   synthesisDecisions.suspicious = [];
   synthesisSummary.overridden = 0;
   synthesisSummary.reviewed = 0;
+  synthesisSummary.suspicious = 0;
   synthesisSummary.remaining = synthesisSummary.unique_strings;
   return {
     overrides_cleared: overridesCleared,

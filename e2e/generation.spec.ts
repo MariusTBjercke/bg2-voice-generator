@@ -40,6 +40,21 @@ test.describe("Generation screen", () => {
     await expect(page.getByText("Plain", { exact: true }).first()).toBeVisible();
   });
 
+  test("expands truncated original and mapped generation text", async ({ page }) => {
+    const row = page.locator(".line").filter({ hasText: "#50000" });
+    const showMore = row.getByRole("button", { name: "Show more" });
+    await expect(showMore.first()).toBeVisible();
+    await expect(
+      row.locator('[title*="deliberately long fixture generation line"]').first(),
+    ).toBeVisible();
+
+    await showMore.first().click();
+    await expect(row.getByRole("button", { name: "Show less" }).first()).toBeVisible();
+    await expect(
+      row.getByText(/deliberately long fixture generation line used to verify/).first(),
+    ).toBeVisible();
+  });
+
   test("combines filters, removes chips, and clears the full scope", async ({ page }) => {
     await page.getByRole("button", { name: "More filters" }).click();
     const speakers = page.locator("details").filter({ has: page.locator("summary", { hasText: "Speakers" }) });
@@ -80,19 +95,23 @@ test.describe("Generation screen", () => {
 
   test("edits generation text inline without changing the subtitle", async ({ page }) => {
     const row = page.locator(".line").filter({ hasText: "#22570" });
-    await expect(row.getByText("<losing battle>", { exact: true }).first()).toBeVisible();
+    await expect(row.getByText("I cannot hold them much longer.", { exact: true }).first()).toBeVisible();
     await row.getByRole("button", { name: "Edit generation text" }).click();
-    await row.getByLabel("Generation text").fill("losing battle");
+    await row.getByLabel("Generation text").fill("I cannot hold them much longer.[dissatisfaction-hnn]");
     await row.getByRole("button", { name: "Save override" }).click();
 
     await expect(row.getByText("Override", { exact: true })).toBeVisible();
-    await expect(row.getByText("losing battle", { exact: true })).toBeVisible();
-    await expect(row.getByText("<losing battle>", { exact: true })).toBeVisible();
+    await expect(row.getByText("I cannot hold them much longer.[dissatisfaction-hnn]", { exact: true })).toBeVisible();
+    await expect(row.getByText("I cannot hold them much longer.", { exact: true })).toBeVisible();
 
     await row.getByRole("button", { name: "Edit generation text" }).click();
     await row.getByRole("button", { name: "Clear override" }).click();
     await expect(row.getByText("Plain", { exact: true })).toBeVisible();
-    await expect(row.getByText(/Override cleared/)).toBeVisible();
+    await expect(page.getByText(/Override cleared/)).toBeVisible();
+  });
+
+  test("omits whole-line angle-bracket annotations from the generatable list", async ({ page }) => {
+    await expect(page.getByText("<losing battle>", { exact: true })).not.toBeVisible();
   });
 
   test("keeps a candidate separate until explicit acceptance", async ({ page }) => {
@@ -128,15 +147,18 @@ test.describe("Generation screen", () => {
     await page.getByRole("button", { name: "Refresh" }).click();
 
     await expect(page.getByText("voice changed", { exact: true })).toHaveCount(2);
-    await expect(page.getByRole("button", { name: "Regenerate voice-changed (2)" })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Re-generate voice-changed (2)" })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Re-generate text-changed (0)" })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Re-generate all changed (2)" })).toBeDisabled();
     await expect(page.getByRole("button", { name: "Remove clip" })).toHaveCount(3);
 
     await page.getByRole("button", { name: "Start engine" }).click();
-    await page.getByRole("button", { name: "Regenerate voice-changed (2)" }).click();
+    await page.getByRole("button", { name: "Re-generate all changed (2)" }).click();
     await expect.poll(async () => page.evaluate(() => JSON.parse(localStorage.getItem("e2e.last-generation-batch") ?? "[]") as number[]))
       .toEqual(staleIds);
     await expect(page.getByText("voice changed", { exact: true })).toHaveCount(0);
 
+    page.once("dialog", (dialog) => dialog.accept());
     await page.getByRole("button", { name: "Remove clip" }).first().click();
     await expect(page.getByRole("button", { name: "Remove clip" })).toHaveCount(2);
   });

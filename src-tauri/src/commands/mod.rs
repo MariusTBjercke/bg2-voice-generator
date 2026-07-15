@@ -18,4 +18,5 @@ pub mod progress;
 pub mod settings;
 pub mod startup;
 pub mod synthesis;
+pub mod tag_rules;
 pub mod transfer;

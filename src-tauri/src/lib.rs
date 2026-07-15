@@ -26,6 +26,8 @@ pub mod omnivoice_tags;
 pub mod synthesis;
 pub mod synthesis_corpus_audit;
 pub mod synthesis_validation;
+pub mod tag_rule_defaults;
+pub mod tag_rules;
 pub mod tts_spelling;
 pub mod transfer;
 pub mod tts;
@@ -118,6 +120,13 @@ pub fn run() {
             commands::dictionary::set_dictionary_rule_enabled,
             commands::dictionary::delete_dictionary_rule,
             commands::dictionary::reset_dictionary_defaults,
+            commands::tag_rules::list_tag_rules,
+            commands::tag_rules::list_supported_inline_tags,
+            commands::tag_rules::preview_tag_rules_text,
+            commands::tag_rules::upsert_tag_rule,
+            commands::tag_rules::set_tag_rule_enabled,
+            commands::tag_rules::delete_tag_rule,
+            commands::tag_rules::reset_tag_rule_defaults,
             commands::agent::prepare_agent_workspace,
             commands::agent::reveal_agent_workspace,
             commands::agent::launch_agent,

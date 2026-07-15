@@ -21,6 +21,7 @@
   import ProgressBar from "$lib/components/ProgressBar.svelte";
   import Pager from "$lib/components/Pager.svelte";
   import SearchFilterBar from "$lib/components/SearchFilterBar.svelte";
+  import ExpandableText from "$lib/components/ExpandableText.svelte";
   import { filterItems, type FilterConfig, type FilterValues } from "$lib/filters";
   import {
     bestApprovedSampleForBinding,
@@ -800,7 +801,9 @@
                       {/if}
                     </div>
                     {#if prov?.source_text}
-                      <p class="transcript" title={prov.source_text}>{prov.source_text}</p>
+                      <div class="transcript">
+                        <ExpandableText text={prov.source_text} maxLength={160} />
+                      </div>
                     {/if}
                     {#if score}
                       <div class="scores">
@@ -1059,11 +1062,6 @@
     font-size: 0.85rem;
     color: var(--text-muted);
     line-height: 1.35;
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
   }
   .scores {
     display: flex;

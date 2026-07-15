@@ -18,13 +18,14 @@ import { migrateLegacyFilterCache, normalizeSimpleFilter } from "$lib/stores/fil
 export { migrateLegacyFilterCache } from "$lib/stores/filterMigration";
 
 /** The pipeline screens that own a persisted filter (the store key per screen). */
-export type FilterScreen = "attribution" | "harvest" | "binding" | "generation";
+export type FilterScreen = "attribution" | "harvest" | "binding" | "generation" | "agent";
 export type SimpleFilterScreen = Exclude<FilterScreen, "generation">;
 
 export interface ScreenFilters {
   attribution?: FilterValues;
   harvest?: FilterValues;
   binding?: FilterValues;
+  agent?: FilterValues;
   generation?: GenerationScope;
 }
 
@@ -49,7 +50,7 @@ function normalizeCache(value: unknown): FilterCache | null {
     ? source.byScreen as Record<string, unknown>
     : {};
   const byScreen: ScreenFilters = {};
-  for (const screen of ["attribution", "harvest", "binding"] as const) {
+  for (const screen of ["attribution", "harvest", "binding", "agent"] as const) {
     const filter = normalizeSimpleFilter(screens[screen]);
     if (filter) byScreen[screen] = filter;
   }

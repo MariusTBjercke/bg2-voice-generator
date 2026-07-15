@@ -49,6 +49,13 @@ COMMANDS:
   dict export [--file <file|->]
   dict test --text <sentence>
   dict scan [--project <id>]
+  tag-rule list [--enabled-only]
+  tag-rule show --id <id>
+  tag-rule add --find <text> --tag <[laughter]|...> [--match whole_word|stage_cue]
+  tag-rule set --id <id> [--find <text>] [--tag <...>] [--match ...] [--enabled <true|false>]
+  tag-rule remove --id <id>
+  tag-rule test --text <sentence>
+  tag-rule reset
 
 Overrides affect generated audio only. They never modify BG2 TLK text or exported subtitles.
 Presets only change line pacing. They cannot render, audition, or accept audio candidates.
@@ -156,9 +163,11 @@ fn open_db(path: &Path) -> Result<Connection, AppError> {
             path.display()
         )));
     }
-    let conn = Connection::open(path)?;
+    let mut conn = Connection::open(path)?;
     crate::db::tune_connection(&conn)?;
+    crate::db::schema::run_migrations(&mut conn)?;
     crate::dictionary::ensure_default_rules(&conn)?;
+    crate::tag_rules::ensure_default_rules(&conn)?;
     Ok(conn)
 }
 
@@ -198,6 +207,14 @@ fn show(conn: &Connection, id: i64) -> Result<(), AppError> {
         println!("mapped: {}", resolved.text);
         for rule in &resolved.applied_rules {
             println!("dictionary: {} -> {}", rule.find_text, rule.speak_as);
+        }
+        for rule in &resolved.applied_tag_rules {
+            println!(
+                "tag ({}): {} -> {}",
+                rule.match_kind.as_str(),
+                rule.find_text,
+                rule.tag
+            );
         }
     }
     println!("synthesis: {}", resolved.text);
@@ -575,9 +592,10 @@ fn dict_command(conn: &mut Connection, args: &[String]) -> Result<(), AppError> 
                 params![find, speak_as, chrono::Utc::now().to_rfc3339()],
             )?;
             let id = conn.last_insert_rowid();
-            let reset = crate::dictionary::reset_completed_generations(conn)?;
+            let reset =
+                crate::dictionary::mark_matching_generations_synthesis_stale(conn, &find)?;
             print_dictionary_rule(&crate::dictionary::rule_by_id(conn, id)?.unwrap());
-            println!("reset generations: {reset}");
+            println!("marked text-changed generations: {reset}");
             Ok(())
         }
         "set" => {
@@ -593,21 +611,28 @@ fn dict_command(conn: &mut Connection, args: &[String]) -> Result<(), AppError> 
                     "built-in rules may only be enabled or disabled".into(),
                 ));
             }
-            let find = value_after(args, "--find").unwrap_or(existing.find_text);
+            let find = value_after(args, "--find").unwrap_or(existing.find_text.clone());
             let speak_as = value_after(args, "--speak-as").unwrap_or(existing.speak_as);
             let (find, speak_as) = crate::dictionary::validate_rule_text(&find, &speak_as)?;
             let enabled = value_after(args, "--enabled")
                 .map(|value| parse_bool(&value))
                 .transpose()?
                 .unwrap_or(existing.enabled);
+            let mut finds = vec![find.clone()];
+            if existing.find_text != find {
+                finds.push(existing.find_text);
+            }
             conn.execute(
                 "UPDATE dictionary_rule SET find_text=?1,speak_as=?2,enabled=?3,updated_at=?4 \
                  WHERE id=?5",
                 params![find, speak_as, enabled, chrono::Utc::now().to_rfc3339(), id],
             )?;
-            let reset = crate::dictionary::reset_completed_generations(conn)?;
+            let find_refs: Vec<&str> = finds.iter().map(String::as_str).collect();
+            let reset = crate::dictionary::mark_matching_generations_synthesis_stale_many(
+                conn, &find_refs,
+            )?;
             print_dictionary_rule(&crate::dictionary::rule_by_id(conn, id)?.unwrap());
-            println!("reset generations: {reset}");
+            println!("marked text-changed generations: {reset}");
             Ok(())
         }
         "remove" => {
@@ -620,9 +645,12 @@ fn dict_command(conn: &mut Connection, args: &[String]) -> Result<(), AppError> 
                     "built-in rules cannot be removed; disable them instead".into(),
                 ));
             }
+            let reset = crate::dictionary::mark_matching_generations_synthesis_stale(
+                conn,
+                &existing.find_text,
+            )?;
             conn.execute("DELETE FROM dictionary_rule WHERE id=?1", [id])?;
-            let reset = crate::dictionary::reset_completed_generations(conn)?;
-            println!("removed rule {id}; reset generations: {reset}");
+            println!("removed rule {id}; marked text-changed generations: {reset}");
             Ok(())
         }
         "import" => {
@@ -649,9 +677,14 @@ fn dict_command(conn: &mut Connection, args: &[String]) -> Result<(), AppError> 
                     ],
                 )?;
             }
-            let reset = crate::dictionary::reset_completed_generations(&tx)?;
+            let finds: Vec<&str> = inputs.iter().map(|input| input.find.as_str()).collect();
+            let reset =
+                crate::dictionary::mark_matching_generations_synthesis_stale_many(&tx, &finds)?;
             tx.commit()?;
-            println!("imported: {}; reset generations: {reset}", inputs.len());
+            println!(
+                "imported: {}; marked text-changed generations: {reset}",
+                inputs.len()
+            );
             Ok(())
         }
         "export" => {
@@ -715,6 +748,170 @@ fn dict_command(conn: &mut Connection, args: &[String]) -> Result<(), AppError> 
     }
 }
 
+fn print_tag_rule(rule: &crate::models::TagRule) {
+    println!(
+        "id={} default={} enabled={} match={}\n  find: {}\n  tag:  {}",
+        rule.id,
+        rule.is_default,
+        rule.enabled,
+        rule.match_kind.as_str(),
+        rule.find_text,
+        rule.tag
+    );
+}
+
+fn tag_rule_command(conn: &mut Connection, args: &[String]) -> Result<(), AppError> {
+    use crate::models::TagMatchKind;
+    let action = args.first().map(String::as_str).ok_or_else(|| {
+        AppError::Other(
+            "tag-rule requires list, show, add, set, remove, test, or reset".into(),
+        )
+    })?;
+    match action {
+        "list" => {
+            let enabled_only = args.iter().any(|arg| arg == "--enabled-only");
+            for rule in crate::tag_rules::list_rules(conn)?
+                .into_iter()
+                .filter(|rule| !enabled_only || rule.enabled)
+            {
+                print_tag_rule(&rule);
+            }
+            Ok(())
+        }
+        "show" => {
+            let id = integer_after(args, "--id")?
+                .ok_or_else(|| AppError::Other("tag-rule show requires --id <id>".into()))?;
+            let rule = crate::tag_rules::rule_by_id(conn, id)?
+                .ok_or_else(|| AppError::Other(format!("tag rule {id} not found")))?;
+            print_tag_rule(&rule);
+            Ok(())
+        }
+        "add" => {
+            let match_kind = value_after(args, "--match")
+                .map(|v| TagMatchKind::parse(&v))
+                .transpose()
+                .map_err(AppError::Other)?
+                .unwrap_or(TagMatchKind::WholeWord);
+            let (find, tag) = crate::tag_rules::validate_rule_text(
+                &value_after(args, "--find").ok_or_else(|| {
+                    AppError::Other("tag-rule add requires --find <text>".into())
+                })?,
+                &value_after(args, "--tag").ok_or_else(|| {
+                    AppError::Other("tag-rule add requires --tag <[sigh]|...>".into())
+                })?,
+                match_kind,
+            )?;
+            conn.execute(
+                "INSERT INTO tag_rule(find_text,tag,match_kind,enabled,is_default,updated_at) \
+                 VALUES(?1,?2,?3,1,0,?4)",
+                params![find, tag, match_kind.as_str(), chrono::Utc::now().to_rfc3339()],
+            )?;
+            let id = conn.last_insert_rowid();
+            let reset = crate::tag_rules::mark_matching_generations_synthesis_stale(
+                conn, &find, match_kind,
+            )?;
+            print_tag_rule(&crate::tag_rules::rule_by_id(conn, id)?.unwrap());
+            println!("marked text-changed generations: {reset}");
+            Ok(())
+        }
+        "set" => {
+            let id = integer_after(args, "--id")?
+                .ok_or_else(|| AppError::Other("tag-rule set requires --id <id>".into()))?;
+            let existing = crate::tag_rules::rule_by_id(conn, id)?
+                .ok_or_else(|| AppError::Other(format!("tag rule {id} not found")))?;
+            if existing.is_default
+                && (value_after(args, "--find").is_some()
+                    || value_after(args, "--tag").is_some()
+                    || value_after(args, "--match").is_some())
+            {
+                return Err(AppError::Other(
+                    "built-in tag rules may only be enabled or disabled".into(),
+                ));
+            }
+            let find = value_after(args, "--find").unwrap_or(existing.find_text.clone());
+            let tag = value_after(args, "--tag").unwrap_or(existing.tag.clone());
+            let match_kind = value_after(args, "--match")
+                .map(|v| TagMatchKind::parse(&v))
+                .transpose()
+                .map_err(AppError::Other)?
+                .unwrap_or(existing.match_kind);
+            let (find, tag) = crate::tag_rules::validate_rule_text(&find, &tag, match_kind)?;
+            let enabled = value_after(args, "--enabled")
+                .map(|value| parse_bool(&value))
+                .transpose()?
+                .unwrap_or(existing.enabled);
+            let mut stale = vec![(find.clone(), match_kind)];
+            if existing.find_text != find || existing.match_kind != match_kind {
+                stale.push((existing.find_text, existing.match_kind));
+            }
+            conn.execute(
+                "UPDATE tag_rule SET find_text=?1,tag=?2,match_kind=?3,enabled=?4,updated_at=?5 \
+                 WHERE id=?6",
+                params![
+                    find,
+                    tag,
+                    match_kind.as_str(),
+                    enabled,
+                    chrono::Utc::now().to_rfc3339(),
+                    id
+                ],
+            )?;
+            let reset =
+                crate::tag_rules::mark_matching_generations_synthesis_stale_many(conn, &stale)?;
+            print_tag_rule(&crate::tag_rules::rule_by_id(conn, id)?.unwrap());
+            println!("marked text-changed generations: {reset}");
+            Ok(())
+        }
+        "remove" => {
+            let id = integer_after(args, "--id")?
+                .ok_or_else(|| AppError::Other("tag-rule remove requires --id <id>".into()))?;
+            let existing = crate::tag_rules::rule_by_id(conn, id)?
+                .ok_or_else(|| AppError::Other(format!("tag rule {id} not found")))?;
+            if existing.is_default {
+                return Err(AppError::Other(
+                    "built-in tag rules cannot be deleted; disable the rule instead".into(),
+                ));
+            }
+            let reset = crate::tag_rules::mark_matching_generations_synthesis_stale(
+                conn,
+                &existing.find_text,
+                existing.match_kind,
+            )?;
+            conn.execute("DELETE FROM tag_rule WHERE id=?1", [id])?;
+            println!("removed tag rule {id}; marked text-changed generations: {reset}");
+            Ok(())
+        }
+        "test" => {
+            let text = value_after(args, "--text").ok_or_else(|| {
+                AppError::Other("tag-rule test requires --text <sentence>".into())
+            })?;
+            let preview = crate::tag_rules::preview_tag_rules(
+                &text,
+                &crate::tag_rules::load_enabled_rules(conn)?,
+            );
+            println!("before: {}", preview.before);
+            println!("after:  {}", preview.after);
+            for rule in preview.applied_rules {
+                println!(
+                    "applied ({}): {} -> {}",
+                    rule.match_kind.as_str(),
+                    rule.find_text,
+                    rule.tag
+                );
+            }
+            Ok(())
+        }
+        "reset" => {
+            let reset = crate::tag_rules::reset_defaults(conn)?;
+            println!("reset tag rule defaults; marked text-changed generations: {reset}");
+            Ok(())
+        }
+        _ => Err(AppError::Other(
+            "tag-rule requires list, show, add, set, remove, test, or reset".into(),
+        )),
+    }
+}
+
 fn execute(conn: &mut Connection, db_path: &Path, command: &str, args: &[String]) -> Result<(), AppError> {
     match command {
         "catalog" => {
@@ -722,16 +919,11 @@ fn execute(conn: &mut Connection, db_path: &Path, command: &str, args: &[String]
                 println!("{tag}");
             }
             println!();
-            println!("Stage-direction mapper (*...* cues):");
-            for (cue, tag) in [
-                ("sigh/sighs", "[sigh]"),
-                ("laugh/chuckle/giggle", "[laughter]"),
-                ("gasp/gasps", "[surprise-ah]"),
-                ("surprise/surprised", "[surprise-oh]"),
-                ("hmm/hmph/grumble", "[dissatisfaction-hnn]"),
-            ] {
-                println!("  {cue} -> {tag}");
+            println!("Stage-direction mapper defaults (editable via `tag-rule` / Dictionary Tag rules):");
+            for (find, tag) in crate::tag_rule_defaults::DEFAULT_STAGE_CUE_TAG_RULES.iter().take(8) {
+                println!("  {find} -> {tag}");
             }
+            println!("  ... (see `tag-rule list` for the full seeded set)");
             println!();
             println!("TTS-unfriendly spelling rewrites (flagged lines only):");
             println!("  B-b-b-but -> But");
@@ -750,6 +942,7 @@ fn execute(conn: &mut Connection, db_path: &Path, command: &str, args: &[String]
             println!("plain_ok={}", summary.plain_ok);
             println!("mapped_ok={}", summary.mapped_ok);
             println!("stripped_unknown_cue={}", summary.stripped_unknown_cue);
+            println!("spoken_stage_direction={}", summary.spoken_stage_direction);
             println!("unterminated_asterisk={}", summary.unterminated_asterisk);
             println!("placement_candidate={}", summary.placement_candidate);
             println!("interpretive_candidate={}", summary.interpretive_candidate);
@@ -778,6 +971,8 @@ fn execute(conn: &mut Connection, db_path: &Path, command: &str, args: &[String]
                 limit,
                 true,
                 undecided_only,
+                None,
+                None,
             )?;
             for row in &result.rows {
                 println!(
@@ -843,10 +1038,14 @@ fn execute(conn: &mut Connection, db_path: &Path, command: &str, args: &[String]
         }
         "progress" => {
             let summary =
-                crate::synthesis::tagging_summary(conn, integer_after(args, "--project")?)?;
+                crate::synthesis::tagging_summary(conn, integer_after(args, "--project")?, true)?;
             println!(
-                "unique={} overridden={} reviewed={} remaining={}",
-                summary.unique_strings, summary.overridden, summary.reviewed, summary.remaining
+                "unique={} overridden={} reviewed={} remaining={} suspicious={}",
+                summary.unique_strings,
+                summary.overridden,
+                summary.reviewed,
+                summary.remaining,
+                summary.suspicious
             );
             Ok(())
         }
@@ -874,6 +1073,7 @@ fn execute(conn: &mut Connection, db_path: &Path, command: &str, args: &[String]
         }
         "preset" => preset_command(conn, db_path, args),
         "dict" => dict_command(conn, args),
+        "tag-rule" => tag_rule_command(conn, args),
         _ => Err(AppError::Other(format!("unknown command: {command}"))),
     }
 }

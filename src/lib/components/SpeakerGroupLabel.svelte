@@ -13,9 +13,9 @@
 </script>
 
 <span class="wrap">
-  <span class="name">{group.display_name}</span>
+  <span class="name" title={group.display_name}>{group.display_name}</span>
   {#if summary}
-    <span class="sub">{summary}</span>
+    <span class="sub" title={summary}>{summary}</span>
   {/if}
 </span>
 

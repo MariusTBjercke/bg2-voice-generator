@@ -14,11 +14,29 @@ pub const TAG_MAPPER_SETTING: &str = "synthesis_tag_mapper_enabled";
 /// Source `[...]` markers are always stripped because they are game annotations,
 /// not trusted OmniVoice markup.
 pub fn synthesis_text_for_generation(text: &str, map_tags: bool) -> String {
+    synthesis_text_for_generation_with_cue_map(text, map_tags, None).0
+}
+
+/// Like [`synthesis_text_for_generation`], but uses `cue_map` (normalized find → tag)
+/// when provided; otherwise the built-in default mapper catalog. Returns the
+/// generation text plus each cue inner that mapped to a tag (for applied-rule UI).
+pub fn synthesis_text_for_generation_with_cue_map(
+    text: &str,
+    map_tags: bool,
+    cue_map: Option<&std::collections::HashMap<String, String>>,
+) -> (String, Vec<String>) {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return String::new();
+        return (String::new(), Vec::new());
+    }
+    // Whole-line `<...>` prose (e.g. `<losing battle>`) is a combat/state label, not
+    // spoken dialogue — same family as `[grunt]`. Dynamic tokens (`<CHARNAME>`) are
+    // left literal; attribution blocks those via `has_tokens`.
+    if is_whole_line_angle_annotation(trimmed) {
+        return (String::new(), Vec::new());
     }
     let mut out = String::with_capacity(trimmed.len());
+    let mut applied_cues = Vec::new();
     let bytes = trimmed.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -27,14 +45,21 @@ pub fn synthesis_text_for_generation(text: &str, map_tags: bool) -> String {
                 let inner = &trimmed[i + 1..i + 1 + rel];
                 let next = i + rel + 2;
                 if map_tags {
-                    if let Some(tag) = omnivoice_tag(inner) {
+                    let tag = match cue_map {
+                        Some(map) => {
+                            crate::omnivoice_tags::stage_direction_to_tag_owned(inner, map)
+                        }
+                        None => omnivoice_tag(inner).map(|s| s.to_owned()),
+                    };
+                    if let Some(tag) = tag {
                         while out.chars().last().is_some_and(char::is_whitespace) {
                             out.pop();
                         }
-                        out.push_str(tag);
+                        out.push_str(&tag);
                         if next < bytes.len() && !(bytes[next] as char).is_whitespace() {
                             out.push(' ');
                         }
+                        applied_cues.push(inner.trim().to_owned());
                     } else {
                         // Some dialog uses `*word*` for emphasis, not a stage direction.
                         // Preserve unknown inner text unless it looks like a non-verbal cue.
@@ -70,7 +95,7 @@ pub fn synthesis_text_for_generation(text: &str, map_tags: bool) -> String {
         out.push(ch);
         i += ch.len_utf8();
     }
-    collapse_whitespace(&out)
+    (collapse_whitespace(&out), applied_cues)
 }
 
 /// True when the mapper strips this unknown `*...*` cue as a non-verbal sound
@@ -81,14 +106,62 @@ pub fn mapper_strips_unknown_cue(inner: &str) -> bool {
 }
 
 fn should_strip_unknown_asterisk(inner: &str) -> bool {
-    if intentionally_stripped_cue(inner) {
-        return true;
+    for variant in crate::omnivoice_tags::cue_lookup_variants(inner) {
+        if intentionally_stripped_cue(&variant) || is_strip_denylist_cue(&variant) {
+            return true;
+        }
     }
+    false
+}
+
+fn is_strip_denylist_cue(normalized: &str) -> bool {
     // Denylist of non-verbal cues that should not be spoken when unknown.
     // (If OmniVoice adds tags for these later, promote them to `omnivoice_tags`.)
+    // Expanded from active-corpus audit of unmapped `*...*` stage directions.
     matches!(
-        inner.trim().to_ascii_lowercase().as_str(),
-        "hic"
+        normalized,
+        "achoo"
+            | "ahem"
+            | "belch"
+            | "belches"
+            | "clap"
+            | "claps"
+            | "crunch"
+            | "crunches"
+            | "erp"
+            | "erf"
+            | "glug"
+            | "glugs"
+            | "grrr"
+            | "growl"
+            | "growls"
+            | "hack"
+            | "hacks"
+            | "hic"
+            | "hiss"
+            | "hisses"
+            | "hisss"
+            | "hissss"
+            | "hisssss"
+            | "moan"
+            | "moans"
+            | "mumble"
+            | "mumbles"
+            | "mutter"
+            | "mutters"
+            | "pant"
+            | "pants"
+            | "panting"
+            | "shiver"
+            | "shivers"
+            | "shudder"
+            | "shudders"
+            | "sniffle"
+            | "sniffling"
+            | "snap"
+            | "snaps"
+            | "yawn"
+            | "yawns"
             | "cough"
             | "coughs"
             | "sneeze"
@@ -126,6 +199,240 @@ pub fn intentionally_stripped_cue(cue: &str) -> bool {
     matches!(
         cue.trim().to_ascii_lowercase().as_str(),
         "sniff" | "sniffs" | "sniffing" | "breath" | "breathes" | "breathing"
+    )
+}
+
+/// True when the mapper maps or strips this cue instead of speaking its inner text.
+pub fn cue_resolved_by_mapper(cue: &str) -> bool {
+    cue_resolved_by_mapper_with(cue, None)
+}
+
+/// Like [`cue_resolved_by_mapper`], using a DB-backed stage-cue map when provided.
+pub fn cue_resolved_by_mapper_with(
+    cue: &str,
+    cue_map: Option<&std::collections::HashMap<String, String>>,
+) -> bool {
+    let tagged = match cue_map {
+        Some(map) => crate::omnivoice_tags::stage_direction_to_tag_owned(cue, map).is_some(),
+        None => omnivoice_tag(cue).is_some(),
+    };
+    tagged || mapper_strips_unknown_cue(cue)
+}
+
+/// True when the mapper leaves this cue's inner text to be spoken verbatim.
+pub fn cue_spoken_as_emphasis(cue: &str) -> bool {
+    cue_spoken_as_emphasis_with(cue, None)
+}
+
+pub fn cue_spoken_as_emphasis_with(
+    cue: &str,
+    cue_map: Option<&std::collections::HashMap<String, String>>,
+) -> bool {
+    !cue.trim().is_empty() && !cue_resolved_by_mapper_with(cue, cue_map)
+}
+
+/// Heuristic risk check for `*...*` cues the mapper speaks as ordinary words.
+pub fn cue_spoken_stage_direction_risk(cue: &str) -> bool {
+    cue_spoken_stage_direction_risk_with(cue, None)
+}
+
+pub fn cue_spoken_stage_direction_risk_with(
+    cue: &str,
+    cue_map: Option<&std::collections::HashMap<String, String>>,
+) -> bool {
+    if !cue_spoken_as_emphasis_with(cue, cue_map) {
+        return false;
+    }
+    let normalized = cue
+        .trim()
+        .trim_end_matches(|c: char| c == '!' || c == '?')
+        .to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    if normalized.contains(char::is_whitespace) {
+        return true;
+    }
+    if normalized.starts_with('(') {
+        return true;
+    }
+    if has_elongated_letter_run(&normalized) || looks_like_growl_onomatopoeia(&normalized) {
+        return true;
+    }
+    !is_likely_emphasis_word(&normalized)
+}
+
+fn has_elongated_letter_run(s: &str) -> bool {
+    let chars: Vec<char> = s.chars().collect();
+    let mut run = 1usize;
+    for window in chars.windows(2) {
+        if window[0].eq_ignore_ascii_case(&window[1]) {
+            run += 1;
+            if run >= 3 {
+                return true;
+            }
+        } else {
+            run = 1;
+        }
+    }
+    false
+}
+
+fn looks_like_growl_onomatopoeia(s: &str) -> bool {
+    s.starts_with('g') && s.chars().filter(|&c| c == 'r').count() >= 2
+}
+
+/// Common English words BG2 uses for spoken emphasis inside `*...*`.
+fn is_likely_emphasis_word(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "a"
+            | "actual"
+            | "again"
+            | "against"
+            | "all"
+            | "alone"
+            | "also"
+            | "always"
+            | "am"
+            | "an"
+            | "and"
+            | "any"
+            | "anything"
+            | "are"
+            | "as"
+            | "assist"
+            | "at"
+            | "aware"
+            | "become"
+            | "before"
+            | "beneath"
+            | "believe"
+            | "better"
+            | "but"
+            | "by"
+            | "can"
+            | "close"
+            | "continue"
+            | "could"
+            | "course"
+            | "curse"
+            | "dare"
+            | "dead"
+            | "did"
+            | "died"
+            | "do"
+            | "does"
+            | "don't"
+            | "docks"
+            | "dozens"
+            | "earn"
+            | "entire"
+            | "entrepreneurs"
+            | "even"
+            | "exist"
+            | "extended"
+            | "feel"
+            | "few"
+            | "fine."
+            | "first"
+            | "got"
+            | "good"
+            | "has"
+            | "have"
+            | "he"
+            | "headed"
+            | "her"
+            | "here"
+            | "him"
+            | "i"
+            | "in"
+            | "is"
+            | "it"
+            | "just"
+            | "knew"
+            | "know"
+            | "last"
+            | "like"
+            | "live"
+            | "love"
+            | "loves"
+            | "may"
+            | "me"
+            | "might"
+            | "more"
+            | "most"
+            | "must"
+            | "my"
+            | "natural"
+            | "nice"
+            | "no"
+            | "no one"
+            | "not"
+            | "nothing"
+            | "now"
+            | "only"
+            | "or"
+            | "our"
+            | "place"
+            | "please"
+            | "plenty"
+            | "power"
+            | "real"
+            | "really"
+            | "removed"
+            | "right"
+            | "right here"
+            | "safe"
+            | "seething"
+            | "serious"
+            | "shall"
+            | "she"
+            | "should"
+            | "so"
+            | "some"
+            | "someone"
+            | "something"
+            | "such"
+            | "sure"
+            | "still"
+            | "stands"
+            | "stench"
+            | "terrible"
+            | "that's"
+            | "the"
+            | "their"
+            | "them"
+            | "then"
+            | "there's"
+            | "these"
+            | "they"
+            | "think"
+            | "this"
+            | "thing"
+            | "those"
+            | "thought"
+            | "took"
+            | "too"
+            | "very"
+            | "was"
+            | "we"
+            | "well"
+            | "were"
+            | "what"
+            | "when"
+            | "who"
+            | "why"
+            | "will"
+            | "wish"
+            | "with"
+            | "won't"
+            | "would"
+            | "want"
+            | "yet"
+            | "you"
+            | "your"
+            | "elf"
     )
 }
 
@@ -185,6 +492,17 @@ pub(crate) fn for_each_asterisk_segment(text: &str, mut f: impl FnMut(&str)) {
         }
         i += 1;
     }
+}
+
+/// True when `text` is exactly one `<inner>` span whose inner text is not a dynamic
+/// token identifier (uppercase `A-Z`, digits, `_`).
+fn is_whole_line_angle_annotation(text: &str) -> bool {
+    let t = text.trim();
+    if !t.starts_with('<') || !t.ends_with('>') || t.len() < 2 {
+        return false;
+    }
+    let inner = &t[1..t.len() - 1];
+    !super::tokens::is_token_ident(inner)
 }
 
 fn push_segment_gap(out: &mut String) {
@@ -272,6 +590,28 @@ mod tests {
     }
 
     #[test]
+    fn whole_line_angle_annotation_becomes_empty() {
+        assert_eq!(spoken_text_for_synthesis("<losing battle>"), "");
+        assert_eq!(spoken_text_for_synthesis("  <grunt>  "), "");
+        assert!(!has_speakable_dialogue("<losing battle>"));
+    }
+
+    #[test]
+    fn whole_line_token_ident_is_not_stripped_as_annotation() {
+        assert_eq!(spoken_text_for_synthesis("<CHARNAME>"), "<CHARNAME>");
+    }
+
+    #[test]
+    fn inline_angle_prose_remains_speakable() {
+        let text = "She whispered <so quietly> I barely heard.";
+        assert!(has_speakable_dialogue(text));
+        assert_eq!(
+            spoken_text_for_synthesis(text),
+            "She whispered <so quietly> I barely heard."
+        );
+    }
+
+    #[test]
     fn preserves_ellipsis_and_punctuation() {
         assert_eq!(
             spoken_text_for_synthesis("*sighs* I suppose you are right..."),
@@ -281,7 +621,7 @@ mod tests {
 
     #[test]
     fn classifies_non_spoken_and_speakable_dialogue() {
-        for text in ["", "   ", "...", "…", "—", "[sigh]", "*pause*"] {
+        for text in ["", "   ", "...", "…", "—", "[sigh]", "*pause*", "<losing battle>"] {
             assert!(!has_speakable_dialogue(text), "{text:?} should be non-spoken");
         }
         for text in ["Hmph!", "I...", "100 gold!", "Écoutez-moi.", "你好"] {
@@ -295,6 +635,66 @@ mod tests {
             spoken_text_for_synthesis("An unclosed *sniff"),
             "An unclosed *sniff"
         );
+    }
+
+    #[test]
+    fn maps_repeated_word_stage_direction_cues() {
+        assert_eq!(
+            synthesis_text_for_generation(
+                "Hmph. Liar. Tight-pursed kobold. Talos have you, I think. *grumble grumble*",
+                true,
+            ),
+            "Hmph. Liar. Tight-pursed kobold. Talos have you, I think.[dissatisfaction-hnn]"
+        );
+        assert_eq!(
+            synthesis_text_for_generation("*GRUMBLE GRUMBLE* Hello.", true),
+            "[dissatisfaction-hnn] Hello."
+        );
+    }
+
+    #[test]
+    fn strips_corpus_backed_nonverbal_cues() {
+        assert_eq!(
+            synthesis_text_for_generation(
+                "(Well... it was all right, I suppose.) *clap* *clap*",
+                true,
+            ),
+            "(Well... it was all right, I suppose.)"
+        );
+        assert_eq!(
+            synthesis_text_for_generation("Greetin's. *Achoo!* *sniff* How may I...", true),
+            "Greetin's. How may I..."
+        );
+        assert_eq!(
+            synthesis_text_for_generation("*pant* All right... are you ready?", true),
+            "All right... are you ready?"
+        );
+        assert_eq!(
+            synthesis_text_for_generation("*sniff sniff* Humanoids? Welcome.", true),
+            "Humanoids? Welcome."
+        );
+        assert_eq!(
+            synthesis_text_for_generation("They're dead! *sob* *sob sob*", true),
+            "They're dead!"
+        );
+    }
+
+    #[test]
+    fn maps_cackle_to_laughter() {
+        assert_eq!(
+            synthesis_text_for_generation("Amusing. *cackle*", true),
+            "Amusing.[laughter]"
+        );
+    }
+
+    #[test]
+    fn spoken_stage_direction_risk_detects_sound_like_cues() {
+        assert!(cue_spoken_stage_direction_risk("grin"));
+        assert!(cue_spoken_stage_direction_risk("Grrrrrowwwwrrr"));
+        assert!(cue_spoken_stage_direction_risk("sniiiff"));
+        assert!(!cue_spoken_stage_direction_risk("dare"));
+        assert!(!cue_spoken_stage_direction_risk("clap"));
+        assert!(!cue_spoken_stage_direction_risk("sigh"));
     }
 
     #[test]

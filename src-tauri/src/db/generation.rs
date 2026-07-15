@@ -614,7 +614,7 @@ pub fn get_or_create_generation(
     .map_err(AppError::from)
 }
 
-/// The `(line_id, output_path, voice_changed)` of every `done` generation in
+/// The `(line_id, output_path, voice_changed, text_changed)` of every `done` generation in
 /// `project_id` that still
 /// carries a stored path. Lets the generation screen hydrate its per-line status on a
 /// cold start (a tab re-mount) instead of forgetting lines it already rendered. The
@@ -623,14 +623,15 @@ pub fn get_or_create_generation(
 pub fn completed_generations_for_project(
     conn: &Connection,
     project_id: i64,
-) -> Result<Vec<(i64, String, bool)>, AppError> {
+) -> Result<Vec<(i64, String, bool, bool)>, AppError> {
     let mut stmt = conn.prepare(
         "SELECT g.line_id, g.output_path, \
                 CASE WHEN c.id IS NULL OR c.status != 'ready' \
                        OR g.reference_sample_id IS NULL \
                        OR c.primary_sample_id IS NULL \
                        OR g.reference_sample_id != c.primary_sample_id \
-                     THEN 1 ELSE 0 END AS voice_changed \
+                     THEN 1 ELSE 0 END AS voice_changed, \
+                CASE WHEN g.synthesis_stale != 0 THEN 1 ELSE 0 END AS text_changed \
          FROM generation g JOIN line l ON l.id = g.line_id \
          LEFT JOIN clone c ON c.speaker_id = l.speaker_id \
          WHERE l.project_id = ?1 AND g.status = 'done' AND g.output_path IS NOT NULL \
@@ -638,10 +639,84 @@ pub fn completed_generations_for_project(
     )?;
     let rows = stmt
         .query_map(params![project_id], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? != 0))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)? != 0,
+                r.get::<_, i64>(3)? != 0,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// Mark completed clips for the given line ids as synthesis-stale without clearing
+/// playable output paths. Used when generation text input changes (overrides,
+/// token stand-ins, dictionary) but the old clip should remain previewable.
+pub fn mark_generations_synthesis_stale_for_line_ids(
+    conn: &Connection,
+    line_ids: &[i64],
+) -> Result<usize, AppError> {
+    let mut total = 0usize;
+    for chunk in line_ids.chunks(500) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = chunk
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "UPDATE generation SET synthesis_stale = 1 \
+             WHERE status = 'done' AND output_path IS NOT NULL AND synthesis_stale = 0 \
+               AND line_id IN ({placeholders})"
+        );
+        total += conn.execute(&sql, rusqlite::params_from_iter(chunk.iter().copied()))?;
+    }
+    Ok(total)
+}
+
+/// Re-link pending generation rows whose `{line_id}.ogg` still exists under the
+/// project workspace. Dictionary used to clear `output_path` without deleting files;
+/// this restores playable "done" status for those orphans.
+pub fn recover_orphaned_generation_files(
+    conn: &Connection,
+    project_id: i64,
+    workspace: &std::path::Path,
+) -> Result<usize, AppError> {
+    let generated = workspace.join("generated");
+    if !generated.is_dir() {
+        return Ok(0);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT g.id, g.line_id FROM generation g \
+         JOIN line l ON l.id = g.line_id \
+         WHERE l.project_id = ?1 \
+           AND g.status IN ('pending', 'failed') \
+           AND (g.output_path IS NULL OR g.output_path = '')",
+    )?;
+    let candidates = stmt
+        .query_map(params![project_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    let mut recovered = 0usize;
+    for (generation_id, line_id) in candidates {
+        let path = generated.join(format!("{line_id}.ogg"));
+        if !path.is_file() {
+            continue;
+        }
+        let path_str = path.to_string_lossy().to_string();
+        recovered += conn.execute(
+            "UPDATE generation SET status = 'done', output_path = ?2, synthesis_stale = 0 \
+             WHERE id = ?1",
+            params![generation_id, path_str],
+        )?;
+    }
+    Ok(recovered)
 }
 
 /// Move a generation to `running` and bump `attempts` (called at the start of each
@@ -684,7 +759,8 @@ pub fn mark_done(
     conn.execute(
         "UPDATE generation SET status = 'done', clone_id = ?2, reference_sample_id = ?3, \
              binding_source_snapshot = ?4, output_path = ?5, resumable_state_json = ?6, \
-             render_settings_json = ?7, render_settings_hash = ?8, reference_fingerprint = ?9 \
+             render_settings_json = ?7, render_settings_hash = ?8, reference_fingerprint = ?9, \
+             synthesis_stale = 0 \
          WHERE id = ?1",
         params![generation_id, clone_id, reference_sample_id, binding_source, output_path, resumable_state_json, render_settings_json, render_settings_hash, reference_fingerprint],
     )?;
@@ -1160,6 +1236,7 @@ mod tests {
         set_clone_status(&conn, cid, CloneStatus::Ready).unwrap();
         let rows = completed_generations_for_project(&conn, 1).unwrap();
         assert!(rows[0].2);
+        assert!(!rows[0].3);
     }
 
     #[test]

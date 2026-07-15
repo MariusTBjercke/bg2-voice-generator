@@ -172,6 +172,9 @@
   let clearCloneScope = $state<"generic" | "manual" | "all">("manual");
   let clearResult = $state<string | null>(null);
   let demographicsNotice = $state<string | null>(null);
+  // Collapse the long demographic-groups and character lists so step 2 stays reachable.
+  let demographicGroupsOpen = $state(true);
+  let charactersListOpen = $state(true);
 
   const dir = $derived($project.gameDir);
 
@@ -1231,13 +1234,29 @@
       </Card>
 
       <Card>
-        <h3>
-          {#if loadingDemographics}
-            Demographic groups
-          {:else}
-            Demographic groups ({demographicGroups.length})
-          {/if}
-        </h3>
+        <div class="panel-head">
+          <button
+            type="button"
+            class="panel-toggle"
+            aria-expanded={demographicGroupsOpen}
+            aria-controls="demographic-groups-panel"
+            onclick={() => (demographicGroupsOpen = !demographicGroupsOpen)}
+          >
+            <span class="chevron" class:collapsed={!demographicGroupsOpen} aria-hidden="true">▼</span>
+            <h3 id="demographic-groups-heading">
+              {#if loadingDemographics}
+                Demographic groups
+              {:else}
+                Demographic groups ({demographicGroups.length})
+              {/if}
+            </h3>
+            {#if !demographicGroupsOpen && !loadingDemographics && demographicsLoaded && demographicGroups.length > 0}
+              <span class="panel-summary">{configuredGroupCount} pools configured</span>
+            {/if}
+          </button>
+        </div>
+        {#if demographicGroupsOpen}
+        <div id="demographic-groups-panel" aria-labelledby="demographic-groups-heading">
         {#if loadingDemographics}
           <p class="hint">
             {#if blockingOperation}
@@ -1432,6 +1451,8 @@
             />
           {/if}
         {/if}
+        </div>
+        {/if}
       </Card>
     </section>
 
@@ -1492,7 +1513,25 @@
     {/if}
     <div class="layout">
       <Card>
-        <h3>Characters ({identityGroups.length})</h3>
+        <div class="panel-head">
+          <button
+            type="button"
+            class="panel-toggle"
+            aria-expanded={charactersListOpen}
+            aria-controls="characters-list-panel"
+            onclick={() => (charactersListOpen = !charactersListOpen)}
+          >
+            <span class="chevron" class:collapsed={!charactersListOpen} aria-hidden="true">▼</span>
+            <h3 id="characters-list-heading">Characters ({identityGroups.length})</h3>
+            {#if !charactersListOpen && identityGroups.length > 0}
+              <span class="panel-summary">
+                {selected ? selected.display_name : `${filteredIdentityGroups.length} shown`}
+              </span>
+            {/if}
+          </button>
+        </div>
+        {#if charactersListOpen}
+        <div id="characters-list-panel" aria-labelledby="characters-list-heading">
         {#if identityGroups.length === 0}
           <p class="hint">No speakers yet. Run a scan on Attribution, then harvest.</p>
         {:else}
@@ -1545,6 +1584,8 @@
               compact
             />
           {/if}
+        {/if}
+        </div>
         {/if}
       </Card>
 
@@ -2180,6 +2221,56 @@
   h3 {
     margin: 0 0 var(--space-3);
     font-size: 1rem;
+  }
+  .panel-head {
+    margin-bottom: var(--space-3);
+  }
+  .panel-head:only-child,
+  .panel-head:last-child {
+    margin-bottom: 0;
+  }
+  .panel-toggle {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+    width: 100%;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
+    text-align: left;
+  }
+  .panel-toggle:hover .chevron,
+  .panel-toggle:focus-visible .chevron {
+    color: var(--text);
+  }
+  .panel-toggle:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
+  .panel-toggle h3 {
+    margin: 0;
+    flex: 1 1 auto;
+  }
+  .panel-summary {
+    flex: 1 1 100%;
+    margin-left: calc(0.75rem + var(--space-2));
+    color: var(--text-muted);
+    font-size: 0.88rem;
+  }
+  .chevron {
+    display: inline-block;
+    flex: 0 0 auto;
+    width: 0.75rem;
+    color: var(--text-muted);
+    transition: transform 0.15s ease;
+  }
+  .chevron.collapsed {
+    transform: rotate(-90deg);
   }
   .layout {
     display: grid;

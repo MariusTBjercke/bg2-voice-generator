@@ -147,7 +147,7 @@
       <p>
         Updated {applyResult.updated} lines.
         {#if applyResult.reset_generations}
-          Reset {applyResult.reset_generations} generated clips.
+          Marked {applyResult.reset_generations} clip(s) as text changed (still playable).
         {/if}
       </p>
     {/if}

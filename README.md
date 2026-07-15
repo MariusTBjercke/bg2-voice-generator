@@ -106,9 +106,10 @@ reads from the one before it, so run them in sequence the first time.
    profile** (neutral / male / female) for gendered protagonist tokens; advanced overrides
    let you customise individual tokens. **Save + Apply** persists the settings and, on an
    existing project, re-applies stand-ins to tokenized lines. New scans pick up placeholder
-   settings automatically. The **Global Rules** tab applies machine-wide `find → speak as`
-   pronunciation rules immediately before generation, with a before/after test field. These
-   rules also affect generated audio only; subtitles remain unchanged.
+   settings automatically. The **Pronunciation** tab applies machine-wide `find → speak as`
+   rules immediately before generation. The **Tag rules** tab seeds the stage-cue → OmniVoice
+   tag mapper as editable defaults and lets you add spoken-word → tag rules (for example
+   `Bah` → `[dissatisfaction-hnn]`). Both affect generated audio only; subtitles remain unchanged.
 
 3. **Attribution.** Click **Scan attribution** to read the game text and work out which
    speaker each line belongs to. You get count cards (speakers, lines, ready lines,
@@ -156,7 +157,9 @@ reads from the one before it, so run them in sequence the first time.
    (**Generate** / **Re-generate**) or use the filtered batch actions (with per-line
    fallback on failure), and audition finished lines in-app. If you later change a
    speaker's binding, the earlier clips remain playable and exportable but are marked
-   **Voice changed**. Regenerate those clips with the dedicated filtered action, or remove
+   **Voice changed**. Dictionary / override / stand-in transcript drifts are marked
+   **Text changed** the same way. Use **Re-generate voice-changed** or
+   **Re-generate text-changed** within the current filter, or remove
    individual/all-filtered generated clips when you do not want them in the pack. To reset a
    broken install, delete `engine-runtime/` (or rebuild the portable copy with
    `-CleanRuntime`) and install again. Generation is the GPU-heavy, model-dependent step;
@@ -279,10 +282,10 @@ transcript.
 ### Dictionary rule curation
 
 The companion CLI also provides `dict list`, `dict add`, `dict set`, `dict remove`,
-`dict import`, `dict export`, `dict test`, and `dict scan` for maintaining repeatable
-pronunciation rules outside the per-line Review workflow. See
-[`docs/dictionary-rules.md`](docs/dictionary-rules.md) for the JSON format and agent-friendly
-workflow.
+`dict import`, `dict export`, `dict test`, and `dict scan` for pronunciation rules, plus
+`tag-rule list|add|set|remove|test|reset` for OmniVoice tag rules, outside the per-line
+Review workflow. See [`docs/dictionary-rules.md`](docs/dictionary-rules.md) for the JSON
+format and agent-friendly workflow.
 
 The footer status bar polls the backend and shows the current version, a "busy" indicator
 while a long operation runs, and degrades to "Reconnecting…" rather than freezing.

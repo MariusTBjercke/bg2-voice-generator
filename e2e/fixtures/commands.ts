@@ -11,6 +11,12 @@ import {
   upsertDictionaryRule,
   setDictionaryRuleEnabled,
   deleteDictionaryRule,
+  tagRules,
+  supportedInlineTags,
+  previewTagRules,
+  upsertTagRule,
+  setTagRuleEnabled,
+  deleteTagRule,
   effectiveBindings,
   engineStatus,
   FIXTURE_GAME_DIR,
@@ -103,6 +109,33 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
     case "reset_dictionary_defaults":
       return { rule: null, reset_generations: 0 };
 
+    case "list_tag_rules":
+      return [...tagRules];
+
+    case "list_supported_inline_tags":
+      return [...supportedInlineTags];
+
+    case "preview_tag_rules_text":
+      return previewTagRules(arg<string>(args, "text"));
+
+    case "upsert_tag_rule":
+      return upsertTagRule({
+        id: arg<number | null>(args, "id"),
+        findText: arg<string>(args, "findText"),
+        tag: arg<string>(args, "tag"),
+        matchKind: arg<"stage_cue" | "whole_word">(args, "matchKind"),
+        enabled: arg<boolean>(args, "enabled"),
+      });
+
+    case "set_tag_rule_enabled":
+      return setTagRuleEnabled(arg<number>(args, "id"), arg<boolean>(args, "enabled"));
+
+    case "delete_tag_rule":
+      return deleteTagRule(arg<number>(args, "id"));
+
+    case "reset_tag_rule_defaults":
+      return { rule: null, reset_generations: 0 };
+
     case "get_game_languages":
       requireGameDir(args);
       return gameLanguages;
@@ -117,11 +150,17 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
 
     case "list_synthesis_flagged":
       requireGameDir(args);
-      return listSynthesisFlagged();
+      return listSynthesisFlagged(
+        arg<string | undefined>(args, "query"),
+        arg<string | undefined>(args, "flag"),
+      );
 
     case "list_synthesis_remaining":
       requireGameDir(args);
-      return listSynthesisRemaining();
+      return listSynthesisRemaining(
+        arg<string | undefined>(args, "query"),
+        arg<string | undefined>(args, "flag"),
+      );
 
     case "auto_review_synthesis_plain":
       requireGameDir(args);
@@ -135,7 +174,7 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
     case "list_synthesis_decisions": {
       requireGameDir(args);
       const kind = arg<SynthesisDecisionKind>(args, "kind");
-      return listSynthesisDecisions(kind);
+      return listSynthesisDecisions(kind, arg<string | undefined>(args, "query"));
     }
 
     case "clear_line_synthesis_override": {
@@ -291,6 +330,7 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
           line_id: lineId,
           output_path: `C:\\fixture\\generated\\${lineId}.ogg`,
           voice_changed: (JSON.parse(localStorage.getItem("e2e.voice-changed-generation-ids") ?? "[]") as number[]).includes(lineId),
+          text_changed: false,
         }));
 
     case "remove_generations": {

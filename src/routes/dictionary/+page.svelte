@@ -10,24 +10,38 @@
     DictionaryPreview,
     DictionaryRule,
     DictionaryWriteResult,
+    TagMatchKind,
+    TagRule,
+    TagRulesPreview,
+    TagRuleWriteResult,
   } from "$lib/types";
 
-  type Tab = "placeholders" | "rules";
+  type Tab = "placeholders" | "rules" | "tags";
 
   let tab = $state<Tab>("placeholders");
   let rules = $state<DictionaryRule[]>([]);
+  let tagRules = $state<TagRule[]>([]);
+  let tagCatalog = $state<string[]>([]);
   let loading = $state(true);
   let busy = $state(false);
   let error = $state<string | null>(null);
   let note = $state<string | null>(null);
   let search = $state("");
+  let tagSearch = $state("");
   let testText = $state("B-b-b-but... I... I... wwaaAAAAHHHH!");
+  let tagTestText = $state("Bah! *sigh* This is annoying.");
   let preview = $state<DictionaryPreview | null>(null);
+  let tagPreview = $state<TagRulesPreview | null>(null);
   let editingId = $state<number | null>(null);
   let editFind = $state("");
   let editSpeakAs = $state("");
+  let tagEditingId = $state<number | null>(null);
+  let tagEditFind = $state("");
+  let tagEditTag = $state("[dissatisfaction-hnn]");
+  let tagEditMatch = $state<TagMatchKind>("whole_word");
 
   const enabledCount = $derived(rules.filter((rule) => rule.enabled).length);
+  const tagEnabledCount = $derived(tagRules.filter((rule) => rule.enabled).length);
   const filteredRules = $derived(
     rules.filter((rule) => {
       const query = search.trim().toLowerCase();
@@ -38,8 +52,21 @@
       );
     }),
   );
+  const filteredTagRules = $derived(
+    tagRules.filter((rule) => {
+      const query = tagSearch.trim().toLowerCase();
+      return (
+        !query ||
+        rule.find_text.toLowerCase().includes(query) ||
+        rule.tag.toLowerCase().includes(query) ||
+        rule.match_kind.includes(query)
+      );
+    }),
+  );
 
-  onMount(loadRules);
+  onMount(async () => {
+    await Promise.all([loadRules(), loadTagRules()]);
+  });
 
   async function loadRules() {
     loading = true;
@@ -52,10 +79,35 @@
     }
   }
 
+  async function loadTagRules() {
+    try {
+      const [rows, catalog] = await Promise.all([
+        invoke<TagRule[]>("list_tag_rules"),
+        invoke<string[]>("list_supported_inline_tags"),
+      ]);
+      tagRules = rows;
+      tagCatalog = catalog;
+      if (!tagCatalog.includes(tagEditTag) && tagCatalog.length) {
+        tagEditTag = tagCatalog[0];
+      }
+    } catch (cause) {
+      error = String(cause);
+    }
+  }
+
   async function testRules() {
     error = null;
     try {
       preview = await invoke<DictionaryPreview>("preview_dictionary_text", { text: testText });
+    } catch (cause) {
+      error = String(cause);
+    }
+  }
+
+  async function testTagRules() {
+    error = null;
+    try {
+      tagPreview = await invoke<TagRulesPreview>("preview_tag_rules_text", { text: tagTestText });
     } catch (cause) {
       error = String(cause);
     }
@@ -73,6 +125,24 @@
     editSpeakAs = rule.speak_as;
   }
 
+  function startAddTag() {
+    tagEditingId = 0;
+    tagEditFind = "";
+    tagEditTag = tagCatalog[0] ?? "[dissatisfaction-hnn]";
+    tagEditMatch = "whole_word";
+  }
+
+  function startEditTag(rule: TagRule) {
+    tagEditingId = rule.id;
+    tagEditFind = rule.find_text;
+    tagEditTag = rule.tag;
+    tagEditMatch = rule.match_kind;
+  }
+
+  function matchLabel(kind: TagMatchKind): string {
+    return kind === "stage_cue" ? "stage cue" : "spoken word";
+  }
+
   async function saveRule() {
     busy = true;
     error = null;
@@ -85,9 +155,31 @@
         enabled: true,
       });
       editingId = null;
-      note = `Saved rule. Reset ${result.reset_generations} generated clip(s).`;
+      note = `Saved pronunciation rule. Marked ${result.reset_generations} clip(s) as text changed (still playable).`;
       await loadRules();
       await testRules();
+    } catch (cause) {
+      error = String(cause);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function saveTagRule() {
+    busy = true;
+    error = null;
+    try {
+      const result = await invoke<TagRuleWriteResult>("upsert_tag_rule", {
+        id: tagEditingId === 0 ? null : tagEditingId,
+        findText: tagEditFind,
+        tag: tagEditTag,
+        matchKind: tagEditMatch,
+        enabled: true,
+      });
+      tagEditingId = null;
+      note = `Saved tag rule. Marked ${result.reset_generations} clip(s) as text changed (still playable).`;
+      await loadTagRules();
+      await testTagRules();
     } catch (cause) {
       error = String(cause);
     } finally {
@@ -103,9 +195,27 @@
         id: rule.id,
         enabled: !rule.enabled,
       });
-      note = `${rule.enabled ? "Disabled" : "Enabled"} rule. Reset ${result.reset_generations} generated clip(s).`;
+      note = `${rule.enabled ? "Disabled" : "Enabled"} rule. Marked ${result.reset_generations} clip(s) as text changed (still playable).`;
       await loadRules();
       await testRules();
+    } catch (cause) {
+      error = String(cause);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function toggleTagRule(rule: TagRule) {
+    busy = true;
+    error = null;
+    try {
+      const result = await invoke<TagRuleWriteResult>("set_tag_rule_enabled", {
+        id: rule.id,
+        enabled: !rule.enabled,
+      });
+      note = `${rule.enabled ? "Disabled" : "Enabled"} tag rule. Marked ${result.reset_generations} clip(s) as text changed (still playable).`;
+      await loadTagRules();
+      await testTagRules();
     } catch (cause) {
       error = String(cause);
     } finally {
@@ -121,9 +231,25 @@
       const result = await invoke<DictionaryWriteResult>("delete_dictionary_rule", {
         id: rule.id,
       });
-      note = `Deleted rule. Reset ${result.reset_generations} generated clip(s).`;
+      note = `Deleted rule. Marked ${result.reset_generations} clip(s) as text changed (still playable).`;
       await loadRules();
       await testRules();
+    } catch (cause) {
+      error = String(cause);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function deleteTagRule(rule: TagRule) {
+    if (!confirm(`Delete the tag rule “${rule.find_text}”?`)) return;
+    busy = true;
+    error = null;
+    try {
+      const result = await invoke<TagRuleWriteResult>("delete_tag_rule", { id: rule.id });
+      note = `Deleted tag rule. Marked ${result.reset_generations} clip(s) as text changed (still playable).`;
+      await loadTagRules();
+      await testTagRules();
     } catch (cause) {
       error = String(cause);
     } finally {
@@ -136,9 +262,24 @@
     error = null;
     try {
       const result = await invoke<DictionaryWriteResult>("reset_dictionary_defaults");
-      note = `Restored default rules. Reset ${result.reset_generations} generated clip(s).`;
+      note = `Restored pronunciation defaults. Marked ${result.reset_generations} clip(s) as text changed (still playable).`;
       await loadRules();
       await testRules();
+    } catch (cause) {
+      error = String(cause);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function resetTagDefaults() {
+    busy = true;
+    error = null;
+    try {
+      const result = await invoke<TagRuleWriteResult>("reset_tag_rule_defaults");
+      note = `Restored tag-rule defaults. Marked ${result.reset_generations} clip(s) as text changed (still playable).`;
+      await loadTagRules();
+      await testTagRules();
     } catch (cause) {
       error = String(cause);
     } finally {
@@ -149,7 +290,7 @@
 
 <Section
   title="Dictionary"
-  description="Configure generation-only text substitutions. Placeholders resolve game tokens; global rules make difficult spellings easier for OmniVoice to pronounce."
+  description="Configure generation-only substitutions. Placeholders resolve game tokens; Pronunciation makes difficult spellings easier to say; Tag rules insert OmniVoice non-verbal controls."
 >
   <div class="tabs" role="tablist" aria-label="Dictionary sections">
     <button
@@ -168,26 +309,38 @@
       class:active={tab === "rules"}
       onclick={() => (tab = "rules")}
     >
-      Global Rules
+      Pronunciation
+    </button>
+    <button
+      type="button"
+      role="tab"
+      aria-selected={tab === "tags"}
+      class:active={tab === "tags"}
+      onclick={() => (tab = "tags")}
+    >
+      Tag rules
     </button>
   </div>
 
   {#if tab === "placeholders"}
     <PlaceholderSettings />
-  {:else}
+  {:else if tab === "rules"}
     <ErrorNotice message={error} />
     {#if note}<p class="note">{note}</p>{/if}
 
     {#if loading}
-      <Card><p class="muted">Loading dictionary rules…</p></Card>
+      <Card><p class="muted">Loading pronunciation rules…</p></Card>
     {:else}
+      <p class="blurb">
+        Pronunciation rules change how words are spoken. They cannot insert OmniVoice tags — use Tag rules for that.
+      </p>
       <div class="summary">
         <Card><span>Rules</span><strong>{rules.length}</strong></Card>
         <Card><span>Enabled</span><strong>{enabledCount}</strong></Card>
       </div>
 
       <Card>
-        <h3>Test rules</h3>
+        <h3>Test pronunciation</h3>
         <label>
           Before
           <input class="test-input" bind:value={testText} />
@@ -256,6 +409,100 @@
         Rules affect generated audio only. In-game subtitles and exported dialogue text are unchanged.
       </p>
     {/if}
+  {:else}
+    <ErrorNotice message={error} />
+    {#if note}<p class="note">{note}</p>{/if}
+
+    <p class="blurb">
+      Tag rules convert stage cues (<code>*sigh*</code>) and optional spoken words (<code>Bah</code>) into OmniVoice non-verbal tags. Defaults mirror the built-in mapper; add spoken-word rules for cases Review would otherwise handle one-by-one.
+    </p>
+    <div class="summary">
+      <Card><span>Rules</span><strong>{tagRules.length}</strong></Card>
+      <Card><span>Enabled</span><strong>{tagEnabledCount}</strong></Card>
+    </div>
+
+    <Card>
+      <h3>Test tag rules</h3>
+      <label>
+        Before
+        <input class="test-input" bind:value={tagTestText} />
+      </label>
+      <Button onclick={testTagRules}>Test tags</Button>
+      {#if tagPreview}
+        <div class="preview-grid">
+          <div><span>Before</span><p>{tagPreview.before}</p></div>
+          <div><span>After (with tags)</span><p>{tagPreview.after}</p></div>
+        </div>
+        {#if tagPreview.applied_rules.length}
+          <p class="chips">
+            {#each tagPreview.applied_rules as applied (applied.id)}
+              <code>{applied.find_text} → {applied.tag}</code>
+            {/each}
+          </p>
+        {/if}
+      {/if}
+    </Card>
+
+    <Card>
+      <div class="toolbar">
+        <input class="search" aria-label="Search tag rules" placeholder="Search tag rules…" bind:value={tagSearch} />
+        <Button variant="ghost" onclick={resetTagDefaults} disabled={busy}>Reset defaults</Button>
+        <Button onclick={startAddTag} disabled={busy}>+ Add tag rule</Button>
+      </div>
+
+      {#if tagEditingId !== null}
+        <div class="editor">
+          <label>Find <input aria-label="Tag find text" bind:value={tagEditFind} /></label>
+          <label>
+            Match
+            <select aria-label="Tag match kind" bind:value={tagEditMatch}>
+              <option value="whole_word">Spoken word</option>
+              <option value="stage_cue">Stage cue (*...*)</option>
+            </select>
+          </label>
+          <label>
+            Tag
+            <select aria-label="OmniVoice tag" bind:value={tagEditTag}>
+              {#each tagCatalog as tag (tag)}
+                <option value={tag}>{tag}</option>
+              {/each}
+            </select>
+          </label>
+          <Button onclick={saveTagRule} disabled={busy || !tagEditFind.trim() || !tagEditTag}>
+            Save
+          </Button>
+          <Button variant="ghost" onclick={() => (tagEditingId = null)}>Cancel</Button>
+        </div>
+      {/if}
+
+      <div class="rule-table tag-table">
+        <div class="rule-head"><span>Find</span><span>Tag</span><span>Match</span><span>Enabled</span><span>Actions</span></div>
+        {#each filteredTagRules as rule (rule.id)}
+          <div class="rule-row">
+            <span>{rule.find_text}{#if rule.is_default}<small>default</small>{/if}</span>
+            <span class="mono">{rule.tag}</span>
+            <span class="match">{matchLabel(rule.match_kind)}</span>
+            <button
+              class="switch"
+              type="button"
+              aria-label={`${rule.enabled ? "Disable" : "Enable"} ${rule.find_text}`}
+              aria-pressed={rule.enabled}
+              onclick={() => toggleTagRule(rule)}
+              disabled={busy}
+            >{rule.enabled ? "On" : "Off"}</button>
+            <span class="row-actions">
+              {#if !rule.is_default}
+                <button type="button" onclick={() => startEditTag(rule)}>Edit</button>
+                <button type="button" onclick={() => deleteTagRule(rule)}>Delete</button>
+              {/if}
+            </span>
+          </div>
+        {/each}
+      </div>
+    </Card>
+    <p class="muted">
+      Tag rules affect generated audio only. Overrides still win for one-off lines.
+    </p>
   {/if}
 </Section>
 
@@ -277,6 +524,10 @@
   .tabs button.active {
     color: var(--text);
     border-color: var(--accent);
+  }
+  .blurb {
+    color: var(--muted);
+    margin-bottom: 1rem;
   }
   .summary {
     display: grid;
@@ -306,7 +557,8 @@
     display: grid;
     gap: 0.35rem;
   }
-  input {
+  input,
+  select {
     background: var(--bg);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
@@ -330,6 +582,10 @@
   }
   .preview-grid p {
     margin-bottom: 0;
+  }
+  .chips code,
+  .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
   .chips code {
     display: inline-block;

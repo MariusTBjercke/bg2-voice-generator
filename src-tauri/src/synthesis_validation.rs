@@ -229,8 +229,8 @@ mod tests {
     }
 
     #[test]
-    fn accepts_removing_invalid_angle_markup_without_changing_words() {
-        validate_override_text("<losing battle>", "losing battle").unwrap();
+    fn rejects_override_that_adds_words_to_angle_annotation_only_line() {
+        assert!(validate_override_text("<losing battle>", "losing battle").is_err());
     }
 
     #[test]
