@@ -7,6 +7,7 @@ talks to it over HTTP on a fixed local port:
   * ``POST /synthesize``       - zero-shot voice clone: {text, ref_audio, ref_text, out_path}
                                  -> writes a mono 16-bit PCM WAV at ``out_path``.
   * ``POST /synthesize_batch`` - batched clone against ONE shared reference.
+  * ``POST /design_voice``     - reference-free ``text + instruct`` audition.
   * ``POST /vad_batch``        - neural speech verification (Silero VAD).
 
 The heavy OmniVoice model is imported LAZILY on the first synthesis call so this
@@ -399,6 +400,35 @@ def _synthesize_batch(req: dict) -> dict:
     return {"sample_rate": sample_rate, "items": results}
 
 
+def _design_voice(req: dict) -> dict:
+    """Render one reference-free design audition.
+
+    Designed audio is only a candidate. Rust freezes the selected WAV into the
+    managed voice library and all later dialogue uses ordinary voice cloning.
+    """
+    import inspect
+    import torch
+
+    text = str(req.get("text") or "").strip()
+    instruct = str(req.get("instruct") or "").strip()
+    if not text or not instruct:
+        raise ValueError("voice design requires non-empty text and instruct")
+    out_path = req["out_path"]
+    sample_rate = int(req.get("target_sample_rate") or TARGET_SAMPLE_RATE)
+    with _LOCK:
+        model = _load_model()
+        if "instruct" not in inspect.signature(model.generate).parameters:
+            raise RuntimeError(
+                "installed OmniVoice model does not support voice design; update the engine"
+            )
+        _seed_rng(_resolve_seed(req))
+        with torch.no_grad():
+            audio = model.generate(text=text, instruct=instruct)
+        native_rate = _native_rate(model)
+    duration = _write_wav(out_path, audio, native_rate, sample_rate)
+    return {"sample_rate": sample_rate, "duration": duration, "written": True}
+
+
 def _load_vad():
     global _VAD_MODEL
     if _VAD_MODEL is None:
@@ -462,6 +492,7 @@ class Handler(BaseHTTPRequestHandler):
                     "cuda_name": _cuda_name(),
                     "fork": _MODEL_IS_FORK,
                     "load_error": _LOAD_ERROR,
+                    "voice_design": True,
                 },
             )
         else:
@@ -471,6 +502,7 @@ class Handler(BaseHTTPRequestHandler):
         handler = {
             "/synthesize": _synthesize,
             "/synthesize_batch": _synthesize_batch,
+            "/design_voice": _design_voice,
             "/vad_batch": _vad_batch,
         }.get(self.path)
         if handler is None:

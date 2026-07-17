@@ -1,6 +1,9 @@
 """Dependency-free wire tests for the managed OmniVoice server."""
 
 import unittest
+import sys
+import types
+from unittest import mock
 
 from engine import omnivoice_server as server
 
@@ -48,6 +51,47 @@ class RenderSettingsWireTests(unittest.TestCase):
         self.assertTrue(kwargs["denoise"])
         self.assertTrue(kwargs["preprocess_prompt"])
         self.assertTrue(kwargs["postprocess_output"])
+
+
+class VoiceDesignWireTests(unittest.TestCase):
+    def test_design_forwards_text_instruct_and_explicit_seed(self):
+        calls = []
+
+        class Model:
+            sampling_rate = 24000
+
+            def generate(self, text, instruct):
+                calls.append((text, instruct))
+                return [0.25]
+
+        fake_torch = types.SimpleNamespace(no_grad=lambda: mock.MagicMock(__enter__=lambda self: None, __exit__=lambda self, *args: None))
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}), \
+             mock.patch.object(server, "_load_model", return_value=Model()), \
+             mock.patch.object(server, "_seed_rng") as seeded, \
+             mock.patch.object(server, "_write_wav", return_value=6.2) as write:
+            result = server._design_voice({
+                "text": "A new road awaits.",
+                "instruct": "female, young adult, high pitch, british accent",
+                "out_path": "candidate.wav",
+                "target_sample_rate": 22050,
+                "seed": 137,
+            })
+
+        self.assertEqual(calls, [("A new road awaits.", "female, young adult, high pitch, british accent")])
+        seeded.assert_called_once_with(137)
+        write.assert_called_once()
+        self.assertEqual(result["duration"], 6.2)
+
+    def test_design_rejects_an_engine_without_instruct_support(self):
+        class LegacyModel:
+            def generate(self, text):
+                return [0.25]
+
+        fake_torch = types.SimpleNamespace(no_grad=mock.MagicMock())
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}), \
+             mock.patch.object(server, "_load_model", return_value=LegacyModel()):
+            with self.assertRaisesRegex(RuntimeError, "does not support voice design"):
+                server._design_voice({"text": "Hello", "instruct": "male", "out_path": "x.wav"})
 
 
 if __name__ == "__main__":

@@ -103,6 +103,47 @@ pub struct HealthResp {
     pub fork: Option<bool>,
     #[serde(default)]
     pub load_error: Option<String>,
+    #[serde(default)]
+    pub voice_design: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DesignReq {
+    pub text: String,
+    pub instruct: String,
+    pub out_path: String,
+    pub target_sample_rate: u32,
+    pub seed: i64,
+}
+
+/// Reference-free voice design. The selected result is later frozen and cloned;
+/// this endpoint is never used for ordinary dialogue generation.
+pub async fn design_voice_to_file(
+    http: &reqwest::Client,
+    base_url: &str,
+    text: &str,
+    instruct: &str,
+    out_path: &Path,
+    seed: i64,
+) -> Result<SynthResp, AppError> {
+    let response = http
+        .post(format!("{base_url}/design_voice"))
+        .timeout(SYNTH_TIMEOUT)
+        .json(&DesignReq {
+            text: text.to_string(),
+            instruct: instruct.to_string(),
+            out_path: out_path.to_string_lossy().into_owned(),
+            target_sample_rate: 22_050,
+            seed,
+        })
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        let code = response.status();
+        let detail = response.text().await.unwrap_or_default();
+        return Err(AppError::Other(format!("OmniVoice voice design failed ({code}): {detail}")));
+    }
+    Ok(response.json::<SynthResp>().await?)
 }
 
 /// One line in a batched request: the text to speak and where its WAV is written.
@@ -415,6 +456,22 @@ mod tests {
         assert_eq!(h.device.as_deref(), Some("cuda:0"));
         assert_eq!(h.cuda_name.as_deref(), Some("RTX"));
         assert_eq!(h.fork, Some(true));
+        assert!(!h.voice_design);
+    }
+
+    #[test]
+    fn design_request_has_no_reference_and_keeps_the_explicit_seed() {
+        let value = serde_json::to_value(DesignReq {
+            text: "A new road awaits.".into(),
+            instruct: "female, young adult, high pitch".into(),
+            out_path: "candidate.wav".into(),
+            target_sample_rate: 22_050,
+            seed: 137,
+        }).unwrap();
+        assert_eq!(value["seed"], 137);
+        assert_eq!(value["instruct"], "female, young adult, high pitch");
+        assert!(value.get("ref_audio").is_none());
+        assert!(value.get("ref_text").is_none());
     }
 
     #[test]

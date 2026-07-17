@@ -146,6 +146,8 @@ pub struct EngineStatus {
     pub cuda_name: Option<String>,
     /// Whether the performance fork is active in the engine process.
     pub fork: Option<bool>,
+    /// Whether this server version advertises reference-free voice design.
+    pub voice_design: bool,
 }
 
 /// Decide whether a `/health` probe means the server is already up (adopt) or we
@@ -291,6 +293,7 @@ impl OmniVoiceEngine {
                 device: h.device,
                 cuda_name: h.cuda_name,
                 fork: h.fork,
+                voice_design: h.voice_design,
             },
             None => EngineStatus {
                 running: false,
@@ -303,6 +306,7 @@ impl OmniVoiceEngine {
                 device: None,
                 cuda_name: None,
                 fork: None,
+                voice_design: false,
             },
         }
     }
@@ -392,6 +396,7 @@ mod tests {
             cuda_name: None,
             fork: None,
             load_error: None,
+            voice_design: false,
         };
         assert!(should_adopt(&Some(ok)));
         assert!(!should_adopt(&None));
@@ -403,6 +408,7 @@ mod tests {
             cuda_name: None,
             fork: None,
             load_error: None,
+            voice_design: false,
         };
         assert!(!should_adopt(&Some(bad)));
     }
