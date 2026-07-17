@@ -12,6 +12,7 @@ import type {
   EffectiveSpeakerBinding,
   EngineStatus,
   HealthReport,
+  GeneratableLine,
   Line,
   ListSynthesisDecisionsResult,
   MetadataBinding,
@@ -23,6 +24,7 @@ import type {
   SynthesisCorpusAuditSummary,
   SynthesisDecisionKind,
   SynthesisDecisionRow,
+  VoiceProfile,
   SynthesisFlaggedRow,
   SynthesisPreview,
   SynthesisTaggingSummary,
@@ -99,6 +101,7 @@ export const speakers: Speaker[] = [
     provenance_json: "{}",
     confidence: 1,
     long_name_strref: 22570,
+    excluded: false,
   },
   {
     id: 2,
@@ -115,6 +118,7 @@ export const speakers: Speaker[] = [
     provenance_json: "{}",
     confidence: 1,
     long_name_strref: 33001,
+    excluded: false,
   },
 ];
 
@@ -126,8 +130,11 @@ export const speakerGroups: SpeakerGroup[] = [
     variant_count: 1,
     line_count: 103,
     approved_sample_count: 3,
+    approved_sound_count: 3,
+    sample_count: 3,
     clone_status: "ready",
     binding_source: "generic",
+    excluded: false,
     variants: [
       {
         speaker_id: 1,
@@ -144,8 +151,11 @@ export const speakerGroups: SpeakerGroup[] = [
     variant_count: 1,
     line_count: 1,
     approved_sample_count: 0,
+    approved_sound_count: 0,
+    sample_count: 0,
     clone_status: "ready",
     binding_source: "generic",
+    excluded: false,
     variants: [
       {
         speaker_id: 2,
@@ -187,10 +197,15 @@ function line(
   };
 }
 
+function asGeneratable(row: Line): GeneratableLine {
+  const { original_text: _original, ...rest } = row;
+  return rest;
+}
+
 /** Lines eligible for generation (speaker 1 has a ready clone in fixtures). */
-export const generatableLines: Line[] = [
-  line(1, 22570, "I cannot hold them much longer.", 1, "ready"),
-  line(
+export const generatableLines: GeneratableLine[] = [
+  asGeneratable(line(1, 22570, "I cannot hold them much longer.", 1, "ready")),
+  asGeneratable(line(
     2,
     22571,
     "We should press on before it is too late.",
@@ -200,10 +215,19 @@ export const generatableLines: Line[] = [
       is_voiced: true,
       existing_sound_resref: "Z0002A00",
     },
-  ),
-  line(3, 33001, "Keep your voice down.", 2, "ready", { dlg_resref: "montdlg" }),
+  )),
+  asGeneratable(line(3, 33001, "Keep your voice down.", 2, "ready", { dlg_resref: "montdlg" })),
+  // Blocked line that still has a clip — visible for preview/removal only.
+  asGeneratable(line(
+    20,
+    99448,
+    "There is no sin in it if your cause is righteous.",
+    1,
+    "blocked",
+    { dlg_resref: "bkeldor", state_index: 175 },
+  )),
   ...Array.from({ length: 101 }, (_, index) =>
-    line(
+    asGeneratable(line(
       100 + index,
       50000 + index,
       index === 0
@@ -212,9 +236,12 @@ export const generatableLines: Line[] = [
       1,
       "ready",
       { state_index: index + 10 },
-    ),
+    )),
   ),
 ];
+
+/** Line ids used by e2e when seeding a blocked/skipped orphan clip. */
+export const orphanCompletedGenerationIds = [20];
 
 export const blockedLines: Line[] = [
   line(10, 44001, "Already voiced by the game.", 1, "blocked", {
@@ -236,6 +263,7 @@ export const clones: Clone[] = [
     id: 1,
     speaker_id: 1,
     primary_sample_id: 1,
+    voice_profile_id: 100,
     binding_source: "default",
     status: "ready",
     render_settings_json: defaultRenderSettingsJson,
@@ -244,6 +272,7 @@ export const clones: Clone[] = [
     id: 2,
     speaker_id: 2,
     primary_sample_id: 2,
+    voice_profile_id: 100,
     binding_source: "default",
     status: "ready",
     render_settings_json: defaultRenderSettingsJson,
@@ -259,6 +288,9 @@ export const effectiveBindings: EffectiveSpeakerBinding[] = [
     clone_status: "ready",
     sample_id: 1,
     sample_path: "C:\\fixture\\workspace\\xzar\\xzar01.wav",
+    voice_profile_id: 100,
+    voice_profile_name: "Xzar — harvested",
+    voice_profile_origin: "harvested",
     donor_speaker_id: 1,
     donor_display_name: "Xzar",
     inherited: true,
@@ -271,6 +303,9 @@ export const effectiveBindings: EffectiveSpeakerBinding[] = [
     clone_status: "ready",
     sample_id: 1,
     sample_path: "C:\\fixture\\workspace\\xzar\\xzar01.wav",
+    voice_profile_id: 100,
+    voice_profile_name: "Xzar — harvested",
+    voice_profile_origin: "harvested",
     donor_speaker_id: 1,
     donor_display_name: "Xzar",
     inherited: false,
@@ -365,7 +400,7 @@ export const demographicGroups: DemographicGroup[] = [
     creature_category_label: "Humanoid",
     speaker_count: 2,
     line_count: 3,
-    pool_size: 1,
+    pool_size: 3,
     configured: true,
     unvoiced_count: 1,
     ready_clone_count: 1,
@@ -397,8 +432,58 @@ export const metadataBindings: MetadataBinding[] = [
     sex_label: "Male",
     race_label: "Human",
     creature_category_label: "Humanoid",
-    donor_speaker_ids: [1],
+    donor_speaker_ids: [1, 2],
+    voice_profile_ids: [100, 101, 102],
   },
+];
+
+export const voiceProfiles: VoiceProfile[] = [
+  {
+    id: 100, project_id: 1, display_name: "Xzar — harvested", origin: "harvested",
+    harvested_speaker_id: 1, design: null, availability: "available",
+    reference_fingerprint: "harvested-fingerprint", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+    references: [{ id: 1000, voice_profile_id: 100, reference_sample_id: 1, managed_path: null, resolved_audio_path: "C:\\fixture\\workspace\\xzar\\xzar01.wav", source_strref: 1000, source_sound_resref: "xzar01", transcript: "A fine day for murder.", sort_order: 0, fingerprint: "ref-1000" }],
+  },
+  {
+    id: 101, project_id: 1, display_name: "Weathered traveler", origin: "imported",
+    harvested_speaker_id: null, design: null, availability: "available",
+    reference_fingerprint: "imported-fingerprint", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+    references: [{ id: 1001, voice_profile_id: 101, reference_sample_id: null, managed_path: "C:\\fixture\\profiles\\101\\reference-0.wav", resolved_audio_path: "C:\\fixture\\profiles\\101\\reference-0.wav", source_strref: null, source_sound_resref: null, transcript: "The road has been long.", sort_order: 0, fingerprint: "ref-1001" }],
+  },
+  {
+    id: 102, project_id: 1, display_name: "Young Amnian noble", origin: "designed",
+    harvested_speaker_id: null, design: { gender: "female", age: "young adult", pitch: "moderate pitch", whisper: false, accent: "british accent" }, availability: "available",
+    reference_fingerprint: "designed-fingerprint", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+    references: [{ id: 1002, voice_profile_id: 102, reference_sample_id: null, managed_path: "C:\\fixture\\profiles\\102\\reference-0.wav", resolved_audio_path: "C:\\fixture\\profiles\\102\\reference-0.wav", source_strref: null, source_sound_resref: null, transcript: "Beyond these walls, every road leads to a new story.", sort_order: 0, fingerprint: "ref-1002" }],
+  },
+  ...Array.from({ length: 26 }, (_, index): VoiceProfile => {
+    const id = 200 + index;
+    const path = `C:\\fixture\\profiles\\${id}\\reference-0.wav`;
+    return {
+      id,
+      project_id: 1,
+      display_name: `ZZ fixture voice ${String(index + 1).padStart(2, "0")}`,
+      origin: "imported",
+      harvested_speaker_id: null,
+      design: null,
+      availability: index === 25 ? "missing_local_audio" : "available",
+      reference_fingerprint: `fixture-${id}`,
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+      references: [{
+        id: id * 10,
+        voice_profile_id: id,
+        reference_sample_id: null,
+        managed_path: index === 25 ? null : path,
+        resolved_audio_path: index === 25 ? null : path,
+        source_strref: null,
+        source_sound_resref: null,
+        transcript: `Fixture library transcript ${index + 1}`,
+        sort_order: 0,
+        fingerprint: `fixture-ref-${id}`,
+      }],
+    };
+  }),
 ];
 
 export const engineStatus: EngineStatus = {
@@ -412,6 +497,7 @@ export const engineStatus: EngineStatus = {
   device: null,
   cuda_name: null,
   fork: null,
+  voice_design: true,
 };
 
 /** Keys persisted via `get_setting` / `set_setting` in E2E. */
@@ -523,6 +609,15 @@ export let tagRules: TagRule[] = [
   {
     id: 2,
     find_text: "laugh",
+    tag: "[laughter]",
+    match_kind: "stage_cue",
+    enabled: true,
+    is_default: true,
+    updated_at: "now",
+  },
+  {
+    id: 4,
+    find_text: "grin",
     tag: "[laughter]",
     match_kind: "stage_cue",
     enabled: true,

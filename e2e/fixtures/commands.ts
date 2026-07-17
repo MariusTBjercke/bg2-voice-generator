@@ -1,5 +1,5 @@
 import type { InvokeArgs } from "@tauri-apps/api/core";
-import type { SynthesisDecisionKind } from "../../src/lib/types";
+import type { DesignVoiceAttributes, SynthesisDecisionKind } from "../../src/lib/types";
 import {
   attributionCounts,
   blockedLines,
@@ -39,6 +39,7 @@ import {
   setSynthesisOverride,
   markSynthesisReview,
   unmarkSynthesisReview,
+  voiceProfiles,
   resetSynthesisAgentState,
   resetSynthesisFixtures,
 } from "./data";
@@ -53,6 +54,13 @@ function requireGameDir(args: InvokeArgs): string {
     throw new Error(`E2E mock: unexpected gameDir ${String(gameDir)}`);
   }
   return gameDir;
+}
+
+function optionallyDelayed<T>(storageKey: string, value: T): T | Promise<T> {
+  const delay = Number(localStorage.getItem(storageKey) ?? "0");
+  return delay > 0
+    ? new Promise((resolve) => window.setTimeout(() => resolve(value), delay))
+    : value;
 }
 
 /**
@@ -148,12 +156,13 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
       requireGameDir(args);
       return { ...synthesisAuditSummary };
 
-    case "list_synthesis_flagged":
+    case "list_synthesis_flagged": {
       requireGameDir(args);
-      return listSynthesisFlagged(
+      return optionallyDelayed("e2e.delay-review-ms", listSynthesisFlagged(
         arg<string | undefined>(args, "query"),
         arg<string | undefined>(args, "flag"),
-      );
+      ));
+    }
 
     case "list_synthesis_remaining":
       requireGameDir(args);
@@ -209,6 +218,32 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
       requireGameDir(args);
       return blockedLines;
 
+    case "list_blocked_lines_page": {
+      requireGameDir(args);
+      const reasonFor = (line: (typeof blockedLines)[number]) => {
+        if (line.is_voiced) return "already voiced";
+        if (line.has_tokens || line.kind === "token") return "dynamic token";
+        if (line.kind === "transition" || line.kind === "script") return "not a state line";
+        if (line.shared_group_id !== null) return "shared (different voice)";
+        if (line.speaker_id === null) return "unattributed";
+        return "other";
+      };
+      const query = String(arg<string | undefined>(args, "query") ?? "").trim().toLowerCase();
+      const reason = String(arg<string | undefined>(args, "reason") ?? "all");
+      const filtered = blockedLines.filter((line) =>
+        (reason === "all" || reasonFor(line) === reason)
+        && (!query || [line.strref, `${line.dlg_resref ?? ""}:${line.state_index ?? ""}`, line.text]
+          .some((value) => String(value).toLowerCase().includes(query))),
+      );
+      const offset = Number(arg<number | undefined>(args, "offset") ?? 0);
+      const limit = Number(arg<number | undefined>(args, "limit") ?? 100);
+      return {
+        rows: filtered.slice(offset, offset + limit),
+        total: filtered.length,
+        token_total: blockedLines.filter((line) => reasonFor(line) === "dynamic token").length,
+      };
+    }
+
     case "list_speakers":
       requireGameDir(args);
       return speakers;
@@ -216,6 +251,30 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
     case "list_speaker_groups":
       requireGameDir(args);
       return speakerGroups;
+
+    case "count_speaker_group_generations": {
+      requireGameDir(args);
+      return 0;
+    }
+
+    case "set_speaker_group_excluded": {
+      requireGameDir(args);
+      const identityKey = arg<string>(args, "identityKey");
+      const excluded = arg<boolean>(args, "excluded");
+      const group = speakerGroups.find((g) => g.identity_key === identityKey);
+      if (group) {
+        group.excluded = excluded;
+        for (const variant of group.variants) {
+          const speaker = speakers.find((s) => s.id === variant.speaker_id);
+          if (speaker) speaker.excluded = excluded;
+        }
+      }
+      return {
+        speakers_updated: group?.variant_count ?? 0,
+        generations_cleared: 0,
+        files_deleted: 0,
+      };
+    }
 
     case "list_group_reference_samples": {
       requireGameDir(args);
@@ -263,9 +322,24 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
         duration_warning: null,
       };
 
-    case "list_generatable_lines":
+    case "list_generatable_lines": {
       requireGameDir(args);
-      return generatableLines;
+      const completed = new Set(
+        JSON.parse(localStorage.getItem("e2e.completed-generation-ids") ?? "[]") as number[],
+      );
+      // Mirror backend: blocked/skipped only appear when they still have a done clip.
+      const lines = generatableLines.filter(
+        (line) =>
+          line.status === "ready" ||
+          line.status === "exported" ||
+          completed.has(line.id),
+      );
+      const delay = Number(localStorage.getItem("e2e.delay-generatable-ms") ?? "0");
+      if (delay > 0) {
+        return new Promise((resolve) => window.setTimeout(() => resolve(lines), delay));
+      }
+      return lines;
+    }
 
     case "list_render_candidates":
       requireGameDir(args);
@@ -345,6 +419,91 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
       requireGameDir(args);
       return clones;
 
+    case "list_voice_profiles":
+      requireGameDir(args);
+      return voiceProfiles;
+
+    case "select_voice_reference_files":
+      return ["C:\\fixture\\imports\\custom-voice.wav"];
+
+    case "create_imported_voice_profile": {
+      requireGameDir(args);
+      const id = Math.max(...voiceProfiles.map((profile) => profile.id), 100) + 1;
+      const clips = arg<Array<{ path: string; transcript: string }>>(args, "clips");
+      const profile = {
+        id, project_id: 1, display_name: arg<string>(args, "displayName"), origin: "imported" as const,
+        harvested_speaker_id: null, design: null, availability: "available" as const,
+        reference_fingerprint: `fixture-${id}`, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+        references: clips.map((clip, index) => ({ id: id * 10 + index, voice_profile_id: id, reference_sample_id: null, managed_path: `C:\\fixture\\profiles\\${id}\\reference-${index}.wav`, resolved_audio_path: `C:\\fixture\\profiles\\${id}\\reference-${index}.wav`, source_strref: null, source_sound_resref: null, transcript: clip.transcript, sort_order: index, fingerprint: `fixture-ref-${id}-${index}` })),
+      };
+      voiceProfiles.push(profile);
+      return profile;
+    }
+
+    case "generate_designed_voice_candidates":
+      requireGameDir(args);
+      return {
+        candidates: [42, 137, 911].map((seed, index) => ({ preview_id: `fixture-${seed}`, output_path: `C:\\fixture\\previews\\${index}.wav`, seed, duration_secs: 6.2 + index / 10 })),
+        quality_warning: null,
+      };
+
+    case "save_designed_voice_profile": {
+      requireGameDir(args);
+      const id = Math.max(...voiceProfiles.map((profile) => profile.id), 100) + 1;
+      const profile = {
+        id, project_id: 1, display_name: arg<string>(args, "displayName"), origin: "designed" as const,
+        harvested_speaker_id: null, design: arg<DesignVoiceAttributes>(args, "attributes"), availability: "available" as const,
+        reference_fingerprint: `fixture-${id}`, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+        references: [{ id: id * 10, voice_profile_id: id, reference_sample_id: null, managed_path: `C:\\fixture\\profiles\\${id}\\reference-0.wav`, resolved_audio_path: `C:\\fixture\\profiles\\${id}\\reference-0.wav`, source_strref: null, source_sound_resref: null, transcript: arg<string>(args, "text"), sort_order: 0, fingerprint: `fixture-ref-${id}` }],
+      };
+      voiceProfiles.push(profile);
+      return profile;
+    }
+
+    case "bind_speaker_voice_profile": {
+      requireGameDir(args);
+      const profile = voiceProfiles.find((row) => row.id === arg<number>(args, "voiceProfileId"));
+      const speakerId = arg<number>(args, "speakerId");
+      const effective = effectiveBindings.find((row) => row.speaker_id === speakerId);
+      if (profile && effective) {
+        effective.binding_source = "override";
+        effective.inherited = false;
+        effective.voice_profile_id = profile.id;
+        effective.voice_profile_name = profile.display_name;
+        effective.voice_profile_origin = profile.origin;
+        effective.donor_speaker_id = null;
+        effective.donor_display_name = null;
+        effective.sample_id = null;
+        effective.sample_path = profile.references[0]?.resolved_audio_path ?? null;
+      }
+      const clone = clones.find((row) => row.speaker_id === speakerId);
+      if (clone && profile) {
+        clone.voice_profile_id = profile.id;
+        clone.primary_sample_id = null;
+        clone.binding_source = "override";
+      }
+      return profile;
+    }
+
+    case "rename_voice_profile": {
+      requireGameDir(args);
+      const profile = voiceProfiles.find((row) => row.id === arg<number>(args, "voiceProfileId"));
+      if (!profile) throw new Error("E2E mock: voice profile not found");
+      profile.display_name = arg<string>(args, "displayName");
+      return profile;
+    }
+
+    case "delete_voice_profile": {
+      requireGameDir(args);
+      const id = arg<number>(args, "voiceProfileId");
+      const impact = { affected_speakers: 1, affected_pools: 1, reset_generations: 1, files_deleted: 1 };
+      if (!arg<boolean | undefined>(args, "dryRun")) {
+        const index = voiceProfiles.findIndex((profile) => profile.id === id);
+        if (index >= 0) voiceProfiles.splice(index, 1);
+      }
+      return impact;
+    }
+
     case "get_clone_render_settings": {
       const cloneId = arg<number>(args, "cloneId");
       const clone = clones.find((row) => row.id === cloneId);
@@ -361,7 +520,7 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
       return {
         clone,
         reset_generations: 2,
-        files_deleted: 2,
+        files_deleted: 0,
         files_missing: 0,
       };
     }
@@ -405,7 +564,7 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
           sort_order: sortOrder,
         })),
         reset_generations: 2,
-        files_deleted: 2,
+        files_deleted: 0,
         files_missing: 0,
       };
     }
@@ -446,10 +605,46 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
         groups_skipped_already_set: 0,
       };
 
-    case "add_metadata_donor":
-    case "remove_metadata_donor":
+    case "add_metadata_donor": {
+      const speakerId = arg<number>(args, "donorSpeakerId");
+      if (!metadataBindings[0].donor_speaker_ids.includes(speakerId)) metadataBindings[0].donor_speaker_ids.push(speakerId);
+      const profile = voiceProfiles.find((row) => row.origin === "harvested" && row.harvested_speaker_id === speakerId);
+      if (profile && !metadataBindings[0].voice_profile_ids.includes(profile.id)) metadataBindings[0].voice_profile_ids.push(profile.id);
+      return undefined;
+    }
+
+    case "remove_metadata_donor": {
+      const speakerId = arg<number>(args, "donorSpeakerId");
+      metadataBindings[0].donor_speaker_ids = metadataBindings[0].donor_speaker_ids.filter((id) => id !== speakerId);
+      const harvestedIds = new Set(voiceProfiles.filter((row) => row.origin === "harvested" && row.harvested_speaker_id === speakerId).map((row) => row.id));
+      metadataBindings[0].voice_profile_ids = metadataBindings[0].voice_profile_ids.filter((id) => !harvestedIds.has(id));
+      return undefined;
+    }
+
     case "clear_metadata_binding":
       return undefined;
+
+    case "add_metadata_profile": {
+      requireGameDir(args);
+      const id = arg<number>(args, "voiceProfileId");
+      if (!metadataBindings[0].voice_profile_ids.includes(id)) metadataBindings[0].voice_profile_ids.push(id);
+      const profile = voiceProfiles.find((row) => row.id === id);
+      if (profile?.harvested_speaker_id !== null && profile?.harvested_speaker_id !== undefined && !metadataBindings[0].donor_speaker_ids.includes(profile.harvested_speaker_id)) {
+        metadataBindings[0].donor_speaker_ids.push(profile.harvested_speaker_id);
+      }
+      return undefined;
+    }
+
+    case "remove_metadata_profile": {
+      requireGameDir(args);
+      const id = arg<number>(args, "voiceProfileId");
+      metadataBindings[0].voice_profile_ids = metadataBindings[0].voice_profile_ids.filter((profileId) => profileId !== id);
+      const profile = voiceProfiles.find((row) => row.id === id);
+      if (profile?.harvested_speaker_id !== null && profile?.harvested_speaker_id !== undefined) {
+        metadataBindings[0].donor_speaker_ids = metadataBindings[0].donor_speaker_ids.filter((speakerId) => speakerId !== profile.harvested_speaker_id);
+      }
+      return undefined;
+    }
 
     case "clear_all_metadata_pools":
       requireGameDir(args);

@@ -42,3 +42,24 @@ test("lists default tag rules and adds a spoken-word Bah rule", async ({ page })
   await page.getByRole("button", { name: "Test tags" }).click();
   await expect(page.getByText("[dissatisfaction-hnn]! [sigh] This is annoying.")).toBeVisible();
 });
+
+test("restores dictionary view context but not an unfinished rule", async ({ page }) => {
+  await page.goto("/dictionary");
+  await page.getByRole("tab", { name: "Tag rules" }).click();
+  await page.getByLabel("Before").fill("Custom tag preview");
+  await page.getByLabel("Search tag rules").fill("sigh");
+  await page.getByRole("button", { name: "+ Add tag rule" }).click();
+  await page.getByLabel("Tag find text").fill("unfinished");
+
+  await page.reload();
+
+  await expect(page.getByRole("tab", { name: "Tag rules" })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByLabel("Before")).toHaveValue("Custom tag preview");
+  await expect(page.getByLabel("Search tag rules")).toHaveValue("sigh");
+  await expect(page.getByLabel("Tag find text")).toHaveCount(0);
+
+  await page.getByRole("tab", { name: "Placeholders" }).click();
+  await page.getByRole("button", { name: "Show advanced overrides" }).click();
+  await page.reload();
+  await expect(page.getByRole("button", { name: "Hide advanced overrides" })).toBeVisible();
+});

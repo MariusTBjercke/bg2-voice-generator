@@ -27,6 +27,18 @@ test("shows synthesis progress and launches agents", async ({ page }) => {
   await expect(page.getByRole("button", { name: "Reveal workspace" })).toBeEnabled();
 });
 
+test("restores cached review summaries and rows during delayed revisit reconciliation", async ({ page }) => {
+  await page.goto("/agent");
+  await expect(page.getByText("*hic* Excuse me.")).toBeVisible();
+  await page.getByRole("navigation").getByRole("link", { name: "Binding" }).click();
+  await page.evaluate(() => localStorage.setItem("e2e.delay-review-ms", "1200"));
+  await page.getByRole("navigation").getByRole("link", { name: "Review" }).click();
+
+  await expect(page.getByText("*hic* Excuse me.")).toBeVisible({ timeout: 300 });
+  await expect(page.getByText("120", { exact: true })).toBeVisible();
+  await expect(page.getByRole("tab", { name: /Flagged 5/ })).toBeVisible();
+});
+
 test("lists processed decisions and clears an override", async ({ page }) => {
   await page.goto("/agent");
 
@@ -47,6 +59,15 @@ test("switches reviewed tab and unmarks a review", async ({ page }) => {
 
   await page.getByRole("button", { name: "Unmark review" }).click();
   await expect(page.getByText("A fine day for murder.")).toHaveCount(0);
+});
+
+test("restores the selected review tab at the first page", async ({ page }) => {
+  await page.goto("/agent");
+  await page.getByRole("tab", { name: /Remaining/ }).click();
+  await page.reload();
+  await expect(page.getByRole("tab", { name: /Remaining/ })).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator(".pager-count")).toContainText("Showing 1–");
+  await expect(page.getByRole("button", { name: /Prev/ })).toBeDisabled();
 });
 
 test("accepts a flagged string without an override", async ({ page }) => {

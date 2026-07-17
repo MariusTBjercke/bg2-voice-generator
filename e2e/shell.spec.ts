@@ -24,4 +24,11 @@ test.describe("App shell", () => {
   test("top bar matches snapshot", async ({ page }) => {
     await expect(page.locator("header.topbar")).toHaveScreenshot("shell-topbar.png");
   });
+
+  test("restores the selected locale after a reload", async ({ page }) => {
+    const locale = page.getByLabel("Active language");
+    await locale.selectOption("de_DE");
+    await page.reload();
+    await expect(locale).toHaveValue("de_DE");
+  });
 });

@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { bootstrapProject, goTo } from "./helpers/bootstrap";
-import { generatableLines } from "./fixtures/data";
+import { generatableLines, orphanCompletedGenerationIds } from "./fixtures/data";
 
 test.describe("Generation screen", () => {
   test.beforeEach(async ({ page }) => {
@@ -14,6 +14,29 @@ test.describe("Generation screen", () => {
     for (const line of generatableLines.slice(0, 3)) {
       await expect(page.getByText(`#${line.strref}`)).toBeVisible();
     }
+  });
+
+  test("speaker names deep-link to Binding with that identity", async ({ page }) => {
+    const row = page.locator(".line").filter({ hasText: "#22570" });
+    const speaker = row.getByRole("link", { name: "Xzar" });
+    await expect(speaker).toHaveAttribute("href", "/binding?identity=22570");
+  });
+
+  test("identity query filters the speaker scope", async ({ page }) => {
+    await page.goto("/generation?identity=33001");
+    await expect(page.getByRole("heading", { name: /Generatable lines \(1 of 104\)/ })).toBeVisible();
+    await expect(page.getByText("#33001")).toBeVisible();
+    await expect(page).toHaveURL(/\/generation$/);
+  });
+
+  test("shows cached lines immediately while a revisit refresh is delayed", async ({ page }) => {
+    await expect(page.getByText("#22570")).toBeVisible();
+    await goTo(page, "Binding");
+    await page.evaluate(() => localStorage.setItem("e2e.delay-generatable-ms", "1200"));
+    await goTo(page, "Generation");
+
+    await expect(page.getByText("#22570")).toBeVisible({ timeout: 300 });
+    await expect(page.getByRole("heading", { name: "Generatable lines (104)" })).toBeVisible();
   });
 
   test("shows voiced-in-game badge for installed pack audio", async ({ page }) => {
@@ -71,6 +94,14 @@ test.describe("Generation screen", () => {
 
     await page.getByRole("button", { name: "Clear all", exact: true }).click();
     await expect(page.getByRole("heading", { name: "Generatable lines (104)" })).toBeVisible();
+  });
+
+  test("restores the advanced-filter panel without restoring pagination", async ({ page }) => {
+    await page.getByRole("button", { name: "More filters" }).click();
+    await page.getByRole("button", { name: "Next page" }).last().click();
+    await page.reload();
+    await expect(page.getByRole("button", { name: /Fewer filters/ })).toBeVisible();
+    await expect(page.getByText("1 / 2", { exact: true }).last()).toBeVisible();
   });
 
   test("batch actions target every filtered line, including lines beyond the current page", async ({ page }) => {
@@ -161,5 +192,30 @@ test.describe("Generation screen", () => {
     page.once("dialog", (dialog) => dialog.accept());
     await page.getByRole("button", { name: "Remove clip" }).first().click();
     await expect(page.getByRole("button", { name: "Remove clip" })).toHaveCount(2);
+  });
+
+  test("surfaces blocked orphan clips for preview and removal, not batch regenerate", async ({ page }) => {
+    await page.evaluate((ids) => {
+      localStorage.setItem("e2e.completed-generation-ids", JSON.stringify(ids));
+      localStorage.setItem("e2e.voice-changed-generation-ids", JSON.stringify(ids));
+    }, orphanCompletedGenerationIds);
+    await page.getByRole("button", { name: "Refresh" }).click();
+
+    await expect(page.getByRole("heading", { name: /Generatable lines \(105\)/ })).toBeVisible();
+    const banner = page.getByRole("status").filter({ hasText: "blocked or skipped" });
+    await expect(banner).toContainText("1 generated clip is on blocked or skipped lines");
+    await banner.getByRole("button", { name: "Show them" }).click();
+
+    await expect(page.getByRole("heading", { name: /Generatable lines \(1 of 105\)/ })).toBeVisible();
+    const row = page.locator(".line").filter({ hasText: "#99448" });
+    await expect(row.getByText("blocked", { exact: true })).toBeVisible();
+    await expect(row.getByText("voice changed", { exact: true })).toBeVisible();
+    await expect(row.getByRole("button", { name: "Re-generate" })).toBeDisabled();
+    await expect(row.getByText(/Blocked by attribution/)).toBeVisible();
+    await expect(page.getByRole("button", { name: "Re-generate all (0)" })).toBeDisabled();
+
+    page.once("dialog", (dialog) => dialog.accept());
+    await row.getByRole("button", { name: "Remove clip" }).click();
+    await expect(page.getByRole("button", { name: "Remove clip" })).toHaveCount(0);
   });
 });

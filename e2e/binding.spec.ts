@@ -8,6 +8,15 @@ test.describe("Guided voice binding", () => {
   });
 
   test("shows demographic defaults and optional speaker overrides together", async ({ page }) => {
+    await expect(page.getByRole("heading", { name: "Voice library" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Import voice" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Design voice" })).toBeVisible();
+    await expect(page.getByRole("link", { name: "Manage harvested samples" })).toHaveAttribute("href", "/harvest");
+    await expect(page.getByText("Weathered traveler")).toBeVisible();
+    await expect(page.locator("li.profile-row").filter({ hasText: "Weathered traveler" }).getByText("Imported", { exact: true })).toBeVisible();
+    await expect(page.locator("li.profile-row").filter({ hasText: "Young Amnian noble" }).getByText("Designed", { exact: true })).toBeVisible();
+    await expect(page.locator("#voice-library-panel li.profile-row").filter({ hasText: "Xzar — harvested" })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: /Voice library/ })).toContainText("28 custom · 1 harvested");
     await expect(page.getByRole("heading", { name: "Demographic defaults" })).toBeVisible();
     await expect(page.getByRole("heading", { name: /Speaker overrides/ })).toBeVisible();
     await expect(page.getByText("Male / Human / Humanoid")).toBeVisible();
@@ -17,13 +26,131 @@ test.describe("Guided voice binding", () => {
     await expect(page.getByRole("button", { name: "Use personal samples for all" })).toBeVisible();
   });
 
+  test("imports a custom voice with an exact transcript", async ({ page }) => {
+    await page.getByRole("button", { name: "Import voice" }).click();
+    await page.getByLabel("Profile name").first().fill("Campfire storyteller");
+    await page.getByRole("button", { name: "Choose 1–4 audio files…" }).click();
+    await page.getByPlaceholder("Exact words spoken in this clip").fill("The fire is warm tonight.");
+    await page.getByRole("button", { name: "Save imported voice" }).click();
+    await expect(page.getByText("Campfire storyteller")).toBeVisible();
+  });
+
+  test("renders and freezes one designed candidate", async ({ page }) => {
+    await page.getByRole("button", { name: "Design voice" }).click();
+    await page.getByLabel("Profile name").fill("Quiet courtier");
+    await page.getByRole("button", { name: "Generate 3 auditions" }).click();
+    await expect(page.getByText("Candidate 1 · seed 42")).toBeVisible();
+    await page.getByText("Candidate 2 · seed 137").click();
+    await page.getByRole("button", { name: "Save selected voice" }).click();
+    await expect(page.getByText("Quiet courtier")).toBeVisible();
+  });
+
+  test("filters the library and explains playable reference details", async ({ page }) => {
+    const library = page.locator("#voice-library-panel");
+    await expect(library).toContainText("reference clip and its exact transcript");
+    await library.getByLabel("Origin").selectOption("harvested");
+
+    const harvested = library.locator("li.profile-row").filter({ hasText: "Xzar" });
+    await expect(harvested).toContainText("1 reference clip");
+    await expect(harvested.getByRole("button", { name: "Play", exact: true })).toBeVisible();
+    await expect(harvested.getByRole("link", { name: "Manage in Harvest" })).toHaveAttribute(
+      "href",
+      "/harvest?identity=22570",
+    );
+    await expect(harvested.getByRole("button", { name: "Rename" })).toHaveCount(0);
+    await expect(harvested.getByRole("button", { name: "Delete…" })).toHaveCount(0);
+
+    await harvested.getByText("Reference details").click();
+    await expect(harvested).toContainText("Transcript: A fine day for murder.");
+    await expect(harvested).toContainText("Source: sound xzar01 · strref 1000");
+    await expect(harvested.getByRole("button", { name: "Play clip" })).toBeVisible();
+    await expect(library).toHaveScreenshot("binding-voice-library.png", { animations: "disabled" });
+
+    await library.getByPlaceholder("name, transcript, source, or design attribute…").fill("xzar01");
+    await expect(harvested).toBeVisible();
+    await library.getByLabel("Availability").selectOption("missing_local_audio");
+    await expect(library.getByText("No voices match these library filters.")).toBeVisible();
+  });
+
+  test("shows editable custom profiles and designed attributes", async ({ page }) => {
+    const library = page.locator("#voice-library-panel");
+    const imported = library.locator("li.profile-row").filter({ hasText: "Weathered traveler" });
+    const designed = library.locator("li.profile-row").filter({ hasText: "Young Amnian noble" });
+    await expect(imported.getByRole("button", { name: "Rename" })).toBeVisible();
+    await expect(imported.getByRole("button", { name: "Delete…" })).toBeVisible();
+    await expect(designed.getByRole("button", { name: "Rename" })).toBeVisible();
+    await designed.getByText("Reference details").click();
+    await expect(designed).toContainText("female · young adult · moderate pitch · british accent");
+  });
+
+  test("paginates library results and resets to the first page when filters change", async ({ page }) => {
+    const library = page.locator("#voice-library-panel");
+    await expect(library.getByText("1 / 2", { exact: true })).toBeVisible();
+    await library.getByRole("button", { name: "Next page" }).click();
+    await expect(library.getByText("2 / 2", { exact: true })).toBeVisible();
+
+    const search = library.getByPlaceholder("name, transcript, source, or design attribute…");
+    await search.fill("Young Amnian noble");
+    await expect(library.getByText("Young Amnian noble")).toBeVisible();
+    await search.fill("no such fixture voice");
+    await expect(library.getByText("No voices match these library filters.")).toBeVisible();
+  });
+
+  test("uses imported and designed profiles in pools and personal overrides", async ({ page }) => {
+    await page.getByText("Male / Human / Humanoid").click();
+    const group = page.locator("li.group-row").filter({ hasText: "Male / Human / Humanoid" });
+    await expect(group.getByText("Weathered traveler")).toBeVisible();
+    await expect(group.getByText("Young Amnian noble")).toBeVisible();
+    await group.locator("li.donor-row").filter({ hasText: "Weathered traveler" }).getByRole("button", { name: "Remove" }).click();
+    await group.getByRole("combobox").first().selectOption("101");
+    await group.getByRole("button", { name: "Add custom voice" }).click();
+
+    await page.getByRole("button", { name: /Xzar/ }).first().click();
+    const override = page.locator(".profile-override");
+    await override.getByRole("combobox").selectOption("102");
+    await override.getByRole("button", { name: "Assign profile" }).click();
+    await expect(page.locator(".effective-voice")).toContainText("Young Amnian noble");
+  });
+
+  test("identity query selects the character and exposes harvest/generation deep links", async ({
+    page,
+  }) => {
+    await page.goto("/binding?identity=33001");
+    await expect(page.getByRole("heading", { name: "Montaron" })).toBeVisible();
+    // Montaron borrows Xzar's demographic voice — Review samples opens the donor.
+    await expect(page.getByRole("link", { name: "Review samples" })).toHaveAttribute(
+      "href",
+      "/harvest?identity=22570",
+    );
+    await expect(page.getByRole("link", { name: "Open on Generation" })).toHaveAttribute(
+      "href",
+      "/generation?identity=33001",
+    );
+    await expect(page).toHaveURL(/\/binding$/);
+  });
+
   test("can expand a group pool editor with suggest and play", async ({ page }) => {
     await page.getByText("Male / Human / Humanoid").click();
-    await expect(page.getByRole("button", { name: "Suggest best donor" })).toBeVisible();
+    const group = page.locator("li.group-row").filter({ hasText: "Male / Human / Humanoid" });
+    await expect(page.getByRole("button", { name: "Suggest harvested voice" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Clear pool", exact: true })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Play", exact: true })).toBeVisible();
-    await page.getByRole("button", { name: "Add from other demographics…" }).click();
-    await expect(page.locator("select.donor-select").nth(1)).toContainText("Montaron");
+    await expect(group.getByRole("button", { name: "Play", exact: true }).first()).toBeVisible();
+    await page.getByRole("button", { name: "Add harvested voice from other demographics…" }).click();
+    await expect(group.locator("select.donor-select").nth(1)).toContainText("Other harvested voice…");
+  });
+
+  test("renders mirrored harvested memberships once and keeps legacy donors as fallbacks", async ({ page }) => {
+    await page.getByText("Male / Human / Humanoid").click();
+    const group = page.locator("li.group-row").filter({ hasText: "Male / Human / Humanoid" });
+    const xzarRows = group.locator("li.donor-row").filter({ hasText: "Xzar" });
+    await expect(xzarRows).toHaveCount(1);
+    await expect(xzarRows).toContainText("Harvested");
+    await expect(xzarRows.getByRole("button", { name: "Play", exact: true })).toBeVisible();
+    await expect(xzarRows.getByRole("button", { name: "Remove" })).toBeVisible();
+
+    const legacy = group.locator("li.donor-row").filter({ hasText: "Montaron" });
+    await expect(legacy).toContainText("Harvested · legacy");
+    await expect(legacy.getByRole("button", { name: "Remove" })).toBeVisible();
   });
 
   test("clear all pools requires confirmation", async ({ page }) => {
@@ -95,7 +222,7 @@ test.describe("Guided voice binding", () => {
     await speed.getByLabel("Fixed speed").check();
     await speed.getByLabel("Multiplier").fill("1.15");
     await page.getByRole("button", { name: "Save tuning" }).click();
-    await expect(page.getByText(/Saved tuning\. Reset 2 generated clip/)).toBeVisible();
+    await expect(page.getByText(/Saved tuning\. Marked 2 clip\(s\) as voice changed/)).toBeVisible();
 
     await page.getByLabel("Preview dialogue").fill("[preview error]");
     await page.getByRole("button", { name: "Render A" }).click();
@@ -126,6 +253,41 @@ test.describe("Guided voice binding", () => {
     await charactersToggle.click();
     await expect(page.locator("#characters-list-panel")).toBeHidden();
     await expect(charactersToggle).toHaveAttribute("aria-expanded", "false");
+  });
+
+  test("persists panels and the expanded demographic group across navigation and reload", async ({ page }) => {
+    await page.getByText("Male / Human / Humanoid").click();
+    await page.getByRole("button", { name: /Xzar/ }).first().click();
+    await page.getByPlaceholder("filter groups…").fill("Male");
+    await page.getByLabel("Preview dialogue").fill("Persistent preview text");
+    await page.getByRole("button", { name: /Characters \(2\)/ }).click();
+
+    await goTo(page, "Generation");
+    await goTo(page, "Binding");
+    await expect(page.getByRole("button", { name: /Characters \(2\)/ })).toHaveAttribute("aria-expanded", "false");
+    await expect(page.getByRole("button", { name: "Suggest harvested voice" })).toBeVisible();
+
+    await page.reload();
+    await expect(page.getByRole("button", { name: /Characters \(2\)/ })).toHaveAttribute("aria-expanded", "false");
+    await expect(page.getByRole("button", { name: "Suggest harvested voice" })).toBeVisible();
+    await expect(page.getByPlaceholder("filter groups…")).toHaveValue("Male");
+    await expect(page.getByRole("heading", { name: "Xzar" })).toBeVisible();
+    await expect(page.getByLabel("Preview dialogue")).toHaveValue("Persistent preview text");
+  });
+
+  test("persists library filters separately from character filters", async ({ page }) => {
+    const library = page.locator("#voice-library-panel");
+    await library.getByLabel("Origin").selectOption("harvested");
+    await page.getByPlaceholder("character name or resref…").fill("Montaron");
+
+    await goTo(page, "Generation");
+    await goTo(page, "Binding");
+    await expect(page.locator("#voice-library-panel").getByLabel("Origin")).toHaveValue("harvested");
+    await expect(page.getByPlaceholder("character name or resref…")).toHaveValue("Montaron");
+
+    await page.reload();
+    await expect(page.locator("#voice-library-panel").getByLabel("Origin")).toHaveValue("harvested");
+    await expect(page.getByPlaceholder("character name or resref…")).toHaveValue("Montaron");
   });
 
   test("keeps the desktop speaker column bounded with vertical-only scrolling", async ({ page }) => {
