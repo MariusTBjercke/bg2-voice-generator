@@ -9,14 +9,160 @@
 //! the fresh scores can be re-auditioned). Only local-derivative metadata is stored
 //! - never original audio (see `00-context.md`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::AppError;
+use crate::export::resref::is_pack_generated_resref;
 use crate::voices::harvest::HarvestedSample;
 
-/// Counts of what a harvest-persist run wrote, surfaced to the command/UI layer.
+/// Speakers with Ready lines and few automatic samples may receive Attribution gap-fill.
+pub const GAP_FILL_AUTOMATIC_MAX: usize = 2;
+
+/// A speaker eligible for Attribution-voiced gap-fill harvest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GapFillEligibleSpeaker {
+    pub speaker_id: i64,
+    pub cre_resref: String,
+    pub automatic_count: usize,
+    /// Same identity key shape as live harvest (`long_name_strref` or `ungrouped:{cre}`).
+    pub identity_key: String,
+}
+
+/// One uniquely attributed official-VO line candidate for gap-fill.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GapFillVoicedLine {
+    pub cre_resref: String,
+    pub strref: u32,
+    pub sound_resref: String,
+    pub source_text: String,
+    pub attribution_confidence: f64,
+}
+
+/// Speakers that still need generation and have ≤ [`GAP_FILL_AUTOMATIC_MAX`] automatic samples.
+pub fn gap_fill_eligible_speakers(
+    conn: &Connection,
+    project_id: i64,
+) -> Result<Vec<GapFillEligibleSpeaker>, AppError> {
+    let mut speakers = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT s.id, s.cre_resref, s.long_name_strref \
+         FROM speaker s \
+         WHERE s.project_id = ?1 \
+           AND EXISTS ( \
+             SELECT 1 FROM line l \
+             WHERE l.speaker_id = s.id AND l.status = 'ready' \
+           )",
+    )?;
+    let rows = stmt.query_map(params![project_id], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<i64>>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (speaker_id, cre_resref, long_name_strref) = row?;
+        let automatic_count = count_automatic_samples(conn, speaker_id)?;
+        if automatic_count > GAP_FILL_AUTOMATIC_MAX {
+            continue;
+        }
+        let cre_lc = cre_resref.to_ascii_lowercase();
+        let identity_key = long_name_strref
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("ungrouped:{cre_lc}"));
+        speakers.push(GapFillEligibleSpeaker {
+            speaker_id,
+            cre_resref: cre_lc,
+            automatic_count,
+            identity_key,
+        });
+    }
+    Ok(speakers)
+}
+
+/// Mirror of `voices::harvest::provenance_is_automatic` without importing that module
+/// cycle (db already depends on HarvestedSample from voices).
+fn sample_provenance_is_automatic(raw: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("eligibility")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .map_or(true, |token| token == "automatic")
+}
+
+fn count_automatic_samples(conn: &Connection, speaker_id: i64) -> Result<usize, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT provenance_json FROM reference_sample WHERE speaker_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![speaker_id], |r| r.get::<_, String>(0))?;
+    let mut count = 0usize;
+    for row in rows {
+        if sample_provenance_is_automatic(&row?) {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Official voiced Attribution lines for the given speakers (unique confidence, not deferred).
+/// Pack-generated `Z*` resrefs are excluded in Rust after the query.
+pub fn gap_fill_voiced_lines(
+    conn: &Connection,
+    project_id: i64,
+    speaker_ids: &[i64],
+) -> Result<Vec<GapFillVoicedLine>, AppError> {
+    if speaker_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT s.cre_resref, l.strref, l.existing_sound_resref, l.text, l.attribution_confidence \
+         FROM line l \
+         JOIN speaker s ON s.id = l.speaker_id \
+         LEFT JOIN shared_strref_group g ON g.id = l.shared_group_id \
+         WHERE l.project_id = ?1 \
+           AND l.speaker_id = ?2 \
+           AND l.kind = 'state' \
+           AND l.is_voiced = 1 \
+           AND l.existing_sound_resref IS NOT NULL \
+           AND TRIM(l.existing_sound_resref) != '' \
+           AND l.attribution_confidence >= 1.0 \
+           AND (l.shared_group_id IS NULL OR g.resolution = 'reuse_same_voice')",
+    )?;
+    for &speaker_id in speaker_ids {
+        let rows = stmt.query_map(params![project_id, speaker_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, f64>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (cre, strref, sound, text, conf) = row?;
+            if is_pack_generated_resref(&sound) {
+                continue;
+            }
+            out.push(GapFillVoicedLine {
+                cre_resref: cre.to_ascii_lowercase(),
+                strref: strref as u32,
+                sound_resref: sound.to_ascii_lowercase(),
+                source_text: text,
+                attribution_confidence: conf,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Map lowercase `cre_resref` → lowercase sound resrefs already stored for the project.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HarvestPersistCounts {
     /// Samples inserted across all speakers.
@@ -30,6 +176,118 @@ pub struct HarvestPersistCounts {
     /// Clones reset to `pending` because their speaker was re-harvested (the samples
     /// they were bound to are deleted, so the binding must be re-resolved).
     pub clones_invalidated: usize,
+    /// Newly inserted samples (same as `samples` for additive; equals inserts for replace).
+    pub samples_added: usize,
+    /// Candidates skipped because a sample with that sound resref already existed.
+    pub samples_skipped_existing: usize,
+}
+
+/// Map lowercase `cre_resref` → lowercase sound resrefs already stored for the project.
+pub fn existing_sample_sound_keys(
+    conn: &Connection,
+    project_id: i64,
+) -> Result<HashMap<String, HashSet<String>>, AppError> {
+    let mut out: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT s.cre_resref, rs.source_sound_resref \
+         FROM reference_sample rs \
+         JOIN speaker s ON s.id = rs.speaker_id \
+         WHERE s.project_id = ?1 AND rs.source_sound_resref IS NOT NULL",
+    )?;
+    let rows = stmt.query_map(params![project_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (cre, sound) = row?;
+        out.entry(cre.to_ascii_lowercase())
+            .or_default()
+            .insert(sound.to_ascii_lowercase());
+    }
+    Ok(out)
+}
+
+/// Insert only samples whose `(speaker, source_sound_resref)` is not already present.
+/// Never deletes samples, never resets decisions, never invalidates clones or donors.
+pub fn persist_additive(
+    conn: &mut Connection,
+    project_id: i64,
+    samples: &[HarvestedSample],
+) -> Result<HarvestPersistCounts, AppError> {
+    let tx = conn.transaction()?;
+
+    let mut speaker_ids: HashMap<String, i64> = HashMap::new();
+    {
+        let mut stmt =
+            tx.prepare("SELECT cre_resref, id FROM speaker WHERE project_id = ?1")?;
+        let rows = stmt.query_map(params![project_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (cre, id) = row?;
+            speaker_ids.insert(cre.to_ascii_lowercase(), id);
+        }
+    }
+
+    let mut existing: HashMap<i64, HashSet<String>> = HashMap::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT rs.speaker_id, rs.source_sound_resref \
+             FROM reference_sample rs \
+             JOIN speaker s ON s.id = rs.speaker_id \
+             WHERE s.project_id = ?1 AND rs.source_sound_resref IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![project_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (speaker_id, sound) = row?;
+            existing
+                .entry(speaker_id)
+                .or_default()
+                .insert(sound.to_ascii_lowercase());
+        }
+    }
+
+    let mut counts = HarvestPersistCounts::default();
+    let mut touched: HashSet<i64> = HashSet::new();
+    for sample in samples {
+        let Some(&speaker_id) = speaker_ids.get(&sample.cre_resref.to_ascii_lowercase()) else {
+            counts.unmatched += 1;
+            continue;
+        };
+        let sound_lc = sample.source_sound_resref.to_ascii_lowercase();
+        if existing
+            .get(&speaker_id)
+            .is_some_and(|set| set.contains(&sound_lc))
+        {
+            counts.samples_skipped_existing += 1;
+            continue;
+        }
+
+        let provenance = serde_json::to_string(&sample.provenance)?;
+        let scores = serde_json::to_string(&sample.score)?;
+        tx.execute(
+            "INSERT INTO reference_sample \
+                (speaker_id, source_strref, source_sound_resref, provenance_json, \
+                 scores_json, decision, local_derivative_path) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+            params![
+                speaker_id,
+                sample.source_strref as i64,
+                sample.source_sound_resref,
+                provenance,
+                scores,
+                sample.local_derivative_path,
+            ],
+        )?;
+        existing.entry(speaker_id).or_default().insert(sound_lc);
+        touched.insert(speaker_id);
+        counts.samples += 1;
+        counts.samples_added += 1;
+    }
+    counts.speakers = touched.len();
+    tx.commit()?;
+    Ok(counts)
 }
 
 /// Write `samples` for `project_id` in one transaction, mapping each sample's
@@ -40,6 +298,8 @@ pub struct HarvestPersistCounts {
 /// rewritten sample starts `pending` (a re-harvest resets approvals).
 /// `authoritative` means the batch is a completed full harvest: samples absent
 /// from it are removed too. Partial/cancelled batches clear only touched speakers.
+///
+/// Prefer [`persist_additive`] for the Harvest UI path so approvals/bindings survive.
 pub fn persist(
     conn: &mut Connection,
     project_id: i64,
@@ -278,6 +538,7 @@ pub fn persist(
     }
 
     counts.speakers = touched.len();
+    counts.samples_added = counts.samples;
     tx.commit()?;
     Ok(counts)
 }
@@ -357,6 +618,155 @@ pub struct ResetDecisionsCounts {
     pub samples_reset: usize,
 }
 
+/// Counts from a same-sound decision repair pass (schema v7 / startup).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SameSoundDecisionRepairCounts {
+    /// Sound-groups where pending siblings were filled to match approved/rejected.
+    pub groups_synced: usize,
+    /// Individual `reference_sample` rows flipped from `pending`.
+    pub samples_updated: usize,
+    /// Groups left alone because both approved and rejected siblings were present.
+    pub groups_conflict_skipped: usize,
+}
+
+fn sound_resref_for_repair(
+    column: Option<&str>,
+    provenance_json: &str,
+    sample_id: i64,
+) -> String {
+    if let Some(s) = column.map(str::trim).filter(|s| !s.is_empty()) {
+        return s.to_ascii_lowercase();
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(provenance_json) {
+        if let Some(s) = v
+            .get("source_sound_resref")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return s.to_ascii_lowercase();
+        }
+    }
+    format!("unknown:{sample_id}")
+}
+
+fn scores_are_bindable(scores_json: &str) -> bool {
+    serde_json::from_str::<crate::audio::scoring::SampleScore>(scores_json)
+        .map(|s| s.is_bindable_duration())
+        .unwrap_or(false)
+}
+
+/// One-shot repair: within each display identity group, promote pending siblings of a
+/// shared sound resref to match a unanimous approved or rejected decision.
+///
+/// Does not demote existing decisions. Skips groups that mix approved+rejected.
+/// Skips approving clips that fail the bindable-duration guard (same as `set_decision`).
+pub fn repair_same_sound_sample_decisions(
+    conn: &Connection,
+) -> Result<SameSoundDecisionRepairCounts, AppError> {
+    struct Row {
+        project_id: i64,
+        speaker_id: i64,
+        long_name_strref: Option<i64>,
+        sample_id: i64,
+        decision: String,
+        scores_json: String,
+        source_sound_resref: Option<String>,
+        provenance_json: String,
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT s.project_id, s.id, s.long_name_strref, rs.id, rs.decision, \
+                rs.scores_json, rs.source_sound_resref, rs.provenance_json \
+         FROM reference_sample rs \
+         JOIN speaker s ON s.id = rs.speaker_id",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(Row {
+                project_id: r.get(0)?,
+                speaker_id: r.get(1)?,
+                long_name_strref: r.get(2)?,
+                sample_id: r.get(3)?,
+                decision: r.get(4)?,
+                scores_json: r.get(5)?,
+                source_sound_resref: r.get(6)?,
+                provenance_json: r.get(7)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    // (project_id, identity_key, sound_resref) → sample rows
+    let mut groups: HashMap<(i64, String, String), Vec<(i64, String, String)>> = HashMap::new();
+    for row in &rows {
+        let key = (
+            row.project_id,
+            crate::db::speaker_groups::identity_key(row.long_name_strref, row.speaker_id),
+            sound_resref_for_repair(
+                row.source_sound_resref.as_deref(),
+                &row.provenance_json,
+                row.sample_id,
+            ),
+        );
+        groups.entry(key).or_default().push((
+            row.sample_id,
+            row.decision.clone(),
+            row.scores_json.clone(),
+        ));
+    }
+
+    let mut counts = SameSoundDecisionRepairCounts::default();
+    for members in groups.values() {
+        if members.len() < 2 {
+            continue;
+        }
+        let has_approved = members.iter().any(|(_, d, _)| d == "approved");
+        let has_rejected = members.iter().any(|(_, d, _)| d == "rejected");
+        if has_approved && has_rejected {
+            counts.groups_conflict_skipped += 1;
+            continue;
+        }
+        let target = if has_approved {
+            "approved"
+        } else if has_rejected {
+            "rejected"
+        } else {
+            continue;
+        };
+
+        let mut updated_in_group = 0usize;
+        for (sample_id, decision, scores_json) in members {
+            if decision != "pending" {
+                continue;
+            }
+            if target == "approved" && !scores_are_bindable(scores_json) {
+                continue;
+            }
+            let n = conn.execute(
+                "UPDATE reference_sample SET decision = ?2 WHERE id = ?1 AND decision = 'pending'",
+                params![sample_id, target],
+            )?;
+            if n > 0 {
+                updated_in_group += 1;
+                counts.samples_updated += 1;
+            }
+        }
+        if updated_in_group > 0 {
+            counts.groups_synced += 1;
+        }
+    }
+
+    if counts.samples_updated > 0 || counts.groups_conflict_skipped > 0 {
+        log::info!(
+            "same-sound decision repair: synced {} group(s), updated {} sample(s), skipped {} conflict(s)",
+            counts.groups_synced,
+            counts.samples_updated,
+            counts.groups_conflict_skipped
+        );
+    }
+    Ok(counts)
+}
+
 /// Reset every non-pending audition `decision` back to `pending` for `project_id`,
 /// optionally narrowed to the identity group containing `only_speaker`.
 pub fn reset_decisions(
@@ -409,13 +819,16 @@ pub struct AutoApproveCounts {
 /// `only_speaker`.
 ///
 /// Named NPCs with multiple CRE variants share one approval: the best clip across
-/// ALL variants wins; every other sample in the group is reset to `pending`. This
-/// ALWAYS overwrites prior decisions. Clips too short to bind, or with zero speech /
-/// text richness, are excluded from ranking; zero-speech clips are auto-rejected.
+/// ALL variants wins; every other sample in the group is reset to `pending`.
+/// When `only_unapproved` is false this ALWAYS overwrites prior decisions. When
+/// true, groups that already have any approved sample are left untouched.
+/// Clips too short to bind, or with zero speech / text richness, are excluded from
+/// ranking; zero-speech clips are auto-rejected.
 pub fn auto_approve_best(
     conn: &mut Connection,
     project_id: i64,
     only_speaker: Option<i64>,
+    only_unapproved: bool,
 ) -> Result<AutoApproveCounts, AppError> {
     let tx = conn.transaction()?;
 
@@ -447,17 +860,24 @@ pub fn auto_approve_best(
 
     struct Group {
         best: Option<(f64, i64)>, // (overall, sample_id)
+        has_approved: bool,
     }
     let mut groups: HashMap<String, Group> = HashMap::new();
     let mut reject_ids: Vec<i64> = Vec::new();
-    for (speaker_id, sample_id, _decision, scores_json, _strref, provenance_json) in &rows {
+    for (speaker_id, sample_id, decision, scores_json, _strref, provenance_json) in &rows {
         if let Some(ref scope) = scope_ids {
             if !scope.contains(speaker_id) {
                 continue;
             }
         }
         let group_key = crate::db::speaker_groups::identity_key_for_speaker(&tx, *speaker_id)?;
-        let g = groups.entry(group_key).or_insert(Group { best: None });
+        let g = groups.entry(group_key).or_insert(Group {
+            best: None,
+            has_approved: false,
+        });
+        if decision == "approved" {
+            g.has_approved = true;
+        }
         let automatic = crate::voices::harvest::provenance_is_automatic(provenance_json);
         if !automatic {
             continue;
@@ -487,6 +907,10 @@ pub fn auto_approve_best(
 
     let mut counts = AutoApproveCounts::default();
     for (group_key, g) in &groups {
+        if only_unapproved && g.has_approved {
+            counts.speakers_skipped += 1;
+            continue;
+        }
         let Some((_, winner_id)) = g.best else {
             counts.speakers_skipped += 1;
             continue;
@@ -748,6 +1172,199 @@ mod tests {
     }
 
     #[test]
+    fn persist_additive_keeps_existing_samples_decisions_and_clones() {
+        let mut conn = mem_db();
+        let pid = project(&conn);
+        let sid = speaker(&conn, pid, "xzar");
+        persist(&mut conn, pid, &[sample("xzar", "xzar01")], true, false).unwrap();
+        let old_id: i64 = conn
+            .query_row("SELECT id FROM reference_sample", [], |r| r.get(0))
+            .unwrap();
+        assert!(set_decision(&conn, old_id, "approved").unwrap());
+        conn.execute(
+            "INSERT INTO clone (speaker_id, primary_sample_id, binding_source, status) \
+             VALUES (?1, ?2, 'default', 'ready')",
+            params![sid, old_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO metadata_binding (project_id, sex, race, creature_category) \
+             VALUES (?1, 1, 1, 1)",
+            params![pid],
+        )
+        .unwrap();
+        let binding_id: i64 = conn
+            .query_row("SELECT id FROM metadata_binding WHERE project_id=?1", [pid], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO metadata_binding_donor (binding_id, donor_speaker_id, sort_order) \
+             VALUES (?1, ?2, 0)",
+            params![binding_id, sid],
+        )
+        .unwrap();
+
+        let counts = persist_additive(
+            &mut conn,
+            pid,
+            &[sample("xzar", "xzar01"), sample("xzar", "xzar02")],
+        )
+        .unwrap();
+        assert_eq!(counts.samples_added, 1);
+        assert_eq!(counts.samples_skipped_existing, 1);
+        assert_eq!(counts.clones_invalidated, 0);
+        assert_eq!(counts.decisions_preserved, 0);
+
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM reference_sample", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+        let decision: String = conn
+            .query_row(
+                "SELECT decision FROM reference_sample WHERE source_sound_resref='xzar01'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(decision, "approved");
+        let (status, primary): (String, i64) = conn
+            .query_row(
+                "SELECT status, primary_sample_id FROM clone WHERE speaker_id=?1",
+                params![sid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "ready");
+        assert_eq!(primary, old_id);
+        let donors: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM metadata_binding_donor WHERE binding_id=?1",
+                [binding_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(donors, 1);
+    }
+
+    #[test]
+    fn gap_fill_eligible_requires_ready_and_few_automatic_samples() {
+        let mut conn = mem_db();
+        let pid = project(&conn);
+        let thin = speaker_with_strref(&conn, pid, "thin", Some(100));
+        let rich = speaker_with_strref(&conn, pid, "rich", Some(200));
+        let noready = speaker(&conn, pid, "noready");
+        conn.execute(
+            "INSERT INTO line(project_id,strref,text,speaker_id,status,kind) \
+             VALUES(?1,1,'Ready line for thin.',?2,'ready','state')",
+            params![pid, thin],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO line(project_id,strref,text,speaker_id,status,kind) \
+             VALUES(?1,2,'Ready line for rich.',?2,'ready','state')",
+            params![pid, rich],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO line(project_id,strref,text,speaker_id,status,kind) \
+             VALUES(?1,3,'Blocked only.',?2,'blocked','state')",
+            params![pid, noready],
+        )
+        .unwrap();
+        persist(
+            &mut conn,
+            pid,
+            &[
+                sample("rich", "rich01"),
+                sample("rich", "rich02"),
+                sample("rich", "rich03"),
+            ],
+            true,
+            false,
+        )
+        .unwrap();
+
+        let eligible = gap_fill_eligible_speakers(&conn, pid).unwrap();
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible[0].cre_resref, "thin");
+        assert_eq!(eligible[0].speaker_id, thin);
+        assert_eq!(eligible[0].automatic_count, 0);
+        assert_eq!(eligible[0].identity_key, "100");
+    }
+
+    #[test]
+    fn gap_fill_voiced_lines_filters_confidence_defer_and_pack_resrefs() {
+        let conn = mem_db();
+        let pid = project(&conn);
+        let sid = speaker(&conn, pid, "npc");
+        conn.execute(
+            "INSERT INTO shared_strref_group(id,strref,resolution) VALUES(1,99,'defer_diff_voice')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO shared_strref_group(id,strref,resolution) VALUES(2,98,'reuse_same_voice')",
+            [],
+        )
+        .unwrap();
+        // Unique official VO
+        conn.execute(
+            "INSERT INTO line(project_id,strref,dlg_resref,state_index,text,speaker_id,status,kind,\
+             is_voiced,existing_sound_resref,attribution_confidence) \
+             VALUES(?1,10,'dlg',0,'A rich official dialogue line for cloning.',?2,'blocked','state',\
+             1,'npcv01',1.0)",
+            params![pid, sid],
+        )
+        .unwrap();
+        // Low confidence
+        conn.execute(
+            "INSERT INTO line(project_id,strref,dlg_resref,state_index,text,speaker_id,status,kind,\
+             is_voiced,existing_sound_resref,attribution_confidence) \
+             VALUES(?1,11,'dlg',1,'Shared dlg representative line for cloning.',?2,'blocked','state',\
+             1,'npcv02',0.2)",
+            params![pid, sid],
+        )
+        .unwrap();
+        // Deferred group
+        conn.execute(
+            "INSERT INTO line(project_id,strref,dlg_resref,state_index,text,speaker_id,status,kind,\
+             is_voiced,existing_sound_resref,attribution_confidence,shared_group_id) \
+             VALUES(?1,12,'dlg',2,'Deferred multi speaker line for cloning.',?2,'blocked','state',\
+             1,'npcv03',1.0,1)",
+            params![pid, sid],
+        )
+        .unwrap();
+        // Pack Z* resref
+        conn.execute(
+            "INSERT INTO line(project_id,strref,dlg_resref,state_index,text,speaker_id,status,kind,\
+             is_voiced,existing_sound_resref,attribution_confidence) \
+             VALUES(?1,13,'dlg',3,'Pack generated voice line for cloning.',?2,'ready','state',\
+             1,'Z0000A00',1.0)",
+            params![pid, sid],
+        )
+        .unwrap();
+        // reuse_same_voice allowed
+        conn.execute(
+            "INSERT INTO line(project_id,strref,dlg_resref,state_index,text,speaker_id,status,kind,\
+             is_voiced,existing_sound_resref,attribution_confidence,shared_group_id) \
+             VALUES(?1,14,'dlg',4,'Reuse same voice shared line for cloning.',?2,'blocked','state',\
+             1,'npcv04',1.0,2)",
+            params![pid, sid],
+        )
+        .unwrap();
+
+        let lines = gap_fill_voiced_lines(&conn, pid, &[sid]).unwrap();
+        let sounds: HashSet<_> = lines.iter().map(|l| l.sound_resref.as_str()).collect();
+        assert!(sounds.contains("npcv01"));
+        assert!(sounds.contains("npcv04"));
+        assert!(!sounds.contains("npcv02"));
+        assert!(!sounds.contains("npcv03"));
+        assert!(!sounds.iter().any(|s| s.starts_with('z') || s.starts_with('Z')));
+        assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
     fn reharvest_preserves_decisions_when_requested() {
         let mut conn = mem_db();
         let pid = project(&conn);
@@ -969,13 +1586,13 @@ mod tests {
         let v1_low = sample_with_overall(&conn, v1, "j1a", 0.6);
         let v2_high = sample_with_overall(&conn, v2, "j14a", 0.95);
 
-        let counts = auto_approve_best(&mut conn, pid, None).unwrap();
+        let counts = auto_approve_best(&mut conn, pid, None, false).unwrap();
         assert_eq!(counts.speakers_considered, 2);
         assert_eq!(counts.samples_approved, 2);
         assert_eq!(decision_of(&conn, v2_high), "approved");
         assert_eq!(decision_of(&conn, v1_low), "approved");
 
-        let counts_one = auto_approve_best(&mut conn, pid, Some(v1)).unwrap();
+        let counts_one = auto_approve_best(&mut conn, pid, Some(v1), false).unwrap();
         assert_eq!(counts_one.speakers_considered, 1);
         assert_eq!(counts_one.samples_approved, 1);
     }
@@ -990,7 +1607,7 @@ mod tests {
             "UPDATE reference_sample SET provenance_json='{\"eligibility\":\"manual_only\"}' WHERE id=?1",
             params![sample],
         ).unwrap();
-        let counts = auto_approve_best(&mut conn, pid, None).unwrap();
+        let counts = auto_approve_best(&mut conn, pid, None, false).unwrap();
         assert_eq!(counts.samples_approved, 0);
         assert_eq!(decision_of(&conn, sample), "pending");
     }
@@ -1092,7 +1709,7 @@ mod tests {
         let b_low = sample_with_overall(&conn, sb, "b02", 0.5);
         assert!(set_decision(&conn, b_low, "approved").unwrap());
 
-        let counts = auto_approve_best(&mut conn, pid, None).unwrap();
+        let counts = auto_approve_best(&mut conn, pid, None, false).unwrap();
         assert_eq!(counts.speakers_considered, 2);
         assert_eq!(counts.speakers_skipped, 0);
         assert_eq!(counts.samples_approved, 2);
@@ -1115,7 +1732,7 @@ mod tests {
         let short_top = sample_with_overall_dur(&conn, sid, "s01", 0.95, 0.3);
         let bindable = sample_with_overall_dur(&conn, sid, "s02", 0.7, 2.0);
 
-        let counts = auto_approve_best(&mut conn, pid, None).unwrap();
+        let counts = auto_approve_best(&mut conn, pid, None, false).unwrap();
         assert_eq!(counts.speakers_considered, 1);
         assert_eq!(counts.samples_approved, 1);
         assert_eq!(decision_of(&conn, short_top), "pending");
@@ -1133,7 +1750,7 @@ mod tests {
         let a = sample_with_overall_dur(&conn, sid, "a01", 0.9, 0.2);
         let b = sample_with_overall_dur(&conn, sid, "a02", 0.8, 0.4);
 
-        let counts = auto_approve_best(&mut conn, pid, None).unwrap();
+        let counts = auto_approve_best(&mut conn, pid, None, false).unwrap();
         assert_eq!(counts.speakers_considered, 0);
         assert_eq!(counts.speakers_skipped, 1);
         assert_eq!(counts.samples_approved, 0);
@@ -1152,7 +1769,7 @@ mod tests {
         let scream = sample_with_overall_dur_speech(&conn, sid, "s01", 0.9, 2.0, 0.0);
         let speech = sample_with_overall_dur_speech(&conn, sid, "s02", 0.7, 2.0, 1.0);
 
-        let counts = auto_approve_best(&mut conn, pid, None).unwrap();
+        let counts = auto_approve_best(&mut conn, pid, None, false).unwrap();
         assert_eq!(counts.speakers_considered, 1);
         assert_eq!(counts.samples_approved, 1);
         assert_eq!(counts.samples_rejected, 1);
@@ -1171,7 +1788,7 @@ mod tests {
         let a = sample_with_overall_dur_speech(&conn, sid, "g01", 0.9, 2.0, 0.0);
         let b = sample_with_overall_dur_speech(&conn, sid, "g02", 0.8, 2.0, 0.0);
 
-        let counts = auto_approve_best(&mut conn, pid, None).unwrap();
+        let counts = auto_approve_best(&mut conn, pid, None, false).unwrap();
         assert_eq!(counts.speakers_considered, 0);
         assert_eq!(counts.speakers_skipped, 1);
         assert_eq!(counts.samples_approved, 0);
@@ -1226,7 +1843,7 @@ mod tests {
         let first = sample_with_overall(&conn, sid, "t01", 0.8);
         let _second = sample_with_overall(&conn, sid, "t02", 0.8);
 
-        auto_approve_best(&mut conn, pid, None).unwrap();
+        auto_approve_best(&mut conn, pid, None, false).unwrap();
         assert_eq!(decision_of(&conn, first), "approved");
     }
 
@@ -1239,12 +1856,32 @@ mod tests {
         let a1 = sample_with_overall(&conn, sa, "a01", 0.7);
         let b1 = sample_with_overall(&conn, sb, "b01", 0.7);
 
-        let counts = auto_approve_best(&mut conn, pid, Some(sa)).unwrap();
+        let counts = auto_approve_best(&mut conn, pid, Some(sa), false).unwrap();
         assert_eq!(counts.speakers_considered, 1);
         assert_eq!(counts.samples_approved, 1);
         assert_eq!(decision_of(&conn, a1), "approved");
         // The other speaker was outside the target scope.
         assert_eq!(decision_of(&conn, b1), "pending");
+    }
+
+    #[test]
+    fn auto_approve_only_unapproved_preserves_existing_approvals() {
+        let mut conn = mem_db();
+        let pid = project(&conn);
+        let kept = speaker(&conn, pid, "xzar");
+        let gap = speaker(&conn, pid, "imoen");
+        let kept_low = sample_with_overall(&conn, kept, "k01", 0.4);
+        let kept_high = sample_with_overall(&conn, kept, "k02", 0.95);
+        let gap_clip = sample_with_overall(&conn, gap, "g01", 0.8);
+        set_decision(&conn, kept_low, "approved").unwrap();
+
+        let counts = auto_approve_best(&mut conn, pid, None, true).unwrap();
+        assert_eq!(counts.speakers_considered, 1);
+        assert_eq!(counts.samples_approved, 1);
+        assert_eq!(counts.speakers_skipped, 1);
+        assert_eq!(decision_of(&conn, kept_low), "approved");
+        assert_eq!(decision_of(&conn, kept_high), "pending");
+        assert_eq!(decision_of(&conn, gap_clip), "approved");
     }
 
     #[test]
@@ -1351,5 +1988,88 @@ mod tests {
             )
             .unwrap();
         assert_eq!(generation, ("pending".into(), "old.ogg".into(), None));
+    }
+
+    #[test]
+    fn repair_approves_pending_siblings_of_same_sound() {
+        let conn = mem_db();
+        let pid = project(&conn);
+        let v1 = speaker_with_strref(&conn, pid, "aerie7", Some(42));
+        let v2 = speaker_with_strref(&conn, pid, "aerie9", Some(42));
+        let approved = sample_with_overall(&conn, v1, "aerie35", 0.8);
+        let pending = sample_with_overall(&conn, v2, "aerie35", 0.8);
+        set_decision(&conn, approved, "approved").unwrap();
+
+        let counts = repair_same_sound_sample_decisions(&conn).unwrap();
+        assert_eq!(counts.groups_synced, 1);
+        assert_eq!(counts.samples_updated, 1);
+        assert_eq!(decision_of(&conn, pending), "approved");
+
+        let again = repair_same_sound_sample_decisions(&conn).unwrap();
+        assert_eq!(again.samples_updated, 0);
+    }
+
+    #[test]
+    fn repair_rejects_pending_siblings_of_same_sound() {
+        let conn = mem_db();
+        let pid = project(&conn);
+        let v1 = speaker_with_strref(&conn, pid, "aerie7", Some(42));
+        let v2 = speaker_with_strref(&conn, pid, "aerie9", Some(42));
+        let rejected = sample_with_overall(&conn, v1, "aerie35", 0.8);
+        let pending = sample_with_overall(&conn, v2, "aerie35", 0.8);
+        set_decision(&conn, rejected, "rejected").unwrap();
+
+        let counts = repair_same_sound_sample_decisions(&conn).unwrap();
+        assert_eq!(counts.groups_synced, 1);
+        assert_eq!(decision_of(&conn, pending), "rejected");
+    }
+
+    #[test]
+    fn repair_skips_approve_reject_conflicts() {
+        let conn = mem_db();
+        let pid = project(&conn);
+        let v1 = speaker_with_strref(&conn, pid, "aerie7", Some(42));
+        let v2 = speaker_with_strref(&conn, pid, "aerie9", Some(42));
+        let v3 = speaker_with_strref(&conn, pid, "aerie12", Some(42));
+        let approved = sample_with_overall(&conn, v1, "aerie35", 0.8);
+        let rejected = sample_with_overall(&conn, v2, "aerie35", 0.8);
+        let pending = sample_with_overall(&conn, v3, "aerie35", 0.8);
+        set_decision(&conn, approved, "approved").unwrap();
+        set_decision(&conn, rejected, "rejected").unwrap();
+
+        let counts = repair_same_sound_sample_decisions(&conn).unwrap();
+        assert_eq!(counts.groups_conflict_skipped, 1);
+        assert_eq!(counts.samples_updated, 0);
+        assert_eq!(decision_of(&conn, pending), "pending");
+    }
+
+    #[test]
+    fn repair_skips_too_short_when_approving() {
+        let conn = mem_db();
+        let pid = project(&conn);
+        let v1 = speaker_with_strref(&conn, pid, "aerie7", Some(42));
+        let v2 = speaker_with_strref(&conn, pid, "aerie9", Some(42));
+        let approved = sample_with_overall(&conn, v1, "aerie35", 0.8);
+        let short = sample_with_overall_dur(&conn, v2, "aerie35", 0.8, 0.1);
+        set_decision(&conn, approved, "approved").unwrap();
+
+        let counts = repair_same_sound_sample_decisions(&conn).unwrap();
+        assert_eq!(counts.samples_updated, 0);
+        assert_eq!(decision_of(&conn, short), "pending");
+    }
+
+    #[test]
+    fn repair_does_not_cross_different_display_identities() {
+        let conn = mem_db();
+        let pid = project(&conn);
+        let aerie = speaker_with_strref(&conn, pid, "aerie", Some(42));
+        let other = speaker_with_strref(&conn, pid, "imoen", Some(99));
+        let approved = sample_with_overall(&conn, aerie, "shared01", 0.8);
+        let pending = sample_with_overall(&conn, other, "shared01", 0.8);
+        set_decision(&conn, approved, "approved").unwrap();
+
+        let counts = repair_same_sound_sample_decisions(&conn).unwrap();
+        assert_eq!(counts.samples_updated, 0);
+        assert_eq!(decision_of(&conn, pending), "pending");
     }
 }

@@ -31,7 +31,8 @@ use crate::error::AppError;
 
 use attribution::{AttributedLine, AttributedSpeaker, CreDialog, SharedStrrefGroup, StrrefFacts};
 use companion::{
-    interdia_banter_dlg_resrefs, CompanionScanStats, scan_companion_side_dlgs, scan_interdia,
+    companion_voiced_sources, interdia_banter_dlg_resrefs, pdialog_dlg_resrefs, CompanionScanStats,
+    scan_companion_side_dlgs, scan_interdia, scan_pdialog,
 };
 use resource::GameResources;
 use tlk::Tlk;
@@ -56,9 +57,10 @@ pub struct VoicedSource {
 }
 
 /// Per-speaker voiced sources for reference harvesting: clips the CRE speaks
-/// through the DLG it UNIQUELY owns (`dialogue`), and voiced entries in its
-/// SNDSLOT.IDS soundset (`slots`). Ambiguous (shared-DLG) speakers are omitted so
-/// a shared clip is never mistaken for one NPC's voice.
+/// through the DLG it UNIQUELY owns (`dialogue`), companion banter/post/join/side
+/// DLGs (`companion`), and voiced entries in its SNDSLOT.IDS soundset (`slots`).
+/// Ambiguous (shared-DLG) speakers omit main-dialogue clips so a shared clip is
+/// never mistaken for one NPC's voice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpeakerSources {
     pub cre_resref: String,
@@ -66,6 +68,8 @@ pub struct SpeakerSources {
     /// variants share their TLK long-name strref; unnamed CREs remain separate.
     pub identity_key: String,
     pub dialogue: Vec<VoicedSource>,
+    /// Voiced states from companion interdia / pdialog / side-chain DLGs.
+    pub companion: Vec<VoicedSource>,
     pub slots: Vec<VoicedSource>,
     /// Source occurrences rejected because one sound resref advertised multiple
     /// distinct non-empty transcripts in the active TLK.
@@ -149,7 +153,8 @@ pub fn harvest_sources(
         tlk.entry(strref).ok().map(|e| e.text).unwrap_or_default()
     };
 
-    let mut out = Vec::new();
+    let mut out: std::collections::BTreeMap<String, SpeakerSources> =
+        std::collections::BTreeMap::new();
     for (cre_resref, creature, dialogue) in &cres {
         let dlg_lc = creature
             .dialog_resref
@@ -201,19 +206,44 @@ pub fn harvest_sources(
             || !slot_sources.is_empty()
             || unsafe_metadata_skipped > 0
         {
-            out.push(SpeakerSources {
-                cre_resref: cre_resref.clone(),
-                identity_key: creature
-                    .long_name_strref
-                    .map(|strref| strref.to_string())
-                    .unwrap_or_else(|| format!("ungrouped:{cre_resref}")),
-                dialogue: dialogue_sources,
-                slots: slot_sources,
-                unsafe_metadata_skipped,
-            });
+            out.insert(
+                cre_resref.clone(),
+                SpeakerSources {
+                    cre_resref: cre_resref.clone(),
+                    identity_key: creature
+                        .long_name_strref
+                        .map(|strref| strref.to_string())
+                        .unwrap_or_else(|| format!("ungrouped:{cre_resref}")),
+                    dialogue: dialogue_sources,
+                    companion: Vec::new(),
+                    slots: slot_sources,
+                    unsafe_metadata_skipped,
+                },
+            );
         }
     }
-    Ok(out)
+
+    for companion in companion_voiced_sources(&res, &tlk, &conflicting_sounds)? {
+        let entry = out
+            .entry(companion.cre_resref.clone())
+            .or_insert_with(|| SpeakerSources {
+                cre_resref: companion.cre_resref.clone(),
+                identity_key: companion.identity_key.clone(),
+                dialogue: Vec::new(),
+                companion: Vec::new(),
+                slots: Vec::new(),
+                unsafe_metadata_skipped: 0,
+            });
+        entry.companion = companion.sources;
+        entry.unsafe_metadata_skipped += companion.unsafe_metadata_skipped;
+        if entry.identity_key.starts_with("ungrouped:")
+            && !companion.identity_key.starts_with("ungrouped:")
+        {
+            entry.identity_key = companion.identity_key;
+        }
+    }
+
+    Ok(out.into_values().collect())
 }
 
 #[cfg(test)]
@@ -330,6 +360,16 @@ pub fn scan_attribution(
     }
     lines.extend(companion_lines);
 
+    let (pdialog_lines, pdialog_speakers, pdialog_stats) =
+        scan_pdialog(&res, &tlk, token_reps, &existing_keys)?;
+    for l in &pdialog_lines {
+        existing_keys.insert((l.strref, l.dlg_resref.clone(), l.state_index));
+    }
+    lines.extend(pdialog_lines);
+    companion_stats.side_dlgs_scanned += pdialog_stats.side_dlgs_scanned;
+    companion_stats.side_lines_added += pdialog_stats.side_lines_added;
+    companion_stats.rows_unmapped += pdialog_stats.rows_unmapped;
+
     let main_dlgs: std::collections::HashSet<String> = owned
         .iter()
         .filter_map(|(_, c, _)| {
@@ -340,25 +380,28 @@ pub fn scan_attribution(
         .collect();
     let mut excluded_dlgs = main_dlgs;
     excluded_dlgs.extend(interdia_banter_dlg_resrefs(&res)?);
+    excluded_dlgs.extend(pdialog_dlg_resrefs(&res)?);
 
     let (side_lines, side_speakers, side_stats) =
         scan_companion_side_dlgs(&res, &tlk, token_reps, &existing_keys, &excluded_dlgs)?;
     lines.extend(side_lines);
-    companion_stats.side_dlgs_scanned = side_stats.side_dlgs_scanned;
-    companion_stats.side_lines_added = side_stats.side_lines_added;
+    companion_stats.side_dlgs_scanned += side_stats.side_dlgs_scanned;
+    companion_stats.side_lines_added += side_stats.side_lines_added;
 
-    // INTERDIA/death-variable resolution is stronger identity evidence than a
+    // INTERDIA/pdialog death-variable resolution is stronger identity evidence than a
     // shared display-name strref. Mark every CRE carrying a resolved companion's
     // long name so binding can safely share one voice across transformations and
     // level variants without doing the same for generic same-name NPCs.
     let companion_identity_strrefs: std::collections::HashSet<u32> = companion_speakers
         .iter()
+        .chain(pdialog_speakers.iter())
         .chain(side_speakers.iter())
         .filter_map(|speaker| speaker.long_name_strref)
         .collect();
 
     for cs in companion_speakers
         .into_iter()
+        .chain(pdialog_speakers)
         .chain(side_speakers)
     {
         if !speakers.iter().any(|s| s.cre_resref == cs.cre_resref) {
@@ -596,14 +639,47 @@ mod real_install {
         );
         assert_ne!(line.token_mask, 0, "Harper line should record its resolved token");
         assert!(
-            line.provenance_json.contains("companion_side_dlg"),
-            "side-chain provenance expected: {}",
+            line.provenance_json.contains("companion_side_dlg")
+                || line.provenance_json.contains("companion_pdialog"),
+            "side-chain or pdialog provenance expected: {}",
             line.provenance_json
         );
 
         assert!(
             scan.companion.side_dlgs_scanned > 0 || scan.companion.side_lines_added > 0,
             "side-DLG scan stats should be non-zero on a full install"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a real BG2EE install"]
+    fn pdialog_scan_covers_yoshimo_hexxat_wilson_party_files() {
+        let dir = game_dir();
+        let reps = token_resolve::TokenReplacements::default();
+        let scan = scan_attribution(&dir, None, &reps, |_, _| {}, || false).unwrap();
+
+        for need in ["yoshp", "yoshj", "hexxatp", "hexxatj", "wilsonp"] {
+            let n = scan
+                .lines
+                .iter()
+                .filter(|line| line.dlg_resref == *need)
+                .count();
+            assert!(n > 0, "{need}.dlg missing from attribution scan");
+        }
+        assert!(
+            scan.lines.iter().any(|line| line.strref == 22_272),
+            "Yoshimo wait-here strref 22272 missing from yoshp"
+        );
+        let yoshp = scan
+            .lines
+            .iter()
+            .find(|line| line.strref == 22_272)
+            .unwrap();
+        assert_eq!(yoshp.dlg_resref, "yoshp");
+        assert!(
+            yoshp.provenance_json.contains("companion_pdialog"),
+            "expected pdialog provenance: {}",
+            yoshp.provenance_json
         );
     }
 }

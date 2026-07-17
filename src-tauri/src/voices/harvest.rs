@@ -10,6 +10,7 @@
 //! leave this module. Original game bytes are streamed to ffmpeg and never written
 //! to disk or returned (see `00-context.md`).
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,7 +18,7 @@ use std::thread;
 
 use serde::{Deserialize, Serialize};
 
-use crate::audio::candidates::{self, CandidateEligibility, CandidateOrigin, SlotSound, VoicedLine};
+use crate::audio::candidates::{self, CandidateEligibility, SlotSound, VoicedLine};
 use crate::audio::ffmpeg;
 use crate::audio::scoring::{self, SampleScore};
 use crate::error::AppError;
@@ -34,7 +35,7 @@ pub const KEY_HARVEST_PARALLELISM: &str = "harvest_parallelism";
 /// Provenance recorded for a harvested sample (persisted as `provenance_json`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SampleProvenance {
-    /// Discovery-path token (`dialogue_state` / `sound_slot`).
+    /// Discovery-path token (`dialogue_state` / `attribution_voiced` / `companion_dialogue` / `sound_slot`).
     pub origin: String,
     /// The speaker CRE this clip was harvested for.
     pub cre_resref: String,
@@ -83,11 +84,25 @@ pub struct HarvestReport {
     pub decode_failures: usize,
     /// Raw voiced sources skipped (TLK text gate + sound-slot fallback policy).
     pub candidates_skipped: usize,
+    /// Candidates not decoded because a sample with that sound resref already exists.
+    pub candidates_already_present: usize,
+    /// Attribution gap-fill candidates selected for decode.
+    pub gap_fill_candidates: usize,
+    /// Samples whose provenance origin is `attribution_voiced`.
+    pub gap_fill_samples: usize,
     pub automatic_samples: usize,
     pub manual_only_samples: usize,
     pub conflicting_aliases_skipped: usize,
     /// True when no usable ffmpeg was found, so decode/scoring was skipped.
     pub ffmpeg_missing: bool,
+}
+
+/// Per-speaker Attribution gap-fill input (built by the command from SQLite rows).
+#[derive(Debug, Clone)]
+pub struct GapFillSpeakerInput {
+    pub cre_resref: String,
+    pub identity_key: String,
+    pub lines: Vec<VoicedLine>,
 }
 
 /// A running snapshot handed to the caller's `on_progress` callback once per
@@ -140,17 +155,22 @@ pub fn resolve_harvest_parallelism(setting: Option<&str>) -> usize {
 /// decoding derivatives into `workspace`. `ffmpeg` is the resolved binary (from
 /// [`ffmpeg::resolve_ffmpeg`]); `None` means skip decode and report it.
 ///
-/// `parallelism` is the number of concurrent decode workers (from
-/// [`resolve_harvest_parallelism`]). `on_progress` is called once per completed
-/// candidate with the running counters (the command layer throttles + emits it).
-/// `should_cancel` is polled before each new job; when it returns true workers
-/// stop claiming work and return the PARTIAL samples + report gathered so far.
+/// `existing_sample_keys` maps lowercase `cre_resref` → lowercase sound resrefs
+/// already persisted for that speaker; matching candidates are skipped (additive
+/// re-harvest). `gap_fill` adds Attribution-voiced candidates for thin speakers
+/// (Ready lines, few automatic samples). `parallelism` is the number of concurrent
+/// decode workers (from [`resolve_harvest_parallelism`]). `on_progress` is called
+/// once per completed candidate with the running counters. `should_cancel` is polled
+/// before each new job; when it returns true workers stop claiming work and return
+/// the PARTIAL samples + report gathered so far.
 pub fn harvest(
     game_dir: &Path,
     locale: Option<&str>,
     ffmpeg_bin: Option<&Path>,
     workspace: &Path,
     parallelism: usize,
+    existing_sample_keys: &HashMap<String, HashSet<String>>,
+    gap_fill: &[GapFillSpeakerInput],
     on_progress: impl Fn(HarvestProgress) + Send + Sync + 'static,
     should_cancel: impl Fn() -> bool + Send + Sync + 'static,
 ) -> Result<(Vec<HarvestedSample>, HarvestReport), AppError> {
@@ -166,8 +186,15 @@ pub fn harvest(
     };
 
     report.conflicting_aliases_skipped = sources.iter().map(|s| s.unsafe_metadata_skipped).sum();
-    let (jobs, skipped) = build_jobs(&sources);
+    let (mut jobs, skipped, already_present) = build_jobs(&sources, existing_sample_keys);
     report.candidates_skipped = skipped;
+    report.candidates_already_present = already_present;
+
+    let (gap_jobs, gap_candidates, gap_already) =
+        build_gap_fill_jobs(gap_fill, existing_sample_keys, &jobs);
+    report.gap_fill_candidates = gap_candidates;
+    report.candidates_already_present += gap_already;
+    jobs.extend(gap_jobs);
 
     if jobs.is_empty() || should_cancel() {
         return Ok((Vec::new(), report));
@@ -192,13 +219,20 @@ pub fn harvest(
     report.samples_harvested = harvested;
     report.decode_failures = failures;
     report.candidates_skipped += policy_skipped;
+    report.gap_fill_samples = samples
+        .iter()
+        .filter(|s| s.provenance.origin == "attribution_voiced")
+        .count();
     report.automatic_samples = samples.iter().filter(|s| s.provenance.eligibility == "automatic").count();
     report.manual_only_samples = samples.len().saturating_sub(report.automatic_samples);
     Ok((samples, report))
 }
 
 /// Flatten per-speaker candidate selection into independent decode jobs.
-fn build_jobs(sources: &[extractor::SpeakerSources]) -> (Vec<HarvestJob>, usize) {
+fn build_jobs(
+    sources: &[extractor::SpeakerSources],
+    existing_sample_keys: &HashMap<String, HashSet<String>>,
+) -> (Vec<HarvestJob>, usize, usize) {
     struct SelectedSpeaker {
         cre_resref: String,
         identity_key: String,
@@ -219,6 +253,16 @@ fn build_jobs(sources: &[extractor::SpeakerSources]) -> (Vec<HarvestJob>, usize)
                 attribution_confidence: 1.0,
             })
             .collect();
+        let companion: Vec<VoicedLine> = speaker
+            .companion
+            .iter()
+            .map(|v| VoicedLine {
+                strref: v.strref,
+                sound_resref: v.sound_resref.clone(),
+                source_text: v.source_text.clone(),
+                attribution_confidence: 1.0,
+            })
+            .collect();
         let slots: Vec<SlotSound> = speaker
             .slots
             .iter()
@@ -229,8 +273,8 @@ fn build_jobs(sources: &[extractor::SpeakerSources]) -> (Vec<HarvestJob>, usize)
             })
             .collect();
 
-        let raw_count = voiced.len() + slots.len();
-        let selected = candidates::select(&voiced, &slots);
+        let raw_count = voiced.len() + companion.len() + slots.len();
+        let selected = candidates::select(&voiced, &companion, &slots);
         skipped += raw_count.saturating_sub(selected.len());
         selected_speakers.push(SelectedSpeaker {
             cre_resref: speaker.cre_resref.clone(),
@@ -255,8 +299,15 @@ fn build_jobs(sources: &[extractor::SpeakerSources]) -> (Vec<HarvestJob>, usize)
     }
 
     let mut jobs = Vec::new();
+    let mut already_present = 0usize;
     for speaker in selected_speakers {
+        let cre_lc = speaker.cre_resref.to_ascii_lowercase();
+        let existing = existing_sample_keys.get(&cre_lc);
         for mut cand in speaker.candidates {
+            if existing.is_some_and(|set| set.contains(&cand.sound_resref)) {
+                already_present += 1;
+                continue;
+            }
             cand.shared_source_count = identities_by_sound.get(&cand.sound_resref).map_or(1, |ids| ids.len());
             if cand.shared_source_count > 1 {
                 cand.eligibility = CandidateEligibility::ManualOnly;
@@ -267,7 +318,73 @@ fn build_jobs(sources: &[extractor::SpeakerSources]) -> (Vec<HarvestJob>, usize)
             });
         }
     }
-    (jobs, skipped)
+    (jobs, skipped, already_present)
+}
+
+/// Build Attribution gap-fill decode jobs, skipping sounds already in live jobs or DB.
+fn build_gap_fill_jobs(
+    gap_fill: &[GapFillSpeakerInput],
+    existing_sample_keys: &HashMap<String, HashSet<String>>,
+    live_jobs: &[HarvestJob],
+) -> (Vec<HarvestJob>, usize, usize) {
+    let mut live_sounds_by_cre: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut identities_by_sound: HashMap<String, HashSet<String>> = HashMap::new();
+    for job in live_jobs {
+        let cre_lc = job.cre_resref.to_ascii_lowercase();
+        live_sounds_by_cre
+            .entry(cre_lc.clone())
+            .or_default()
+            .insert(job.cand.sound_resref.clone());
+        identities_by_sound
+            .entry(job.cand.sound_resref.clone())
+            .or_default()
+            .insert(format!("live:{cre_lc}"));
+    }
+
+    let mut selected: Vec<(String, candidates::Candidate)> = Vec::new();
+    let mut already_present = 0usize;
+    for speaker in gap_fill {
+        let cre_lc = speaker.cre_resref.to_ascii_lowercase();
+        let mut already = existing_sample_keys
+            .get(&cre_lc)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(live) = live_sounds_by_cre.get(&cre_lc) {
+            already.extend(live.iter().cloned());
+        }
+        for l in &speaker.lines {
+            let sound = l.sound_resref.to_ascii_lowercase();
+            if sound.is_empty() {
+                continue;
+            }
+            if !crate::audio::reference_text::is_usable_reference_text(&l.source_text) {
+                continue;
+            }
+            if already.contains(&sound) {
+                already_present += 1;
+            }
+        }
+        for cand in candidates::select_gap_fill(&speaker.lines, &already) {
+            identities_by_sound
+                .entry(cand.sound_resref.clone())
+                .or_default()
+                .insert(speaker.identity_key.clone());
+            selected.push((speaker.cre_resref.clone(), cand));
+        }
+    }
+
+    let mut jobs = Vec::new();
+    for (cre_resref, mut cand) in selected {
+        cand.shared_source_count = identities_by_sound
+            .get(&cand.sound_resref)
+            .map_or(1, |ids| ids.len());
+        if cand.shared_source_count > 1 {
+            cand.eligibility = CandidateEligibility::ManualOnly;
+        }
+        jobs.push(HarvestJob { cre_resref, cand });
+    }
+    let candidates = jobs.len();
+    (jobs, candidates, already_present)
 }
 
 /// Decode jobs concurrently with a bounded worker pool.
@@ -389,10 +506,7 @@ fn harvest_one(
         &metrics,
     );
 
-    let origin = match cand.origin {
-        CandidateOrigin::DialogueState => "dialogue_state",
-        CandidateOrigin::SoundSlot => "sound_slot",
-    };
+    let origin = cand.origin.token();
     Ok(Some(HarvestedSample {
         cre_resref: cre_resref.to_string(),
         source_strref: cand.strref,
@@ -422,6 +536,7 @@ fn derivative_path(workspace: &Path, cre_resref: &str, sound_resref: &str) -> Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::candidates::CandidateOrigin;
 
     fn speaker_source(cre: &str, identity: &str, sound: &str) -> extractor::SpeakerSources {
         extractor::SpeakerSources {
@@ -432,6 +547,7 @@ mod tests {
                 sound_resref: sound.into(),
                 source_text: "A trustworthy sentence for this character.".into(),
             }],
+            companion: Vec::new(),
             slots: Vec::new(),
             unsafe_metadata_skipped: 0,
         }
@@ -451,9 +567,10 @@ mod tests {
             speaker_source("first", "100", "shared01"),
             speaker_source("second", "200", "shared01"),
         ];
-        let (jobs, skipped) = build_jobs(&sources);
+        let (jobs, skipped, already) = build_jobs(&sources, &HashMap::new());
         assert_eq!(jobs.len(), 2);
         assert_eq!(skipped, 0);
+        assert_eq!(already, 0);
         assert!(jobs.iter().all(|job| job.cand.eligibility == CandidateEligibility::ManualOnly));
         assert!(jobs.iter().all(|job| job.cand.shared_source_count == 2));
     }
@@ -464,18 +581,96 @@ mod tests {
             speaker_source("first1", "100", "shared01"),
             speaker_source("first2", "100", "shared01"),
         ];
-        let (jobs, skipped) = build_jobs(&sources);
+        let (jobs, skipped, already) = build_jobs(&sources, &HashMap::new());
         assert_eq!(jobs.len(), 2);
         assert_eq!(skipped, 0);
+        assert_eq!(already, 0);
     }
 
     #[test]
     fn metadata_conflict_count_is_included_in_policy_skips() {
         let mut source = speaker_source("first", "100", "clean01");
         source.unsafe_metadata_skipped = 3;
-        let (jobs, skipped) = build_jobs(&[source]);
+        let (jobs, skipped, already) = build_jobs(&[source], &HashMap::new());
         assert_eq!(jobs.len(), 1);
         assert_eq!(skipped, 3);
+        assert_eq!(already, 0);
+    }
+
+    #[test]
+    fn skips_candidates_already_present_for_speaker() {
+        let sources = vec![speaker_source("first", "100", "have01")];
+        let mut existing = HashMap::new();
+        existing.insert(
+            "first".into(),
+            HashSet::from(["have01".into()]),
+        );
+        let (jobs, _skipped, already) = build_jobs(&sources, &existing);
+        assert!(jobs.is_empty());
+        assert_eq!(already, 1);
+    }
+
+    #[test]
+    fn companion_sources_become_decode_jobs() {
+        let sources = vec![extractor::SpeakerSources {
+            cre_resref: "jahei1".into(),
+            identity_key: "42".into(),
+            dialogue: Vec::new(),
+            companion: vec![extractor::VoicedSource {
+                strref: 10,
+                sound_resref: "bjahe01".into(),
+                source_text: "A rich companion banter line for cloning.".into(),
+            }],
+            slots: Vec::new(),
+            unsafe_metadata_skipped: 0,
+        }];
+        let (jobs, skipped, already) = build_jobs(&sources, &HashMap::new());
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(skipped, 0);
+        assert_eq!(already, 0);
+        assert_eq!(jobs[0].cand.origin, CandidateOrigin::CompanionDialogue);
+    }
+
+    #[test]
+    fn gap_fill_jobs_skip_live_and_existing_sounds() {
+        let live = vec![extractor::SpeakerSources {
+            cre_resref: "npc".into(),
+            identity_key: "1".into(),
+            dialogue: vec![extractor::VoicedSource {
+                strref: 1,
+                sound_resref: "live01".into(),
+                source_text: "A live dialogue harvest line for cloning.".into(),
+            }],
+            companion: Vec::new(),
+            slots: Vec::new(),
+            unsafe_metadata_skipped: 0,
+        }];
+        let (live_jobs, _, _) = build_jobs(&live, &HashMap::new());
+        let gap = [GapFillSpeakerInput {
+            cre_resref: "npc".into(),
+            identity_key: "1".into(),
+            lines: vec![
+                VoicedLine {
+                    strref: 2,
+                    sound_resref: "live01".into(),
+                    source_text: "Same sound already harvested live for cloning.".into(),
+                    attribution_confidence: 1.0,
+                },
+                VoicedLine {
+                    strref: 3,
+                    sound_resref: "gap01".into(),
+                    source_text: "A new attribution gap fill line for cloning.".into(),
+                    attribution_confidence: 1.0,
+                },
+            ],
+        }];
+        let (gap_jobs, candidates, already) =
+            build_gap_fill_jobs(&gap, &HashMap::new(), &live_jobs);
+        assert_eq!(candidates, 1);
+        assert_eq!(gap_jobs.len(), 1);
+        assert_eq!(gap_jobs[0].cand.sound_resref, "gap01");
+        assert_eq!(gap_jobs[0].cand.origin, CandidateOrigin::AttributionVoiced);
+        assert!(already >= 1);
     }
 
     #[test]
@@ -536,6 +731,8 @@ mod tests {
             ffmpeg.as_deref(),
             ws.path(),
             resolve_harvest_parallelism(None),
+            &HashMap::new(),
+            &[],
             |_| {},
             || false,
         )

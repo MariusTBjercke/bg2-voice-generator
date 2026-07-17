@@ -71,6 +71,10 @@ fn no_window(_cmd: &mut Command) {}
 /// Decode `src_bytes` (an original sound resource of any ffmpeg-readable format)
 /// into a normalized mono PCM-WAV derivative at `out_path`, then read it back as
 /// f32 samples for scoring. `src_bytes` is streamed on stdin and never persisted.
+///
+/// Prefer [`decode_path_to_derivative`] for on-disk user imports: MP4/M4A/MOV and
+/// similar containers need a seekable input, and piping them can exit 0 while
+/// writing an empty WAV header.
 pub fn decode_to_derivative(
     ffmpeg: &Path,
     src_bytes: &[u8],
@@ -121,8 +125,74 @@ pub fn decode_to_derivative(
         )));
     }
 
+    read_derivative(out_path)
+}
+
+/// Decode an on-disk audio file into the same normalized mono PCM-WAV derivative
+/// as [`decode_to_derivative`]. Uses a seekable path input so MP4/M4A/MOV imports
+/// demux correctly (stdin piping cannot).
+pub fn decode_path_to_derivative(
+    ffmpeg: &Path,
+    src_path: &Path,
+    out_path: &Path,
+) -> Result<DecodedPcm, AppError> {
+    if !src_path.is_file() {
+        return Err(AppError::Other(format!(
+            "imported clip not found: {}",
+            src_path.display()
+        )));
+    }
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args(["-y", "-hide_banner", "-nostdin", "-i"])
+        .arg(src_path)
+        .arg("-af")
+        .arg(trim_filter())
+        .args(["-ar", TARGET_SAMPLE_RATE, "-ac", "1", "-c:a", "pcm_s16le", "-f", "wav"])
+        .arg(out_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    no_window(&mut cmd);
+
+    let mut child = cmd.spawn()?;
+    let status = match child.wait_timeout(FFMPEG_TIMEOUT)? {
+        Some(status) => status,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(AppError::Other(format!(
+                "ffmpeg exceeded the {}s decode timeout and was killed",
+                FFMPEG_TIMEOUT.as_secs()
+            )));
+        }
+    };
+
+    if !status.success() {
+        return Err(AppError::Other(format!(
+            "ffmpeg decode failed (exit {:?})",
+            status.code()
+        )));
+    }
+
+    read_derivative(out_path)
+}
+
+fn read_derivative(out_path: &Path) -> Result<DecodedPcm, AppError> {
     let out = std::fs::read(out_path)?;
-    decode_pcm_wav(&out)
+    let pcm = decode_pcm_wav(&out)?;
+    if pcm.samples.is_empty() {
+        // ffmpeg can exit 0 while writing only a WAV header (common when an MP4/M4A
+        // was fed on a non-seekable pipe). Treat that as a hard failure.
+        return Err(AppError::Other(
+            "ffmpeg produced an empty reference clip (unreadable source, or all silence after trim)"
+                .into(),
+        ));
+    }
+    Ok(pcm)
 }
 
 #[cfg(test)]

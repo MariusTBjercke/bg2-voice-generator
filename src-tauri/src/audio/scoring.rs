@@ -570,6 +570,28 @@ mod tests {
     }
 
     #[test]
+    fn companion_dialogue_scores_between_main_and_slot() {
+        let m = PcmMetrics::measure(&vec![0.2f32; 44_100 * 3], 44_100);
+        let ds = score(CandidateOrigin::DialogueState, 1.0, DIALOGUE_TEXT, &m);
+        let cd = score(CandidateOrigin::CompanionDialogue, 1.0, DIALOGUE_TEXT, &m);
+        let ss = score(CandidateOrigin::SoundSlot, 0.0, DIALOGUE_TEXT, &m);
+        assert!(ds.overall > cd.overall);
+        assert!(cd.overall > ss.overall);
+        assert!((cd.provenance - 0.85).abs() < 1e-9);
+    }
+
+    #[test]
+    fn attribution_voiced_scores_between_main_and_companion() {
+        let m = PcmMetrics::measure(&vec![0.2f32; 44_100 * 3], 44_100);
+        let ds = score(CandidateOrigin::DialogueState, 1.0, DIALOGUE_TEXT, &m);
+        let av = score(CandidateOrigin::AttributionVoiced, 1.0, DIALOGUE_TEXT, &m);
+        let cd = score(CandidateOrigin::CompanionDialogue, 1.0, DIALOGUE_TEXT, &m);
+        assert!(ds.overall > av.overall);
+        assert!(av.overall > cd.overall);
+        assert!((av.provenance - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
     fn short_clip_scores_zero_duration() {
         let m = PcmMetrics::measure(&vec![0.3f32; 4410], 44_100); // 0.1s
         let s = score(CandidateOrigin::DialogueState, 1.0, DIALOGUE_TEXT, &m);

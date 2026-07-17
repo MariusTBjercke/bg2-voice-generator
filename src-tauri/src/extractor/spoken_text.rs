@@ -688,8 +688,20 @@ mod tests {
     }
 
     #[test]
+    fn maps_grin_to_laughter() {
+        assert_eq!(
+            synthesis_text_for_generation("Amusing. *grin*", true),
+            "Amusing.[laughter]"
+        );
+        assert_eq!(
+            synthesis_text_for_generation("And I... oh, friend... *grin*... I can see.", true),
+            "And I... oh, friend...[laughter] ... I can see."
+        );
+    }
+
+    #[test]
     fn spoken_stage_direction_risk_detects_sound_like_cues() {
-        assert!(cue_spoken_stage_direction_risk("grin"));
+        assert!(!cue_spoken_stage_direction_risk("grin"));
         assert!(cue_spoken_stage_direction_risk("Grrrrrowwwwrrr"));
         assert!(cue_spoken_stage_direction_risk("sniiiff"));
         assert!(!cue_spoken_stage_direction_risk("dare"));
