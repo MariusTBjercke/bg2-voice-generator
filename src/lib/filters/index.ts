@@ -19,13 +19,15 @@ export interface FacetSpec<T> {
   /** The facet value for one item, as a string token (or null = "no value"). */
   value: (item: T) => string | null;
   /** The options offered; if omitted, they are derived from the data. */
-  options?: FacetOption[];
+  options?: FacetOption<T>[];
 }
 
 /** One dropdown option: the stored token + its human label. */
-export interface FacetOption {
+export interface FacetOption<T = unknown> {
   value: string;
   label: string;
+  /** Optional matcher for compound options that cannot be expressed as equality. */
+  predicate?: (item: T) => boolean;
 }
 
 /** A screen's full filter description: free-text fields + optional facets. */
@@ -84,14 +86,19 @@ export function filterItems<T>(
     for (const facet of facets) {
       const selected = values.facets[facet.key] ?? FACET_ALL;
       if (selected === FACET_ALL) continue;
-      if ((facet.value(item) ?? "") !== selected) return false;
+      const option = facet.options?.find((candidate) => candidate.value === selected);
+      if (option?.predicate) {
+        if (!option.predicate(item)) return false;
+      } else if ((facet.value(item) ?? "") !== selected) {
+        return false;
+      }
     }
     return true;
   });
 }
 
 /** Derive a facet's options from the data when it has no explicit `options`. */
-export function facetOptions<T>(facet: FacetSpec<T>, items: T[]): FacetOption[] {
+export function facetOptions<T>(facet: FacetSpec<T>, items: T[]): FacetOption<T>[] {
   if (facet.options) return facet.options;
   const seen = new Map<string, string>();
   for (const item of items) {

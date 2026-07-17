@@ -4,6 +4,7 @@
   import { page } from "$app/state";
   import { invoke } from "$lib/utils/invoke";
   import { project } from "$lib/stores/project";
+  import { getInstallUiPreferences, updateInstallUiPreferences } from "$lib/stores/uiPreferences";
   import { startProgressListener } from "$lib/stores/progress";
   import StatusBadge from "$lib/components/StatusBadge.svelte";
   import type { GameLanguages, HealthReport } from "$lib/types";
@@ -85,8 +86,12 @@
       project.update((p) => ({ ...p, gameDir }));
       try {
         const langs = await invoke<GameLanguages>("get_game_languages", { gameDir });
-        const locale = langs.active ?? langs.locales[0] ?? null;
+        const preferred = getInstallUiPreferences(gameDir).locale;
+        const locale = preferred && langs.locales.includes(preferred)
+          ? preferred
+          : (langs.active ?? langs.locales[0] ?? null);
         project.update((p) => ({ ...p, locale }));
+        updateInstallUiPreferences(gameDir, (current) => ({ ...current, locale }));
       } catch {
         // locale stays null; commands fall back to the install default
       }

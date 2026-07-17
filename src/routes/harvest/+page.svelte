@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { goto } from "$app/navigation";
+  import { page } from "$app/state";
   import { invoke, assetUrl } from "$lib/utils/invoke";
   import { project } from "$lib/stores/project";
   import {
@@ -9,10 +11,10 @@
     setGroupSamples,
     clearGroupSamples,
     setClones,
+    invalidateGeneration,
   } from "$lib/stores/results";
   import { loadSpeakerGroups, invalidateSpeakerGroups } from "$lib/stores/speakerGroups";
   import SpeakerGroupList from "$lib/components/SpeakerGroupList.svelte";
-  import SpeakerGroupLabel from "$lib/components/SpeakerGroupLabel.svelte";
   import Section from "$lib/components/Section.svelte";
   import Card from "$lib/components/Card.svelte";
   import Button from "$lib/components/Button.svelte";
@@ -25,10 +27,18 @@
   import { filterItems, type FilterConfig, type FilterValues } from "$lib/filters";
   import {
     bestApprovedSampleForBinding,
+    groupSamplesBySoundResref,
     parseSampleScore,
-    sortSamplesByOverallScore,
+    type SoundSampleGroup,
   } from "$lib/speakers/samples";
+  import { formatApprovedSummary, groupSummary } from "$lib/speakers/groups";
+  import {
+    identityHref,
+    pathWithoutIdentity,
+    readIdentityParam,
+  } from "$lib/navigation/speakerDeepLink";
   import { progress } from "$lib/stores/progress";
+  import { getInstallUiPreferences, updateInstallUiPreferences } from "$lib/stores/uiPreferences";
   import {
     ensureFiltersGameDir,
     getSavedFilter,
@@ -95,6 +105,8 @@
   // and the last global run's summary counts.
   let autoApproving = $state(false);
   let autoResult = $state<AutoApproveResult | null>(null);
+  /** When true, Auto-approve best skips characters that already have an approval. */
+  let onlyUnapproved = $state(true);
   let approvalMode = $state<"safe" | "manual">("safe");
 
   // Reset: a busy flag shared by the global and per-speaker reset actions.
@@ -109,6 +121,7 @@
   let verifying = $state(false);
   let verifyCancelling = $state(false);
   let verifyResult = $state<VerifySpeechResult | null>(null);
+  let selectionDir = $state<string | null>(null);
 
   const dir = $derived($project.gameDir);
   // Live backend progress for THIS operation (fed by the shared event stream).
@@ -166,8 +179,9 @@
   const samples = $derived(
     selected ? ($results.harvest.samplesByGroup[selected.identity_key] ?? []) : [],
   );
-  const sortedSamples = $derived(sortSamplesByOverallScore(samples));
+  const soundGroups = $derived(groupSamplesBySoundResref(samples));
   const autoBindPick = $derived(bestApprovedSampleForBinding(samples));
+  let expandedSounds = $state<Record<string, boolean>>({});
   const clonesBySpeaker = $derived($results.binding.clonesBySpeaker);
   const boundSampleIds = $derived.by(() => {
     if (!selected) return new Set<number>();
@@ -190,12 +204,42 @@
     ),
   );
 
-  // Character search (by display name or any variant cre_resref).
+  // Character search + sample-status facet for working through the cast.
+  const REVIEW_FACET = "review";
   const filterConfig: FilterConfig<SpeakerGroup> = {
     textPlaceholder: "character name or cre resref…",
     text: (g) => [g.display_name, ...g.variants.map((v) => v.cre_resref)],
+    facets: [
+      {
+        key: REVIEW_FACET,
+        label: "Sample status",
+        value: () => null,
+        options: [
+          {
+            value: "needs_approval",
+            label: "has samples, none approved",
+            predicate: (g) => g.sample_count > 0 && g.approved_sound_count === 0,
+          },
+          {
+            value: "has_approved",
+            label: "has approved",
+            predicate: (g) => g.approved_sound_count > 0,
+          },
+          {
+            value: "no_samples",
+            label: "no harvested samples",
+            predicate: (g) => g.sample_count === 0,
+          },
+          {
+            value: "multi_variant",
+            label: "multiple CRE variants",
+            predicate: (g) => g.variant_count > 1,
+          },
+        ],
+      },
+    ],
   };
-  let filterValues = $state<FilterValues>({ search: "", facets: {} });
+  let filterValues = $state<FilterValues>({ search: "", facets: { [REVIEW_FACET]: "all" } });
   let filtersHydrated = $state(false);
   const filteredGroups = $derived(filterItems(groups, filterConfig, filterValues));
   const pagedGroups = $derived(
@@ -210,7 +254,12 @@
     void dir;
     ensureFiltersGameDir(dir);
     const saved = getSavedFilter(get(filterCache), "harvest");
-    if (saved) filterValues = { search: saved.search, facets: { ...saved.facets } };
+    if (saved) {
+      filterValues = {
+        search: saved.search,
+        facets: { [REVIEW_FACET]: "all", ...saved.facets },
+      };
+    }
     filtersHydrated = true;
   });
   $effect(() => {
@@ -271,6 +320,7 @@
         locale: $project.locale ?? undefined,
       });
       setHarvestResult(r);
+      invalidateGeneration("critical", "metadata");
       // A re-harvest can change the samples, so drop stale per-speaker caches.
       clearGroupSamples();
       invalidateSpeakerGroups(dir);
@@ -286,7 +336,14 @@
   async function selectGroup(g: SpeakerGroup, _force = false) {
     selected = g;
     selectedKey = g.identity_key;
+    expandedSounds = {};
     setSelectedIdentityKey(g.identity_key);
+    if (dir) {
+      updateInstallUiPreferences(dir, (current) => ({
+        ...current,
+        harvestSelectedIdentityKey: g.identity_key,
+      }));
+    }
     error = null;
     loadingSamples = true;
     try {
@@ -312,33 +369,48 @@
     }
   }
 
-  async function decide(sample: ReferenceSample, decision: SampleDecision) {
+  async function decideGroup(group: SoundSampleGroup, decision: SampleDecision) {
     if (!selected) return;
     const key = selected.identity_key;
-    const prev = sample.decision;
+    const targets = group.siblings.filter((s) => {
+      if (s.decision === decision) return false;
+      if (decision === "approved") {
+        const score = scoreOf(s);
+        if ((score?.duration_secs ?? 0) < MIN_BIND_SECS) return false;
+      }
+      return true;
+    });
+    if (targets.length === 0) {
+      if (decision === "approved" && group.siblings.some((s) => s.decision !== "approved")) {
+        error = `Too short to bind a clone from (under ${MIN_BIND_SECS}s)`;
+      }
+      return;
+    }
+
+    const previous = samples.map((s) => ({ ...s }));
+    const targetIds = new Set(targets.map((s) => s.id));
     setGroupSamples(
       key,
-      samples.map((x) => (x.id === sample.id ? { ...x, decision } : x)),
+      samples.map((x) => (targetIds.has(x.id) ? { ...x, decision } : x)),
     );
     try {
-      await invoke<boolean>("set_sample_decision", { sampleId: sample.id, decision });
+      for (const sample of targets) {
+        await invoke<boolean>("set_sample_decision", { sampleId: sample.id, decision });
+      }
+      invalidateGeneration("critical", "metadata");
       await Promise.all([loadGroups(), loadClones()]);
     } catch (e) {
       error = String(e);
-      if (selected) {
-        setGroupSamples(
-          key,
-          samples.map((x) => (x.id === sample.id ? { ...x, decision: prev } : x)),
-        );
-      }
+      setGroupSamples(key, previous);
     }
   }
 
-  // Auto-approve the best sample for EVERY speaker in one backend call (set-based;
-  // see db::harvest). This ALWAYS overwrites prior decisions: each speaker's best
-  // is (re)approved. Because decisions changed server-side across many speakers,
-  // drop the cached per-speaker sample lists so re-selecting reflects reality, then
-  // refresh the current selection.
+  function toggleSoundExpand(soundResref: string) {
+    expandedSounds = { ...expandedSounds, [soundResref]: !expandedSounds[soundResref] };
+  }
+
+  // Auto-approve the best sample. With `onlyUnapproved`, groups that already have
+  // an approval are skipped; otherwise each group is reset to one winner.
   async function autoApproveAll() {
     if (!dir) return;
     approvalMode = "safe";
@@ -348,8 +420,10 @@
       const r = await invoke<AutoApproveResult>("auto_approve_best_samples", {
         gameDir: dir,
         speakerId: undefined,
+        onlyUnapproved,
       });
       autoResult = r;
+      invalidateGeneration("critical", "metadata");
       clearGroupSamples();
       invalidateSpeakerGroups(dir);
       await loadGroups();
@@ -371,6 +445,7 @@
         gameDir: dir,
         speakerId: undefined,
       });
+      invalidateGeneration("critical", "metadata");
       clearGroupSamples();
       invalidateSpeakerGroups(dir);
       await loadGroups();
@@ -383,7 +458,7 @@
   }
 
   // Auto-approve the best sample for the selected character (one clip for the whole
-  // identity group). Refreshes that group's cached list.
+  // identity group). Respects `onlyUnapproved` the same as the global action.
   async function autoApproveSelected() {
     if (!dir || !selected) return;
     const repId =
@@ -396,7 +471,9 @@
       await invoke<AutoApproveResult>("auto_approve_best_samples", {
         gameDir: dir,
         speakerId: repId,
+        onlyUnapproved,
       });
+      invalidateGeneration("critical", "metadata");
       await selectGroup(selected, true);
       invalidateSpeakerGroups(dir);
       await loadGroups();
@@ -419,6 +496,7 @@
         gameDir: dir,
         speakerId: undefined,
       });
+      invalidateGeneration("critical", "metadata");
       autoResult = null;
       clearGroupSamples();
       if (selected) await selectGroup(selected, true);
@@ -444,6 +522,7 @@
         gameDir: dir,
         speakerId: repId,
       });
+      invalidateGeneration("critical", "metadata");
       await selectGroup(selected, true);
       await loadGroups();
     } catch (e) {
@@ -490,6 +569,12 @@
   }
 
   const approvedCount = $derived(samples.filter((s) => s.decision === "approved").length);
+  const approvedSoundCount = $derived(
+    soundGroups.filter((g) => g.siblings.some((s) => s.decision === "approved")).length,
+  );
+  const approvedSummary = $derived(
+    formatApprovedSummary({ soundCount: approvedSoundCount, sampleCount: approvedCount }),
+  );
 
   const decisionTone = { approved: "success", rejected: "danger", pending: "neutral" } as const;
 
@@ -498,7 +583,12 @@
   });
 
   $effect(() => {
-    if (dir) void loadGroups();
+    const gameDir = dir;
+    if (selectionDir === gameDir) return;
+    selectionDir = gameDir;
+    selected = null;
+    selectedKey = null;
+    if (gameDir) void loadGroups();
   });
 
   $effect(() => {
@@ -506,17 +596,49 @@
   });
 
   $effect(() => {
-    const savedKey = $results.harvest.selectedIdentityKey;
+    const gameDir = dir;
+    const deepKey = readIdentityParam(page.url);
+    if (deepKey && groups.length > 0) {
+      const match = groups.find((g) => g.identity_key === deepKey);
+      const strip = () =>
+        void goto(pathWithoutIdentity(page.url), { replaceState: true, keepFocus: true });
+      if (!match) {
+        strip();
+        return;
+      }
+      if (filterValues.search !== match.display_name) {
+        filterValues = {
+          search: match.display_name,
+          facets: { ...filterValues.facets, [REVIEW_FACET]: "all" },
+        };
+      }
+      if (selected?.identity_key !== match.identity_key) {
+        void selectGroup(match).then(strip);
+      } else {
+        strip();
+      }
+      return;
+    }
+    const savedKey = $results.harvest.selectedIdentityKey
+      ?? (gameDir ? getInstallUiPreferences(gameDir).harvestSelectedIdentityKey : null);
     if (!selected && savedKey && groups.length > 0) {
       const match = groups.find((g) => g.identity_key === savedKey);
-      if (match) void selectGroup(match);
+      if (match) {
+        void selectGroup(match);
+      } else if (gameDir) {
+        setSelectedIdentityKey(null);
+        updateInstallUiPreferences(gameDir, (current) => ({
+          ...current,
+          harvestSelectedIdentityKey: null,
+        }));
+      }
     }
   });
 </script>
 
 <Section
   title="Harvest"
-  description="Decode reference voice clips for attributed characters, then audition and approve the best samples per character. Approved samples become the input for voice binding."
+  description="Decode reference voice clips for attributed characters (unique main dialogue, quality-capped companion/banter VO, sound slots, and Attribution gap-fill for thin speakers), then audition and approve the best samples. Re-harvest adds newly found clips only and keeps existing approvals and bindings. Approved samples become the input for voice binding."
 >
   <Card>
     <div class="harvest-settings">
@@ -555,6 +677,13 @@
             ? "Re-harvest references"
             : "Harvest references"}
       </Button>
+      <label
+        class="check"
+        title="When checked, Auto-approve best skips characters that already have an approval. Fill gaps with manual-only always skips those characters."
+      >
+        <input type="checkbox" bind:checked={onlyUnapproved} />
+        Only characters with no approved samples
+      </label>
       <Button
         variant="ghost"
         onclick={autoApproveAll}
@@ -564,8 +693,15 @@
           resetting ||
           !dir ||
           groups.length === 0}
+        title={onlyUnapproved
+          ? "Approves the best automatic clip only for characters that still have no approval. Does not change your existing decisions."
+          : "Replaces existing approve/reject decisions: each character keeps one best automatic clip."}
       >
-        {autoApproving && approvalMode === "safe" ? "Approving…" : "Auto-approve best for all characters"}
+        {autoApproving && approvalMode === "safe"
+          ? "Approving…"
+          : onlyUnapproved
+            ? "Auto-approve remaining (automatic)"
+            : "Auto-approve best for all characters"}
       </Button>
       <Button
         variant="ghost"
@@ -588,7 +724,7 @@
           resetting ||
           !dir ||
           groups.length === 0}
-        title="Opt-in fallback: approve a pending manual-only clip only for exact CRE variants with no approved sample and no qualifying automatic-safe candidate. These clips remain excluded from automatic demographic donor pools."
+        title="Always gap-only: approve a pending manual-only clip for exact CRE variants with no approved sample and no qualifying automatic candidate. Does not overwrite existing approvals."
       >
         {autoApproving && approvalMode === "manual" ? "Filling gaps…" : "Fill gaps with manual-only"}
       </Button>
@@ -680,15 +816,15 @@
       <div class="stats">
         <div class="stat"><span class="value">{rep.speakers_with_sources}</span><span class="label">Speakers with sources</span></div>
         <div class="stat"><span class="value">{rep.candidates_seen}</span><span class="label">Candidates seen</span></div>
-        <div class="stat"><span class="value">{rep.samples_harvested}</span><span class="label">Samples harvested</span></div>
+        <div class="stat"><span class="value">{rep.samples_harvested}</span><span class="label">Decoded this run</span></div>
+        <div class="stat"><span class="value">{result.persisted.samples_added}</span><span class="label">New samples saved</span></div>
+        <div class="stat"><span class="value">{result.persisted.samples_skipped_existing}</span><span class="label">Already present</span></div>
+        <div class="stat"><span class="value">{rep.gap_fill_samples}</span><span class="label">Gap-fill samples</span></div>
         <div class="stat"><span class="value">{rep.decode_failures}</span><span class="label">Decode failures</span></div>
         <div class="stat"><span class="value">{rep.candidates_skipped}</span><span class="label">Skipped (text/policy)</span></div>
         <div class="stat"><span class="value">{rep.automatic_samples}</span><span class="label">Automatic-safe</span></div>
         <div class="stat"><span class="value">{rep.manual_only_samples}</span><span class="label">Manual-only</span></div>
         <div class="stat"><span class="value">{rep.conflicting_aliases_skipped}</span><span class="label">TLK conflicts</span></div>
-        <div class="stat"><span class="value">{result.persisted.samples}</span><span class="label">Saved samples</span></div>
-        <div class="stat"><span class="value">{result.persisted.decisions_preserved}</span><span class="label">Decisions kept</span></div>
-        <div class="stat"><span class="value">{result.persisted.clones_invalidated}</span><span class="label">Bindings reset</span></div>
       </div>
     </Card>
   {/if}
@@ -739,17 +875,31 @@
         {#if !selected}
           <p class="hint">Select a character to review their harvested samples.</p>
         {:else}
+          {@const summary = groupSummary(selected)}
           <div class="samples-head">
-            <h3><SpeakerGroupLabel group={selected} /></h3>
+            <div class="samples-title">
+              <div class="samples-title-row">
+                <h3>{selected.display_name}</h3>
+                <a class="cross-link" href={identityHref("/binding", selected.identity_key)}
+                  >Open on Binding</a
+                >
+              </div>
+              {#if summary}
+                <span class="sub">{summary}</span>
+              {/if}
+            </div>
             <StatusBadge tone={approvedCount > 0 ? "success" : "neutral"}>
-              {approvedCount} approved
+              {approvedSummary ?? "0 approved"}
             </StatusBadge>
             <Button
               variant="ghost"
               onclick={autoApproveSelected}
               disabled={autoApproving || resetting || samples.length === 0}
+              title={onlyUnapproved
+                ? "Approves the best automatic clip only if this character has no approval yet."
+                : "Replaces this character's existing approve/reject decisions with one best automatic clip."}
             >
-              Approve best
+              {onlyUnapproved ? "Approve best if empty" : "Approve best"}
             </Button>
             <Button
               variant="ghost"
@@ -765,15 +915,28 @@
             <p class="hint">No harvested samples for this speaker. Run a harvest first.</p>
           {:else}
             <ul class="samples">
-              {#each sortedSamples as sample (sample.id)}
+              {#each soundGroups as group (group.soundResref)}
+                {@const sample = group.representative}
                 {@const score = scoreOf(sample)}
                 {@const prov = provenanceOf(sample)}
                 {@const tooShort = (score?.duration_secs ?? 0) < MIN_BIND_SECS}
+                {@const multi = group.siblings.length > 1}
+                {@const expanded = expandedSounds[group.soundResref] ?? false}
+                {@const badgeDecision = group.decision ?? "pending"}
+                {@const anyDecided = group.siblings.some(
+                  (s) => s.decision === "approved" || s.decision === "rejected",
+                )}
+                {@const allApproved = group.siblings.every((s) => s.decision === "approved")}
+                {@const allRejected = group.siblings.every((s) => s.decision === "rejected")}
                 <li class="sample">
                   <div class="sample-main">
                     <div class="sample-meta">
-                      <StatusBadge tone={decisionTone[sample.decision]}>{sample.decision}</StatusBadge>
-                      {#if autoBindPick && sample.id === autoBindPick.id}
+                      {#if group.mixed}
+                        <StatusBadge tone="warn">mixed</StatusBadge>
+                      {:else}
+                        <StatusBadge tone={decisionTone[badgeDecision]}>{badgeDecision}</StatusBadge>
+                      {/if}
+                      {#if autoBindPick && group.siblings.some((s) => s.id === autoBindPick.id)}
                         <StatusBadge
                           tone="info"
                           title="This sample would be bound if you choose Bind best approved on the Binding screen. Use Bind this there to pick a different approved clip."
@@ -781,7 +944,7 @@
                           auto-bind pick
                         </StatusBadge>
                       {/if}
-                      {#if boundSampleIds.has(sample.id)}
+                      {#if group.siblings.some((s) => boundSampleIds.has(s.id))}
                         <StatusBadge tone="success">bound</StatusBadge>
                       {/if}
                       {#if score}
@@ -796,8 +959,17 @@
                           <span class="sub">shared by {prov.shared_source_count} identities</span>
                         {/if}
                       {/if}
-                      {#if selected && selected.variant_count > 1 && variantCreBySpeakerId.get(sample.speaker_id)}
-                        <span class="sub mono">variant {variantCreBySpeakerId.get(sample.speaker_id)}</span>
+                      {#if multi}
+                        <span class="sub">{group.siblings.length} variants</span>
+                        <button
+                          type="button"
+                          class="expand"
+                          aria-expanded={expanded}
+                          aria-label={`${expanded ? "Collapse" : "Expand"} variants for ${group.soundResref}`}
+                          onclick={() => toggleSoundExpand(group.soundResref)}
+                        >
+                          {expanded ? "▾" : "▸"}
+                        </button>
                       {/if}
                     </div>
                     {#if prov?.source_text}
@@ -847,27 +1019,65 @@
                         <p class="audio-error">{audioError[sample.id]}</p>
                       {/if}
                     {/if}
+                    {#if multi && expanded}
+                      <ul class="sound-variants">
+                        {#each group.siblings as sibling (sibling.id)}
+                          {@const siblingProv = provenanceOf(sibling)}
+                          <li class="sound-variant">
+                            <StatusBadge tone={decisionTone[sibling.decision]}
+                              >{sibling.decision}</StatusBadge
+                            >
+                            {#if variantCreBySpeakerId.get(sibling.speaker_id)}
+                              <span class="sub mono"
+                                >variant {variantCreBySpeakerId.get(sibling.speaker_id)}</span
+                              >
+                            {/if}
+                            {#if sibling.local_derivative_path}
+                              <button
+                                class="play"
+                                type="button"
+                                aria-label={playingId === sibling.id ? "Pause" : "Play"}
+                                onclick={() => togglePlay(sibling)}
+                              >
+                                {playingId === sibling.id ? "⏸" : "▶"}
+                              </button>
+                              <span class="path mono" title={sibling.local_derivative_path}
+                                >{sibling.local_derivative_path}</span
+                              >
+                            {/if}
+                            {#if siblingProv?.cre_resref && !variantCreBySpeakerId.get(sibling.speaker_id)}
+                              <span class="sub mono">{siblingProv.cre_resref}</span>
+                            {/if}
+                          </li>
+                        {/each}
+                      </ul>
+                    {/if}
                   </div>
                   <div class="decision">
                     <Button
                       variant="ghost"
-                      onclick={() => decide(sample, "approved")}
-                      disabled={sample.decision === "approved" || tooShort}
+                      onclick={() => decideGroup(group, "approved")}
+                      disabled={allApproved || tooShort}
                       title={tooShort
                         ? `Too short to bind a clone from (under ${MIN_BIND_SECS}s)`
-                        : undefined}
+                        : multi
+                          ? `Approve this sound for all ${group.siblings.length} variants`
+                          : undefined}
                     >
                       Approve
                     </Button>
-                    {#if sample.decision === "approved" || sample.decision === "rejected"}
-                      <Button variant="ghost" onclick={() => decide(sample, "pending")}>
+                    {#if anyDecided}
+                      <Button variant="ghost" onclick={() => decideGroup(group, "pending")}>
                         Clear
                       </Button>
                     {/if}
                     <Button
                       variant="danger"
-                      onclick={() => decide(sample, "rejected")}
-                      disabled={sample.decision === "rejected"}
+                      onclick={() => decideGroup(group, "rejected")}
+                      disabled={allRejected}
+                      title={multi
+                        ? `Reject this sound for all ${group.siblings.length} variants`
+                        : undefined}
                     >
                       Reject
                     </Button>
@@ -908,6 +1118,14 @@
     align-items: center;
     gap: var(--space-3);
     flex-wrap: wrap;
+  }
+  .check {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    cursor: help;
   }
   .harvest-settings {
     display: flex;
@@ -1027,9 +1245,24 @@
     flex-wrap: wrap;
     margin-bottom: var(--space-3);
   }
+  .samples-title {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    min-width: 0;
+    margin-right: auto;
+  }
+  .samples-title-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-3);
+    flex-wrap: wrap;
+  }
   .samples-head h3 {
     margin: 0;
-    margin-right: auto;
+  }
+  .cross-link {
+    font-size: 0.85rem;
   }
   .sample {
     display: flex;
@@ -1053,6 +1286,39 @@
     align-items: center;
     gap: var(--space-3);
     flex-wrap: wrap;
+  }
+  .expand {
+    flex-shrink: 0;
+    font: inherit;
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    padding: 0 var(--space-1);
+  }
+  .sound-variants {
+    list-style: none;
+    margin: var(--space-2) 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+  .sound-variant {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+  }
+  .sound-variant .path {
+    flex: 1 1 8rem;
+    min-width: 0;
+    margin: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .overall {
     font-weight: 600;

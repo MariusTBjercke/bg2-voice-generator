@@ -60,12 +60,31 @@ export function groupSummary(g: SpeakerGroup): string {
   const parts: string[] = [];
   if (g.variant_count > 1) parts.push(`${g.variant_count} variants`);
   if (g.line_count > 0) parts.push(`${g.line_count} lines`);
-  if (g.approved_sample_count > 0) {
-    parts.push(
-      `${g.approved_sample_count} approved${g.variant_count > 1 && g.approved_sample_count > 1 ? " across variants" : ""}`,
-    );
-  }
+  const approved = formatApprovedSummary({
+    soundCount: g.approved_sound_count,
+    sampleCount: g.approved_sample_count,
+  });
+  if (approved) parts.push(approved);
   return parts.join(" · ");
+}
+
+/**
+ * Primary = distinct approved sounds (collapsed clips). When the same sounds are
+ * stored once per CRE variant, append the raw row total in parentheses.
+ */
+export function formatApprovedSummary(opts: {
+  soundCount: number;
+  sampleCount: number;
+}): string | null {
+  const sounds = Math.max(0, opts.soundCount);
+  const samples = Math.max(0, opts.sampleCount);
+  if (sounds === 0 && samples === 0) return null;
+  // Prefer distinct sounds; fall back to row count if sounds were not populated.
+  const primary = sounds > 0 ? sounds : samples;
+  if (samples > primary) {
+    return `${primary} approved (${samples} across variants)`;
+  }
+  return `${primary} approved`;
 }
 
 export function groupForSpeaker(

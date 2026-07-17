@@ -2,6 +2,7 @@
   import { open, save } from "@tauri-apps/plugin-dialog";
   import { invoke } from "$lib/utils/invoke";
   import { project } from "$lib/stores/project";
+  import { ensureGameDir } from "$lib/stores/results";
   import Section from "$lib/components/Section.svelte";
   import Card from "$lib/components/Card.svelte";
   import Button from "$lib/components/Button.svelte";
@@ -87,6 +88,8 @@
         bundlePath,
         gameDir: dir,
       });
+      ensureGameDir(null);
+      ensureGameDir(dir);
     } catch (e) {
       importError = String(e);
     } finally {

@@ -1,5 +1,8 @@
 <script lang="ts">
   import { get } from "svelte/store";
+  import { goto } from "$app/navigation";
+  import { page } from "$app/state";
+  import { confirm as tauriConfirm } from "@tauri-apps/plugin-dialog";
   import { invoke, assetUrl } from "$lib/utils/invoke";
   import { project } from "$lib/stores/project";
   import {
@@ -8,7 +11,9 @@
     setGroupSamples,
     setClone,
     setClones,
+    invalidateGeneration,
   } from "$lib/stores/results";
+  import { getInstallUiPreferences, updateInstallUiPreferences } from "$lib/stores/uiPreferences";
   import Section from "$lib/components/Section.svelte";
   import Card from "$lib/components/Card.svelte";
   import Button from "$lib/components/Button.svelte";
@@ -18,20 +23,32 @@
   import SearchFilterBar from "$lib/components/SearchFilterBar.svelte";
   import { filterItems, type FilterConfig, type FilterValues } from "$lib/filters";
   import {
+    defaultVoiceLibraryFilter,
+    sortVoiceLibraryProfiles,
+    voiceLibraryFilterConfig,
+    VOICE_LIBRARY_PAGE_SIZE,
+  } from "$lib/filters/voiceLibrary";
+  import {
     ensureFiltersGameDir,
     getSavedFilter,
     setSavedFilter,
     filterCache,
   } from "$lib/stores/filters";
+  import {
+    identityHref,
+    pathWithoutIdentity,
+    readIdentityParam,
+  } from "$lib/navigation/speakerDeepLink";
   import SpeakerGroupLabel from "$lib/components/SpeakerGroupLabel.svelte";
   import {
     groupForSpeaker,
     personalCloneForGroup,
     representativeVariant,
     samplesForSpeakerFromCache,
+    formatApprovedSummary,
   } from "$lib/speakers/groups";
-  import { sortSamplesByOverallScore } from "$lib/speakers/samples";
-  import { loadSpeakerGroups } from "$lib/stores/speakerGroups";
+  import { bestApprovedSampleForBinding, groupSamplesBySoundResref, formatSoundSampleOptionLabel, pickSampleIdForSoundGroup } from "$lib/speakers/samples";
+  import { invalidateSpeakerGroups, loadSpeakerGroups } from "$lib/stores/speakerGroups";
   import { progress } from "$lib/stores/progress";
   import type {
     ApplyMetadataResult,
@@ -46,15 +63,22 @@
     CloneRenderSettingsUpdate,
     DemographicGroup,
     EffectiveSpeakerBinding,
-    Line,
+    GeneratableLine,
     MetadataAssignment,
     MetadataBinding,
     OmniVoiceRenderSettings,
     ReferenceSample,
     SampleProvenance,
     SampleScore,
+    SetSpeakerGroupExcludedResult,
     SpeakerGroup,
     Speaker,
+    VoiceProfile,
+    ImportedVoiceClipInput,
+    DesignVoiceAttributes,
+    DesignedVoiceCandidate,
+    DesignedVoiceCandidatesResult,
+    DeleteVoiceProfileResult,
   } from "$lib/types";
 
   // Binding: turn a speaker's APPROVED reference samples into a bound voice clone
@@ -141,6 +165,26 @@
   let referenceSaving = $state(false);
 
   let demographicGroups = $state<DemographicGroup[]>([]);
+  let voiceProfiles = $state<VoiceProfile[]>([]);
+  let voiceLibraryOpen = $state(true);
+  let libraryLoading = $state(false);
+  let libraryBusy = $state(false);
+  let libraryCreator = $state<"import" | "design" | null>(null);
+  let libraryPage = $state(0);
+  let libraryFilterValues = $state<FilterValues>(defaultVoiceLibraryFilter());
+  let libraryFiltersHydrated = $state(false);
+  let importName = $state("");
+  let importClips = $state<ImportedVoiceClipInput[]>([]);
+  let designName = $state("");
+  let designText = $state("Beyond these walls, every road leads to a new story.");
+  let designAttributes = $state<DesignVoiceAttributes>({
+    gender: "female", age: "young adult", pitch: "moderate pitch", whisper: false, accent: "british accent",
+  });
+  let designCandidates = $state<DesignedVoiceCandidate[]>([]);
+  let selectedDesignPreview = $state<string | null>(null);
+  let designWarning = $state<string | null>(null);
+  let profilePoolPick = $state<number | "">("");
+  let speakerProfilePick = $state<number | "">("");
   let metadataBindings = $state<MetadataBinding[]>([]);
   let loadingDemographics = $state(false);
   let demographicsLoaded = $state(false);
@@ -175,8 +219,25 @@
   // Collapse the long demographic-groups and character lists so step 2 stays reachable.
   let demographicGroupsOpen = $state(true);
   let charactersListOpen = $state(true);
+  let preferencesDir = $state<string | null>(null);
+  let preferencesHydrated = $state(false);
 
   const dir = $derived($project.gameDir);
+  const customVoiceCount = $derived(
+    voiceProfiles.filter((profile) => profile.origin !== "harvested").length,
+  );
+  const harvestedVoiceCount = $derived(
+    voiceProfiles.filter((profile) => profile.origin === "harvested").length,
+  );
+  const filteredVoiceProfiles = $derived(
+    filterItems(sortVoiceLibraryProfiles(voiceProfiles), voiceLibraryFilterConfig, libraryFilterValues),
+  );
+  const pagedVoiceProfiles = $derived(
+    filteredVoiceProfiles.slice(
+      libraryPage * VOICE_LIBRARY_PAGE_SIZE,
+      (libraryPage + 1) * VOICE_LIBRARY_PAGE_SIZE,
+    ),
+  );
 
   const metadataApplyHadNoEffect = $derived(
     metadataResult !== null &&
@@ -324,13 +385,19 @@
   function donorPrimarySample(speakerId: number): ReferenceSample | undefined {
     const samples = samplesForSpeakerFromCache($results.harvest.samplesByGroup, identityGroups, speakerId);
     if (!samples) return undefined;
-    return primaryApprovedSample(samples);
+    return primaryApprovedSample(samples.filter((s) => s.speaker_id === speakerId));
   }
 
   function donorApprovedCount(speakerId: number): number {
     const samples = samplesForSpeakerFromCache($results.harvest.samplesByGroup, identityGroups, speakerId);
     if (!samples) return 0;
-    return samples.filter((s) => s.decision === "approved" && s.local_derivative_path).length;
+    const approved = samples.filter(
+      (s) =>
+        s.speaker_id === speakerId &&
+        s.decision === "approved" &&
+        s.local_derivative_path,
+    );
+    return groupSamplesBySoundResref(approved).length;
   }
 
   function donorSamplesAreLoaded(speakerId: number): boolean {
@@ -360,6 +427,222 @@
     return binding?.donor_speaker_ids ?? [];
   }
 
+  function profileIdsForGroup(g: DemographicGroup): number[] {
+    return metadataBindings.find((b) => groupKey(b) === groupKey(g))?.voice_profile_ids ?? [];
+  }
+
+  function profileById(id: number): VoiceProfile | undefined {
+    return voiceProfiles.find((profile) => profile.id === id);
+  }
+
+  function originLabel(profile: VoiceProfile): string {
+    return profile.origin === "harvested" ? "Harvested" : profile.origin === "imported" ? "Imported" : "Designed";
+  }
+
+  function profilePrimaryReference(profile: VoiceProfile) {
+    return profile.references.find((reference) => reference.resolved_audio_path) ?? profile.references[0];
+  }
+
+  function profileReferenceLabel(profile: VoiceProfile): string {
+    const count = profile.references.length;
+    return `${count} reference clip${count === 1 ? "" : "s"}`;
+  }
+
+  function referenceSource(reference: VoiceProfile["references"][number]): string | null {
+    const parts = [
+      reference.source_sound_resref ? `sound ${reference.source_sound_resref}` : null,
+      reference.source_strref !== null ? `strref ${reference.source_strref}` : null,
+    ].filter((part): part is string => part !== null);
+    return parts.length > 0 ? parts.join(" · ") : null;
+  }
+
+  function harvestedProfileHref(profile: VoiceProfile): string {
+    if (profile.harvested_speaker_id === null) return "/harvest";
+    const group = groupForSpeaker(identityGroups, profile.harvested_speaker_id);
+    return group ? identityHref("/harvest", group.identity_key) : "/harvest";
+  }
+
+  /** Harvest deep-link for the clips that actually shape this speaker's voice. */
+  function reviewSamplesHref(
+    group: SpeakerGroup,
+    effective: EffectiveSpeakerBinding | undefined,
+  ): string {
+    const repId = representativeVariant(group).speaker_id;
+    const sourceSpeakerId =
+      effective?.donor_speaker_id != null && effective.donor_speaker_id !== repId
+        ? effective.donor_speaker_id
+        : null;
+    if (sourceSpeakerId !== null) {
+      const donorGroup = groupForSpeaker(identityGroups, sourceSpeakerId);
+      if (donorGroup) return identityHref("/harvest", donorGroup.identity_key);
+    }
+    if (effective?.voice_profile_id != null) {
+      const profile = profileById(effective.voice_profile_id);
+      if (profile?.origin === "harvested") return harvestedProfileHref(profile);
+    }
+    return identityHref("/harvest", group.identity_key);
+  }
+
+  function profileIdentityKey(profile: VoiceProfile): string | null {
+    if (profile.harvested_speaker_id === null) return null;
+    return groupForSpeaker(identityGroups, profile.harvested_speaker_id)?.identity_key
+      ?? `speaker:${profile.harvested_speaker_id}`;
+  }
+
+  function donorIdentityKey(speakerId: number): string {
+    return groupForSpeaker(identityGroups, speakerId)?.identity_key ?? `speaker:${speakerId}`;
+  }
+
+  function unmirroredDonorsForGroup(g: DemographicGroup): number[] {
+    const represented = new Set(
+      profileIdsForGroup(g)
+        .map(profileById)
+        .filter((profile): profile is VoiceProfile => profile?.origin === "harvested")
+        .map(profileIdentityKey)
+        .filter((key): key is string => key !== null),
+    );
+    return donorsForGroup(g).filter((donorId) => !represented.has(donorIdentityKey(donorId)));
+  }
+
+  async function loadVoiceProfiles() {
+    if (!dir) { voiceProfiles = []; return; }
+    libraryLoading = true;
+    try { voiceProfiles = await invoke<VoiceProfile[]>("list_voice_profiles", { gameDir: dir }); }
+    catch (e) { error = String(e); }
+    finally { libraryLoading = false; }
+  }
+
+  async function chooseImportedClips() {
+    try {
+      const paths = await invoke<string[]>("select_voice_reference_files");
+      importClips = paths.map((path) => ({ path, transcript: "" }));
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function importVoiceProfile() {
+    if (!dir) return;
+    libraryBusy = true; error = null;
+    try {
+      await invoke<VoiceProfile>("create_imported_voice_profile", {
+        gameDir: dir, displayName: importName, clips: importClips,
+      });
+      importName = ""; importClips = [];
+      await loadVoiceProfiles();
+    } catch (e) { error = String(e); }
+    finally { libraryBusy = false; }
+  }
+
+  async function generateDesignCandidates() {
+    if (!dir) return;
+    libraryBusy = true; error = null; designCandidates = []; selectedDesignPreview = null;
+    try {
+      const result = await invoke<DesignedVoiceCandidatesResult>("generate_designed_voice_candidates", {
+        gameDir: dir, text: designText, attributes: designAttributes,
+      });
+      designCandidates = result.candidates;
+      selectedDesignPreview = result.candidates[0]?.preview_id ?? null;
+      designWarning = result.quality_warning;
+    } catch (e) { error = String(e); }
+    finally { libraryBusy = false; }
+  }
+
+  async function saveDesignedVoice() {
+    if (!dir || !selectedDesignPreview) return;
+    libraryBusy = true; error = null;
+    try {
+      await invoke<VoiceProfile>("save_designed_voice_profile", {
+        gameDir: dir, displayName: designName, previewId: selectedDesignPreview,
+        text: designText, attributes: designAttributes,
+      });
+      designName = ""; designCandidates = []; selectedDesignPreview = null;
+      await loadVoiceProfiles();
+    } catch (e) { error = String(e); }
+    finally { libraryBusy = false; }
+  }
+
+  // Use the same shared <audio> as sample/effective play. Creating a detached
+  // Audio() and assigning it to `audio` overwrites bind:this and leaves every
+  // other Play control as a silent no-op until the page remounts.
+  async function playProfileReference(path: string, id: number) {
+    if (!audio) {
+      error = "Audio player is not ready yet — try again in a moment.";
+      return;
+    }
+    if (playingId === -id) {
+      audio.pause();
+      return;
+    }
+    try {
+      audio.src = assetUrl(path);
+      await audio.play();
+      playingId = -id;
+    } catch (e) {
+      playingId = null;
+      error = String(e);
+    }
+  }
+
+  async function deleteProfile(profile: VoiceProfile) {
+    if (!dir) return;
+    try {
+      const impact = await invoke<DeleteVoiceProfileResult>("delete_voice_profile", {
+        gameDir: dir, voiceProfileId: profile.id, dryRun: true,
+      });
+      if (!confirm(`Delete “${profile.display_name}”? This affects ${impact.affected_speakers} speaker binding(s) and ${impact.affected_pools} voice pool(s). Generated clips stay playable and are marked voice-changed; speakers fall back to their demographic default when one exists.`)) return;
+      await invoke<DeleteVoiceProfileResult>("delete_voice_profile", {
+        gameDir: dir, voiceProfileId: profile.id, dryRun: false,
+      });
+      await Promise.all([loadVoiceProfiles(), loadClones(), loadDemographics()]);
+      invalidateGeneration("critical", "metadata");
+    } catch (e) { error = String(e); }
+  }
+
+  async function renameProfile(profile: VoiceProfile) {
+    if (!dir) return;
+    const displayName = prompt("Voice profile name", profile.display_name)?.trim();
+    if (!displayName || displayName === profile.display_name) return;
+    try {
+      await invoke<VoiceProfile>("rename_voice_profile", {
+        gameDir: dir,
+        voiceProfileId: profile.id,
+        displayName,
+      });
+      await loadVoiceProfiles();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function addProfileToGroup(g: DemographicGroup) {
+    if (!dir || profilePoolPick === "") return;
+    try {
+      await invoke<void>("add_metadata_profile", { gameDir: dir, sex: g.sex, race: g.race, creatureCategory: g.creature_category, voiceProfileId: profilePoolPick });
+      profilePoolPick = ""; await loadDemographics(); await afterPoolChange();
+    } catch (e) { error = String(e); }
+  }
+
+  async function removeProfileFromGroup(g: DemographicGroup, profileId: number) {
+    if (!dir) return;
+    try {
+      await invoke<void>("remove_metadata_profile", { gameDir: dir, sex: g.sex, race: g.race, creatureCategory: g.creature_category, voiceProfileId: profileId });
+      await loadDemographics(); await afterPoolChange();
+    } catch (e) { error = String(e); }
+  }
+
+  async function bindSelectedProfile() {
+    if (!dir || speakerProfilePick === "" || representativeSpeakerId === null) return;
+    binding = true; error = null;
+    try {
+      await invoke<VoiceProfile>("bind_speaker_voice_profile", { gameDir: dir, speakerId: representativeSpeakerId, voiceProfileId: speakerProfilePick });
+      speakerProfilePick = "";
+      await Promise.all([loadClones(), loadDemographics(), loadSpeakersWithLines()]);
+      invalidateGeneration("critical", "metadata");
+    } catch (e) { error = String(e); }
+    finally { binding = false; }
+  }
+
   const configuredGroupCount = $derived(
     demographicGroups.filter((g) => g.configured).length,
   );
@@ -382,6 +665,7 @@
   }
 
   function groupCloneStatusOf(g: SpeakerGroup): string {
+    if (g.excluded) return "excluded";
     const rep = repSpeakerForGroup(g);
     return rep ? cloneStatusOf(rep) : "unbound";
   }
@@ -434,8 +718,38 @@
     return parts.length ? `${src}: ${parts.join(" / ")}` : src;
   }
 
-  $effect(() => {
+  $effect.pre(() => {
     ensureGameDir(dir);
+    if (!dir || preferencesDir === dir) return;
+    preferencesDir = dir;
+    const preferences = getInstallUiPreferences(dir).binding;
+    demographicGroupsOpen = preferences.demographicGroupsOpen;
+    charactersListOpen = preferences.charactersListOpen;
+    expandedGroupKey = preferences.expandedGroupKey;
+    selectedKey = preferences.selectedIdentityKey;
+    groupFilter = preferences.demographicSearch;
+    previewText = preferences.previewText;
+    previewA = freshPreviewSlot(preferences.previewA.settingsSource, preferences.previewA.reference);
+    previewB = freshPreviewSlot(preferences.previewB.settingsSource, preferences.previewB.reference);
+    preferencesHydrated = true;
+  });
+
+  $effect(() => {
+    if (!dir || !preferencesHydrated || preferencesDir !== dir) return;
+    const snapshot = {
+      demographicGroupsOpen,
+      charactersListOpen,
+      expandedGroupKey,
+      selectedIdentityKey: selected?.identity_key ?? selectedKey,
+      demographicSearch: groupFilter,
+      previewText,
+      previewA: { settingsSource: previewA.settingsSource, reference: previewA.reference },
+      previewB: { settingsSource: previewB.settingsSource, reference: previewB.reference },
+    };
+    updateInstallUiPreferences(dir, (current) => ({
+      ...current,
+      binding: snapshot,
+    }));
   });
 
   const clones = $derived($results.binding.clonesBySpeaker);
@@ -451,11 +765,11 @@
       ? selectedClone.primary_sample_id
       : null,
   );
-  // Only APPROVED samples are bindable; highest overall first (matches auto-approve).
-  const approvedSamples = $derived(
-    sortSamplesByOverallScore(samples.filter((s) => s.decision === "approved")),
-  );
+  // Only APPROVED samples are bindable; collapse same sound across CRE variants.
+  const approvedSamples = $derived(samples.filter((s) => s.decision === "approved"));
+  const approvedSoundGroups = $derived(groupSamplesBySoundResref(approvedSamples));
   const approvedCount = $derived(approvedSamples.length);
+  const approvedSoundCount = $derived(approvedSoundGroups.length);
   const settingsDirty = $derived(
     savedSettings !== null && JSON.stringify(savedSettings) !== JSON.stringify(draftSettings),
   );
@@ -493,7 +807,14 @@
   // Play/pause an approved sample's derivative in-app (mirrors Harvest: one shared
   // <audio>, so starting a clip stops any other; failures surface on the row).
   async function togglePlay(sample: ReferenceSample) {
-    if (!audio || !sample.local_derivative_path) return;
+    if (!sample.local_derivative_path) return;
+    if (!audio) {
+      audioError = {
+        ...audioError,
+        [sample.id]: "Audio player is not ready yet — try again in a moment.",
+      };
+      return;
+    }
     if (playingId === sample.id) {
       audio.pause();
       return;
@@ -510,7 +831,14 @@
   }
 
   async function toggleEffective(binding: EffectiveSpeakerBinding) {
-    if (!audio || !binding.sample_path || binding.sample_id === null) return;
+    if (!binding.sample_path || binding.sample_id === null) return;
+    if (!audio) {
+      audioError = {
+        ...audioError,
+        [binding.sample_id]: "Audio player is not ready yet — try again in a moment.",
+      };
+      return;
+    }
     if (playingId === binding.sample_id) {
       audio.pause();
       return;
@@ -565,10 +893,46 @@
           { value: "pending", label: "pending" },
           { value: "failed", label: "failed" },
           { value: "unbound", label: "unbound" },
+          {
+            value: "needs_binding",
+            label: "approved, not bound",
+            predicate: (g) =>
+              g.approved_sound_count > 0 && !g.excluded && groupCloneStatusOf(g) === "unbound",
+          },
+          {
+            value: "has_approved",
+            label: "has approved samples",
+            predicate: (g) => g.approved_sound_count > 0,
+          },
+          { value: "excluded", label: "excluded from pack" },
         ],
       },
     ],
   };
+  // The library has its own install-scoped filter state; it must not overwrite
+  // the character-list search/facet state below.
+  $effect(() => {
+    void dir;
+    ensureFiltersGameDir(dir);
+    const saved = getSavedFilter(get(filterCache), "bindingLibrary");
+    libraryFilterValues = saved
+      ? { search: saved.search, facets: { ...defaultVoiceLibraryFilter().facets, ...saved.facets } }
+      : defaultVoiceLibraryFilter();
+    libraryFiltersHydrated = true;
+  });
+  $effect(() => {
+    const snapshot = {
+      search: libraryFilterValues.search,
+      facets: { ...libraryFilterValues.facets },
+    };
+    if (!libraryFiltersHydrated) return;
+    setSavedFilter("bindingLibrary", snapshot);
+  });
+  $effect(() => {
+    void libraryFilterValues.search;
+    void JSON.stringify(libraryFilterValues.facets);
+    libraryPage = 0;
+  });
   // Filter persistence across tab navigation + restarts: restore this screen's
   // saved filter on mount (or install change), then write every later change back.
   $effect(() => {
@@ -615,6 +979,101 @@
     ]);
     speakers = speakerList;
     identityGroups = groups;
+    // Deep-link selection is applied by the identity effect once groups land.
+    if (readIdentityParam(page.url)) return;
+    const preferredKey = selected?.identity_key ?? getInstallUiPreferences(dir).binding.selectedIdentityKey;
+    if (preferredKey) {
+      const match = groups.find((group) => group.identity_key === preferredKey);
+      if (match && selected?.identity_key !== match.identity_key) {
+        void selectGroup(match);
+      } else if (!match) {
+        selected = null;
+        selectedKey = null;
+        updateInstallUiPreferences(dir, (current) => ({
+          ...current,
+          binding: { ...current.binding, selectedIdentityKey: null },
+        }));
+      }
+    }
+  }
+
+  function applyIdentityDeepLink(match: SpeakerGroup) {
+    const statusAll = filterValues.facets[STATUS_FACET] === "all";
+    if (filterValues.search !== match.display_name || !statusAll) {
+      filterValues = {
+        search: match.display_name,
+        facets: { ...filterValues.facets, [STATUS_FACET]: "all" },
+      };
+    }
+    const strip = () =>
+      void goto(pathWithoutIdentity(page.url), { replaceState: true, keepFocus: true });
+    if (selected?.identity_key !== match.identity_key) {
+      void selectGroup(match).then(strip);
+    } else {
+      strip();
+    }
+  }
+
+  let excluding = $state(false);
+
+  async function toggleExcluded(g: SpeakerGroup) {
+    if (!dir || excluding) return;
+    const nextExcluded = !g.excluded;
+    let shouldClearGenerations = false;
+    if (nextExcluded) {
+      try {
+        const n = Number(
+          await invoke<number>("count_speaker_group_generations", {
+            gameDir: dir,
+            identityKey: g.identity_key,
+          }),
+        );
+        if (Number.isFinite(n) && n > 0) {
+          // Native dialog (not window.confirm): WebView2 suppresses window.confirm
+          // after await, which silently skipped cleanup every time.
+          const message =
+            `Exclude ${g.display_name} from Generate and Export?\n\n` +
+            `They have ${n} existing generated clip${n === 1 ? "" : "s"}.\n\n` +
+            `Delete clips — exclude and remove those files\n` +
+            `Keep clips — exclude but leave the files (they still will not ship in packs)`;
+          try {
+            shouldClearGenerations = await tauriConfirm(message, {
+              title: "Exclude from pack",
+              kind: "warning",
+              okLabel: "Delete clips",
+              cancelLabel: "Keep clips",
+            });
+          } catch {
+            // Browser E2E / non-Tauri fallback.
+            shouldClearGenerations = window.confirm(message) === true;
+          }
+        }
+      } catch (e) {
+        error = String(e);
+        return;
+      }
+    }
+    excluding = true;
+    error = null;
+    try {
+      await invoke<SetSpeakerGroupExcludedResult>("set_speaker_group_excluded", {
+        gameDir: dir,
+        identityKey: g.identity_key,
+        excluded: nextExcluded === true,
+        clearGenerations: shouldClearGenerations === true,
+      });
+      // Always refresh Binding badges and Generation's cached line list — exclude
+      // drops speakers from list_generatable_lines; include puts them back.
+      invalidateSpeakerGroups(dir);
+      invalidateGeneration("critical", "metadata");
+      await Promise.all([loadSpeakers(), loadSpeakersWithLines()]);
+      const refreshed = identityGroups.find((row) => row.identity_key === g.identity_key);
+      if (refreshed) selected = refreshed;
+    } catch (e) {
+      error = String(e);
+    } finally {
+      excluding = false;
+    }
   }
 
   async function selectGroup(g: SpeakerGroup) {
@@ -622,8 +1081,15 @@
     selectedKey = g.identity_key;
     error = null;
     tuningNotice = null;
-    previewA = freshPreviewSlot("saved", "single");
-    previewB = freshPreviewSlot("edited", "composite");
+    const preferences = dir ? getInstallUiPreferences(dir).binding : null;
+    previewA = freshPreviewSlot(
+      preferences?.previewA.settingsSource ?? "saved",
+      preferences?.previewA.reference ?? "single",
+    );
+    previewB = freshPreviewSlot(
+      preferences?.previewB.settingsSource ?? "edited",
+      preferences?.previewB.reference ?? "composite",
+    );
     loadingSamples = true;
     try {
       const list = await invoke<ReferenceSample[]>("list_group_reference_samples", {
@@ -697,7 +1163,11 @@
       });
       setClone(result.clone.speaker_id, result.clone);
       savedSettings = copySettings(draftSettings);
-      tuningNotice = `Saved tuning. Reset ${result.reset_generations} generated clip(s); deleted ${result.files_deleted} local output(s).`;
+      invalidateGeneration("critical", "metadata", "candidates");
+      tuningNotice =
+        result.reset_generations > 0
+          ? `Saved tuning. Marked ${result.reset_generations} clip(s) as voice changed (still playable).`
+          : "Saved tuning.";
     } catch (e) {
       tuningError = String(e);
     } finally {
@@ -707,6 +1177,14 @@
 
   function slotFor(name: "A" | "B"): PreviewSlot {
     return name === "A" ? previewA : previewB;
+  }
+
+  /** Map a stored/sibling sample id onto the collapsed sound-group pick id. */
+  function resolvePreviewSampleId(sampleId: number): number {
+    const group = approvedSoundGroups.find((g) =>
+      g.siblings.some((sibling) => sibling.id === sampleId),
+    );
+    return group ? pickSampleIdForSoundGroup(group) : sampleId;
   }
 
   function replaceSlot(name: "A" | "B", slot: PreviewSlot) {
@@ -721,13 +1199,16 @@
     replaceSlot(name, { ...current, loading: true, error: null, result: null });
     try {
       const settings = current.settingsSource === "saved" ? savedSettings : draftSettings;
+      const sampleId =
+        current.reference === "single" && current.sampleId !== ""
+          ? resolvePreviewSampleId(current.sampleId)
+          : null;
       const result = await invoke<BindingPreview>("preview_clone_voice", {
         cloneId,
         text: previewText,
         settings: copySettings(settings),
         reference: current.reference,
-        sampleId:
-          current.reference === "single" && current.sampleId !== "" ? current.sampleId : null,
+        sampleId,
       });
       replaceSlot(name, { ...slotFor(name), loading: false, result });
     } catch (e) {
@@ -747,8 +1228,16 @@
         sampleIds: result.sample_ids,
       });
       setClone(update.clone.speaker_id, update.clone);
+      invalidateGeneration("critical", "metadata", "candidates");
       await loadClones();
-      tuningNotice = `Saved ${update.references.length === 1 ? "single" : `${update.references.length}-clip composite`} reference. Reset ${update.reset_generations} generated clip(s); deleted ${update.files_deleted} local output(s).`;
+      const kind =
+        update.references.length === 1
+          ? "single"
+          : `${update.references.length}-clip composite`;
+      tuningNotice =
+        update.reset_generations > 0
+          ? `Saved ${kind} reference. Marked ${update.reset_generations} clip(s) as voice changed (still playable).`
+          : `Saved ${kind} reference.`;
       previewA = freshPreviewSlot("saved", "current");
       previewB = freshPreviewSlot("edited", "composite");
     } catch (e) {
@@ -773,9 +1262,10 @@
         sampleId,
       });
       setClone(res.clone.speaker_id, res.clone);
+      invalidateGeneration("critical", "metadata");
       bindWarning = res.duration_warning;
       if (hadClone && repId !== null) reboundIds = new Set(reboundIds).add(repId);
-      await Promise.all([loadClones(), loadSpeakersWithLines()]);
+      await Promise.all([loadClones(), loadSpeakersWithLines(), loadVoiceProfiles()]);
     } catch (e) {
       error = String(e);
     } finally {
@@ -789,7 +1279,7 @@
   async function loadSpeakersWithLines() {
     if (!dir) return;
     try {
-      const lines = await invoke<Line[]>("list_generatable_lines", { gameDir: dir });
+      const lines = await invoke<GeneratableLine[]>("list_generatable_lines", { gameDir: dir });
       generatableLineCount = lines.length;
       speakersWithLines = new Set(
         lines.map((l) => l.speaker_id).filter((id): id is number => id !== null),
@@ -827,8 +1317,8 @@
       autoBindResult = await invoke<AutoBindResult>("auto_bind_all", {
         gameDir: dir,
       });
-      await loadClones();
-      await loadSpeakersWithLines();
+      await Promise.all([loadClones(), loadSpeakersWithLines(), loadVoiceProfiles()]);
+      invalidateGeneration("critical", "metadata");
     } catch (e) {
       error = String(e);
     } finally {
@@ -854,6 +1344,10 @@
       if (gen !== demographicsLoadGen) return;
       demographicGroups = groups;
       metadataBindings = bindings;
+      if (preferencesHydrated) {
+        const existingKeys = new Set(groups.map(groupKey));
+        if (expandedGroupKey && !existingKeys.has(expandedGroupKey)) expandedGroupKey = null;
+      }
     } catch (e) {
       if (gen !== demographicsLoadGen) return;
       error = String(e);
@@ -887,6 +1381,7 @@
 
   async function afterPoolChange() {
     poolChangesPending = true;
+    invalidateGeneration("metadata", "critical");
   }
 
   async function addDonorToGroup(g: DemographicGroup, crossDemographic = false) {
@@ -1022,6 +1517,7 @@
       metadataBySpeaker = map;
       await refreshDemographics();
       poolChangesPending = false;
+      invalidateGeneration("metadata", "critical");
     } catch (e) {
       error = String(e);
     } finally {
@@ -1040,6 +1536,7 @@
         autoFillUnmapped: false,
       });
       reboundIds = new Set(reboundIds).add(representativeSpeakerId);
+      invalidateGeneration("metadata", "critical");
       await Promise.all([loadClones(), loadSpeakersWithLines(), loadDemographics()]);
     } catch (e) {
       error = String(e);
@@ -1071,6 +1568,7 @@
       }
       demographicsNotice = `Cleared ${pools.cleared} pool(s)${clearGenericClones ? ` and ${clonesCleared} fallback clone(s)` : ""}.`;
       poolChangesPending = !clearGenericClones;
+      invalidateGeneration("metadata", "critical");
       await refreshDemographics();
     } catch (e) {
       error = String(e);
@@ -1098,6 +1596,8 @@
       });
       clearResult = `Cleared ${result.cleared} speaker binding(s).`;
       selected = null;
+      selectedKey = null;
+      invalidateGeneration("metadata", "critical");
       await loadClones();
       await loadSpeakersWithLines();
       await loadDemographics();
@@ -1114,7 +1614,19 @@
       void loadClones();
       void loadSpeakersWithLines();
       void loadDemographics();
+      void loadVoiceProfiles();
     }
+  });
+
+  $effect(() => {
+    const deepKey = readIdentityParam(page.url);
+    if (!deepKey || identityGroups.length === 0) return;
+    const match = identityGroups.find((group) => group.identity_key === deepKey);
+    if (!match) {
+      void goto(pathWithoutIdentity(page.url), { replaceState: true, keepFocus: true });
+      return;
+    }
+    applyIdentityDeepLink(match);
   });
 
   let wasBlocking = $state(false);
@@ -1156,12 +1668,151 @@
       </Card>
     {/if}
 
+    <Card>
+      <div class="panel-head">
+        <button type="button" class="panel-toggle" aria-expanded={voiceLibraryOpen} aria-controls="voice-library-panel" onclick={() => (voiceLibraryOpen = !voiceLibraryOpen)}>
+          <span class="chevron" class:collapsed={!voiceLibraryOpen} aria-hidden="true">▼</span>
+          <h2 class="library-heading">Voice library</h2>
+          <span class="panel-summary">{customVoiceCount} custom · {harvestedVoiceCount} harvested</span>
+        </button>
+      </div>
+      {#if voiceLibraryOpen}
+        <div id="voice-library-panel" class="voice-library">
+          <p class="hint">A reference clip and its exact transcript are the example OmniVoice uses to reproduce a voice. Create custom voices here, or manage game-derived clips in Harvest.</p>
+
+          <div class="library-actions" aria-label="Voice library actions">
+            <Button
+              variant={libraryCreator === "import" ? "primary" : "ghost"}
+              aria-expanded={libraryCreator === "import"}
+              onclick={() => (libraryCreator = libraryCreator === "import" ? null : "import")}
+            >Import voice</Button>
+            <Button
+              variant={libraryCreator === "design" ? "primary" : "ghost"}
+              aria-expanded={libraryCreator === "design"}
+              onclick={() => (libraryCreator = libraryCreator === "design" ? null : "design")}
+            >Design voice</Button>
+            <a class="action-link" href="/harvest">Manage harvested samples</a>
+          </div>
+
+          {#if libraryCreator === "import"}
+            <div class="library-creator" aria-label="Import a custom voice">
+              <h3>Import a custom voice</h3>
+              <label>Profile name <input bind:value={importName} maxlength="80" placeholder="e.g. Weathered traveler" /></label>
+              <Button variant="ghost" onclick={chooseImportedClips}>Choose 1–4 audio files…</Button>
+              {#each importClips as clip (clip.path)}
+                <label class="clip-transcript"><span class="mono">{clip.path.split(/[\\/]/).pop()}</span><input bind:value={clip.transcript} placeholder="Exact words spoken in this clip" /></label>
+              {/each}
+              <p class="hint">Every clip needs an exact manual transcript. Audio is copied and normalized locally; 5–8 seconds is ideal.</p>
+              <Button onclick={importVoiceProfile} disabled={libraryBusy || !importName.trim() || importClips.length === 0 || importClips.some((clip) => !clip.transcript.trim())}>{libraryBusy ? "Working…" : "Save imported voice"}</Button>
+            </div>
+          {:else if libraryCreator === "design"}
+            <div class="library-creator" aria-label="Design a voice">
+              <h3>Design a voice</h3>
+              <label>Profile name <input bind:value={designName} maxlength="80" placeholder="e.g. Young Amnian noble" /></label>
+              <div class="design-grid">
+                <label>Gender<select bind:value={designAttributes.gender}><option>female</option><option>male</option></select></label>
+                <label>Age<select bind:value={designAttributes.age}><option>child</option><option>teenager</option><option>young adult</option><option>middle-aged</option><option>elderly</option></select></label>
+                <label>Pitch<select bind:value={designAttributes.pitch}><option>very low pitch</option><option>low pitch</option><option>moderate pitch</option><option>high pitch</option><option>very high pitch</option></select></label>
+                <label>Accent<select bind:value={designAttributes.accent}><option value={null}>No preference</option><option>american accent</option><option>british accent</option><option>australian accent</option><option>canadian accent</option><option>indian accent</option><option>russian accent</option></select></label>
+                <label class="check"><input type="checkbox" bind:checked={designAttributes.whisper} /> Whisper</label>
+              </div>
+              <label>Reference sentence<textarea bind:value={designText} rows="2"></textarea></label>
+              <Button variant="ghost" onclick={generateDesignCandidates} disabled={libraryBusy || !designText.trim()}>{libraryBusy ? "Rendering…" : "Generate 3 auditions"}</Button>
+              {#if designWarning}<p class="bind-warning">{designWarning}</p>{/if}
+              {#if designCandidates.length > 0}
+                <div class="design-candidates">
+                  {#each designCandidates as candidate, index (candidate.preview_id)}
+                    <label class="candidate"><input type="radio" name="design-candidate" value={candidate.preview_id} bind:group={selectedDesignPreview} /><span>Candidate {index + 1} · seed {candidate.seed}</span><Button variant="ghost" onclick={() => playProfileReference(candidate.output_path, 1000000 + index)}>{playingId === -(1000000 + index) ? "Pause" : "▶ Play"}</Button></label>
+                  {/each}
+                </div>
+                <Button onclick={saveDesignedVoice} disabled={libraryBusy || !designName.trim() || !selectedDesignPreview}>Save selected voice</Button>
+              {/if}
+            </div>
+          {/if}
+
+          <SearchFilterBar
+            config={voiceLibraryFilterConfig}
+            items={voiceProfiles}
+            bind:values={libraryFilterValues}
+            shown={filteredVoiceProfiles.length}
+            total={voiceProfiles.length}
+            label="voices"
+          />
+          {#if libraryLoading}
+            <p class="hint">Loading voice profiles…</p>
+          {:else if voiceProfiles.length === 0}
+            <p class="hint">No reusable voices yet. Import or design a custom voice, or approve samples in Harvest.</p>
+          {:else if filteredVoiceProfiles.length === 0}
+            <p class="hint">No voices match these library filters.</p>
+          {:else}
+            <ul class="profile-list">
+              {#each pagedVoiceProfiles as profile (profile.id)}
+                {@const primaryReference = profilePrimaryReference(profile)}
+                <li class="profile-row">
+                  <div class="profile-summary">
+                    <div class="profile-name">
+                      <strong>{profile.display_name}</strong>
+                      <span class="sub">{profileReferenceLabel(profile)}</span>
+                    </div>
+                    <StatusBadge tone={profile.origin === "designed" ? "info" : "success"}>{originLabel(profile)}</StatusBadge>
+                    <StatusBadge tone={profile.availability === "available" ? "success" : "warn"}>
+                      {profile.availability === "available" ? "Available" : "Missing local audio"}
+                    </StatusBadge>
+                    {#if primaryReference?.resolved_audio_path && profile.availability === "available"}
+                      <Button
+                        variant="ghost"
+                        aria-label={playingId === -primaryReference.id ? "Pause" : "Play"}
+                        onclick={() =>
+                          playProfileReference(primaryReference.resolved_audio_path!, primaryReference.id)}
+                      >
+                        {playingId === -primaryReference.id ? "Pause" : "▶ Play"}
+                      </Button>
+                    {/if}
+                    {#if profile.origin === "harvested"}
+                      <a class="action-link compact" href={harvestedProfileHref(profile)}>Manage in Harvest</a>
+                    {:else}
+                      <Button variant="ghost" onclick={() => renameProfile(profile)}>Rename</Button>
+                      <Button variant="danger" onclick={() => deleteProfile(profile)}>Delete…</Button>
+                    {/if}
+                  </div>
+                  <details class="profile-details">
+                    <summary>Reference details</summary>
+                    {#if profile.design}
+                      <p class="design-attributes">
+                        {profile.design.gender} · {profile.design.age} · {profile.design.pitch}
+                        {#if profile.design.accent} · {profile.design.accent}{/if}
+                        {#if profile.design.whisper} · whisper{/if}
+                      </p>
+                    {/if}
+                    <ol class="reference-list">
+                      {#each profile.references as reference (reference.id)}
+                        <li>
+                          <div><strong>Transcript:</strong> {reference.transcript}</div>
+                          {#if referenceSource(reference)}<div class="sub">Source: {referenceSource(reference)}</div>{/if}
+                          {#if reference.resolved_audio_path}
+                            <Button variant="ghost" aria-label={playingId === -reference.id ? "Pause clip" : "Play clip"} onclick={() => playProfileReference(reference.resolved_audio_path!, reference.id)}>{playingId === -reference.id ? "Pause clip" : "Play clip"}</Button>
+                          {:else}
+                            <span class="sub">Local audio unavailable.</span>
+                          {/if}
+                        </li>
+                      {/each}
+                    </ol>
+                  </details>
+                </li>
+              {/each}
+            </ul>
+            <Pager bind:page={libraryPage} total={filteredVoiceProfiles.length} pageSize={VOICE_LIBRARY_PAGE_SIZE} />
+          {/if}
+        </div>
+      {/if}
+    </Card>
+
     <section class="guided-step" aria-labelledby="defaults-heading">
       <div class="step-heading">
         <span class="step-number">1</span>
         <div>
           <h2 id="defaults-heading">Demographic defaults</h2>
-          <p>Choose reusable donor voices for each demographic. This is enough for the lazy, low-configuration path.</p>
+          <p>Build reusable voice pools from harvested, imported, and designed profiles. This is enough for the low-configuration path.</p>
         </div>
       </div>
       <Card>
@@ -1180,7 +1831,7 @@
         {/if}
         <div class="meta-panels">
           <div class="meta-panel">
-            <h3>Donor pools</h3>
+            <h3>Voice pools</h3>
             <label class="check">
               <input type="checkbox" bind:checked={replaceExistingPools} />
               Replace existing
@@ -1296,7 +1947,8 @@
             <ul class="groups">
               {#each pagedDemographicGroups as g (groupKey(g))}
                 {@const key = groupKey(g)}
-                {@const donors = donorsForGroup(g)}
+                {@const donors = unmirroredDonorsForGroup(g)}
+                {@const profileIds = profileIdsForGroup(g)}
                 {@const matching = availableMatchingDonors(g)}
                 {@const cross = availableCrossDonors(g)}
                 {@const expanded = expandedGroupKey === key}
@@ -1304,7 +1956,7 @@
                   <button type="button" class="group-head" onclick={() => toggleGroup(g)}>
                     <span class="group-title">{groupLabel(g)}</span>
                     <span class="sub">
-                      {g.speaker_count} speakers · {g.line_count} lines · pool {donors.length}
+                      {g.speaker_count} speakers · {g.line_count} lines · pool {g.pool_size}
                       · {g.ready_clone_count}/{g.unvoiced_count} unvoiced NPCs ready
                     </span>
                     <StatusBadge tone={g.configured ? "success" : "info"}
@@ -1313,9 +1965,33 @@
                   </button>
                   {#if expanded}
                     <div class="group-body">
-                      {#if donors.length === 0}
-                        <p class="hint">No donors in this pool yet.</p>
-                      {:else}
+                      {#if profileIds.length > 0}
+                        <ul class="donor-list" aria-label="Voices in pool">
+                          {#each profileIds as profileId (profileId)}
+                            {@const profile = profileById(profileId)}
+                            {@const primaryReference = profile ? profilePrimaryReference(profile) : undefined}
+                            <li class="donor-row">
+                              <span>{profile?.display_name ?? `Profile ${profileId}`}</span>
+                              {#if profile}
+                                <StatusBadge tone={profile.origin === "designed" ? "info" : "success"}>{originLabel(profile)}</StatusBadge>
+                                {#if primaryReference && referenceSource(primaryReference)}
+                                  <span class="sub">{referenceSource(primaryReference)}</span>
+                                {/if}
+                                {#if primaryReference?.resolved_audio_path}
+                                  <Button variant="ghost" aria-label={playingId === -primaryReference.id ? "Pause" : "Play"} onclick={() => playProfileReference(primaryReference.resolved_audio_path!, primaryReference.id)}>
+                                    {playingId === -primaryReference.id ? "Pause" : "▶ Play"}
+                                  </Button>
+                                {/if}
+                              {/if}
+                              <Button variant="ghost" onclick={() => removeProfileFromGroup(g, profileId)}>Remove</Button>
+                            </li>
+                          {/each}
+                        </ul>
+                      {/if}
+                      {#if profileIds.length === 0 && donors.length === 0}
+                        <p class="hint">No voices in this pool yet.</p>
+                      {/if}
+                      {#if donors.length > 0}
                         <ul class="donor-list">
                           {#each donors as donorId (donorId)}
                             {@const donor = speakerById(donorId)}
@@ -1325,6 +2001,7 @@
                             {@const sampleLoaded = donorSamplesAreLoaded(donorId)}
                             <li class="donor-row">
                               <span>{donorDisplayLabel(donorId)}</span>
+                              <StatusBadge tone="warn">Harvested · legacy</StatusBadge>
                               {#if donorGroup && donorGroup.variant_count > 1}
                                 <span class="sub mono">{donorGroup.variant_count} variants</span>
                               {:else}
@@ -1342,7 +2019,7 @@
                                   {playingId === primary.id ? "⏸ Pause" : "▶ Play"}
                                 </Button>
                                 {#if approvedN > 1}
-                                  <span class="sub">newest of {approvedN} approved</span>
+                                  <span class="sub">newest of {approvedN} approved sounds</span>
                                 {/if}
                               {:else if donorSamplesLoading.has(donorId) || !sampleLoaded}
                                 <span class="sub">loading sample…</span>
@@ -1370,14 +2047,23 @@
                       {/if}
                       {#if matchingDonors[key] !== undefined && matching.length === 0}
                         <p class="hint donor-hint">
-                          No unused speaker in this demographic has an approved reference
-                          clip. Harvest and approve one, or add a donor from another
+                          No unused harvested voice in this demographic has an approved reference
+                          clip. Harvest and approve one, or add a harvested voice from another
                           demographic.
                         </p>
                       {/if}
+                      <div class="group-actions profile-pool-actions">
+                        <select class="profile-select" bind:value={profilePoolPick}>
+                          <option value="">Add custom voice…</option>
+                          {#each voiceProfiles.filter((profile) => profile.origin !== "harvested" && profile.availability === "available" && !profileIds.includes(profile.id)) as profile (profile.id)}
+                            <option value={profile.id}>{profile.display_name} — {originLabel(profile)}</option>
+                          {/each}
+                        </select>
+                        <Button onclick={() => addProfileToGroup(g)} disabled={profilePoolPick === ""}>Add custom voice</Button>
+                      </div>
                       <div class="group-actions">
                         <select class="donor-select" bind:value={donorPickId}>
-                          <option value="">Matching approved donor…</option>
+                          <option value="">Matching harvested voice…</option>
                           {#each uniqueDonorOptions(matching) as opt (opt.id)}
                             <option value={opt.id}>{opt.label}</option>
                           {/each}
@@ -1393,7 +2079,7 @@
                           onclick={() => suggestDonorsForGroup(g)}
                           disabled={suggestingDonors}
                         >
-                          {suggestingDonors ? "Suggesting…" : "Suggest best donor"}
+                          {suggestingDonors ? "Suggesting…" : "Suggest harvested voice"}
                         </Button>
                         <Button variant="ghost" onclick={() => clearGroupPool(g)}>
                           Clear pool
@@ -1408,11 +2094,11 @@
                               void loadEligibleDonors(g, true);
                             }}
                           >
-                            Add from other demographics…
+                            Add harvested voice from other demographics…
                           </Button>
                         {:else}
                           <select class="donor-select" bind:value={crossPickId}>
-                            <option value="">Other approved donor…</option>
+                            <option value="">Other harvested voice…</option>
                             {#each uniqueDonorOptions(cross) as opt (opt.id)}
                               {@const s = speakerById(opt.id)}
                               <option value={opt.id}>
@@ -1424,7 +2110,7 @@
                             onclick={() => addDonorToGroup(g, true)}
                             disabled={crossPickId === ""}
                           >
-                            Add override
+                            Add harvested voice
                           </Button>
                           <Button
                             variant="ghost"
@@ -1551,16 +2237,18 @@
                   >
                     <button class="speaker-select" type="button" onclick={() => selectGroup(g)}>
                       <SpeakerGroupLabel group={g} />
-                      {#if effective?.inherited}
+                      {#if g.excluded}
+                        <StatusBadge tone="neutral">Excluded</StatusBadge>
+                      {:else if effective?.inherited}
                         <StatusBadge tone="info">Demographic default</StatusBadge>
-                        <span class="sub">Voice: {effective.donor_display_name ?? "Unknown donor"}</span>
+                        <span class="sub">Voice: {effective.voice_profile_name ?? effective.donor_display_name ?? "Unknown voice"}</span>
                       {:else if effective?.clone_id}
                         <StatusBadge tone={cloneTone[effective.clone_status ?? "pending"]}>Personal override</StatusBadge>
-                        <span class="sub">Voice: {effective.donor_display_name ?? g.display_name}</span>
+                        <span class="sub">Voice: {effective.voice_profile_name ?? effective.donor_display_name ?? g.display_name}</span>
                       {:else}
                         <StatusBadge tone="warn">Unbound</StatusBadge>
                       {/if}
-                      {#if groupReadyButNoLines(g)}
+                      {#if !g.excluded && groupReadyButNoLines(g)}
                         <StatusBadge tone="warn">no lines</StatusBadge>
                       {/if}
                     </button>
@@ -1598,13 +2286,21 @@
           {@const effective = repId !== null ? effectiveBySpeaker[repId] : undefined}
           <div class="head">
             <h3>{selected.display_name}</h3>
+            <a class="cross-link" href={reviewSamplesHref(selected, effective)}
+              >Review samples</a
+            >
+            <a class="cross-link" href={identityHref("/generation", selected.identity_key)}
+              >Open on Generation</a
+            >
             {#if selectedRepSpeaker && demographicLabelFor(selectedRepSpeaker)}
               <span class="sub">{demographicLabelFor(selectedRepSpeaker)}</span>
             {/if}
             {#if selected.variant_count > 1}
               <span class="sub">{selected.variant_count} CRE variants</span>
             {/if}
-            {#if clone}
+            {#if selected.excluded}
+              <StatusBadge tone="neutral">Excluded from pack</StatusBadge>
+            {:else if clone}
               {#if clone.binding_source === "generic"}
                 {@const ma = repId !== null ? metadataBySpeaker[repId] : undefined}
                 <StatusBadge tone="info"
@@ -1621,55 +2317,93 @@
           <div class="effective-voice">
             <div>
               <strong>Effective voice</strong>
-              {#if effective?.clone_id}
+              {#if selected.excluded}
+                <p>
+                  Excluded from pack — Generate all/missing and Export skip this character.
+                  Existing clips are kept unless you chose to delete them when excluding.
+                </p>
+              {:else if effective?.clone_id}
                 <p>
                   {effective.inherited ? "Demographic default" : "Personal override"}
-                  · {effective.donor_display_name ?? "Unknown donor"}
+                  · {effective.voice_profile_name ?? effective.donor_display_name ?? "Unknown voice"}
                 </p>
               {:else}
                 <p>Unbound — apply a demographic default or choose a personal sample.</p>
               {/if}
             </div>
             <div class="effective-actions">
-              {#if effective?.sample_path && effective.sample_id !== null}
+              <Button
+                variant="ghost"
+                onclick={() => {
+                  if (selected) void toggleExcluded(selected);
+                }}
+                disabled={excluding}
+              >
+                {excluding
+                  ? "Updating…"
+                  : selected.excluded
+                    ? "Include in pack"
+                    : "Exclude from pack"}
+              </Button>
+              {#if !selected.excluded && effective?.sample_path && effective.sample_id !== null}
                 <Button variant="ghost" onclick={() => toggleEffective(effective)}>
                   {playingId === effective.sample_id ? "Pause effective voice" : "Play effective voice"}
                 </Button>
               {/if}
-              {#if clone && clone.binding_source !== "generic"}
+              {#if !selected.excluded && clone && clone.binding_source !== "generic"}
                 <Button variant="ghost" onclick={restoreDemographicDefault} disabled={binding}>
                   Use demographic default
                 </Button>
               {/if}
             </div>
           </div>
-          {#if selectedRepSpeaker && groupReadyButNoLines(selected)}
+          <div class="profile-override">
+            <strong>Assign an imported or designed profile</strong>
+            <div class="group-actions">
+              <select class="profile-select" bind:value={speakerProfilePick}>
+                <option value="">Choose reusable voice…</option>
+                {#each voiceProfiles.filter((profile) => profile.availability === "available" && profile.origin !== "harvested") as profile (profile.id)}
+                  <option value={profile.id}>{profile.display_name} — {originLabel(profile)}</option>
+                {/each}
+              </select>
+              <Button onclick={bindSelectedProfile} disabled={binding || speakerProfilePick === ""}>{binding ? "Binding…" : "Assign profile"}</Button>
+            </div>
+          </div>
+          {#if !selected.excluded && selectedRepSpeaker && groupReadyButNoLines(selected)}
             <div class="warn-box" role="alert">
               This character has a ready clone but no generatable lines — every line they
               own is already voiced, tokenized, or attributed to another owner. Nothing to
-              generate on the <a href="/generation">Generation</a> screen for them.
+              generate on the
+              <a href={identityHref("/generation", selected.identity_key)}>Generation</a>
+              screen for them.
             </div>
           {/if}
           {#if loadingSamples}
             <p class="hint">Loading samples…</p>
           {:else}
             <p class="hint">
-              {approvedCount} approved sample{approvedCount === 1 ? "" : "s"} available.
-              Binding uses ONE reference clip; the clip's voice, pace, and delivery
-              shape every generated line.
+              {formatApprovedSummary({
+                soundCount: approvedSoundCount,
+                sampleCount: approvedCount,
+              }) ?? "No approved samples"}
+              available. Binding uses ONE reference clip; the clip's voice, pace, and
+              delivery shape every generated line.
             </p>
             {#if approvedCount === 0}
               <div class="warn-box" role="alert">
                 This character has no approved samples. Approve at least one on the
-                <a href="/harvest">Harvest</a> screen before binding, or configure a
-                demographic pool in step 1 above.
+                <a href={identityHref("/harvest", selected.identity_key)}>Harvest</a>
+                screen before binding, or configure a demographic pool in step 1 above.
               </div>
             {:else}
               <ul class="picker">
-                {#each approvedSamples as sample (sample.id)}
+                {#each approvedSoundGroups as group (group.soundResref)}
+                  {@const sample =
+                    bestApprovedSampleForBinding(group.siblings) ?? group.representative}
                   {@const score = scoreOf(sample)}
                   {@const prov = provenanceOf(sample)}
-                  {@const isBound = boundSampleId === sample.id}
+                  {@const isBound = group.siblings.some((s) => s.id === boundSampleId)}
+                  {@const multi = group.siblings.length > 1}
                   <li class="pick" class:bound={isBound}>
                     <div class="pick-main">
                       <div class="pick-meta">
@@ -1680,9 +2414,17 @@
                           <span class="overall">Overall {pct(score.overall)}</span>
                         {/if}
                         {#if prov}
-                          <span class="sub mono">{prov.source_sound_resref} · {prov.origin}</span>
+                          <span class="sub mono"
+                            >{prov.source_sound_resref} · {prov.origin}</span
+                          >
+                        {/if}
+                        {#if multi}
+                          <span class="sub">{group.siblings.length} variants</span>
                         {/if}
                       </div>
+                      {#if prov?.source_text}
+                        <p class="pick-transcript sub">{prov.source_text}</p>
+                      {/if}
                       {#if audioError[sample.id]}
                         <p class="audio-error">{audioError[sample.id]}</p>
                       {/if}
@@ -1701,9 +2443,9 @@
                       <Button
                         variant="ghost"
                         onclick={() => bind(sample.id)}
-                        disabled={binding || isBound}
+                        disabled={binding}
                       >
-                        {isBound ? "Bound" : "Bind this"}
+                        {isBound ? "Re-apply" : "Bind this"}
                       </Button>
                     </div>
                   </li>
@@ -1738,12 +2480,22 @@
                       own voice.
                     {:else}
                       To give this speaker their own voice, approve one of their samples
-                      on the <a href="/harvest">Harvest</a> screen, then bind it here.
+                      on the
+                      <a href={identityHref("/harvest", selected.identity_key)}>Harvest</a>
+                      screen, then bind it here.
                     {/if}
                   </p>
                 {/if}
-                {#if clone.status === "ready"}
-                  <p class="ready-note">Ready to generate — use the Generation screen.</p>
+                {#if selected.excluded}
+                  <p class="ready-note">
+                    Excluded from pack — Include again before generating for this character.
+                  </p>
+                {:else if clone.status === "ready"}
+                  <p class="ready-note">
+                    Ready to generate — use the
+                    <a href={identityHref("/generation", selected.identity_key)}>Generation</a>
+                    screen.
+                  </p>
                 {:else if clone.status === "failed"}
                   <p class="fail-note">
                     Binding failed. Check the approved sample and try again.
@@ -1753,8 +2505,8 @@
                   <p class="rebound-note">
                     Voice changed this session. Clips generated earlier still use the old
                     voice — use "Re-generate all" on the
-                    <a href="/generation">Generation</a> screen (filtered to this
-                    character) to refresh them.
+                    <a href={identityHref("/generation", selected.identity_key)}>Generation</a>
+                    screen (filtered to this character) to refresh them.
                   </p>
                 {/if}
               </div>
@@ -1764,8 +2516,9 @@
                   <div>
                     <h3 id="voice-tuning-title">Voice tuning</h3>
                     <p>
-                      Preview changes safely before saving. Saving invalidates only clips
-                      generated with this effective clone.
+                      Preview changes safely before saving. Saving marks only clips
+                      generated with this effective clone as voice changed — they stay
+                      playable until you regenerate.
                     </p>
                   </div>
                   {#if settingsDirty}<StatusBadge tone="warn">unsaved</StatusBadge>{/if}
@@ -1911,9 +2664,9 @@
                               Single clip
                               <select bind:value={slot.sampleId}>
                                 <option value="">Bound primary clip</option>
-                                {#each approvedSamples as sample (sample.id)}
-                                  <option value={sample.id}>
-                                    {provenanceOf(sample)?.source_sound_resref ?? `Sample ${sample.id}`}
+                                {#each approvedSoundGroups as group (group.soundResref)}
+                                  <option value={pickSampleIdForSoundGroup(group)}>
+                                    {formatSoundSampleOptionLabel(group)}
                                   </option>
                                 {/each}
                               </select>
@@ -2022,6 +2775,159 @@
   .meta-stat strong {
     color: var(--text);
     font-weight: 600;
+  }
+  .library-heading {
+    margin: 0;
+    font-size: 1.1rem;
+  }
+  .voice-library,
+  .library-creator,
+  .profile-override {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+  .profile-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .profile-row,
+  .candidate {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--panel-2);
+  }
+  .profile-row {
+    align-items: stretch;
+    flex-direction: column;
+    gap: var(--space-1);
+    padding: var(--space-1) var(--space-3);
+  }
+  .profile-summary,
+  .library-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+  .profile-summary {
+    align-content: flex-start;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-1) var(--space-2);
+    min-height: 0;
+  }
+  .profile-summary :global(.btn),
+  .profile-details :global(.btn),
+  .action-link.compact {
+    padding: var(--space-1) var(--space-3);
+  }
+  .profile-name {
+    display: flex;
+    flex-direction: column;
+    flex: 0 1 auto;
+    min-width: 0;
+    margin-right: auto;
+  }
+  .action-link {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    padding: var(--space-2) var(--space-4);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--panel-2);
+    color: var(--text);
+    text-decoration: none;
+  }
+  .action-link:hover {
+    border-color: var(--accent);
+  }
+  .profile-details {
+    border-top: 1px solid var(--border);
+    padding-top: var(--space-1);
+  }
+  .profile-details summary {
+    cursor: pointer;
+    color: var(--text-muted);
+    line-height: 1.3;
+  }
+  .design-attributes {
+    margin: var(--space-1) 0;
+    color: var(--text-muted);
+  }
+  .reference-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    margin: var(--space-1) 0 0;
+    padding-left: var(--space-5);
+  }
+  .reference-list li {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: var(--space-1) var(--space-3);
+    align-items: center;
+  }
+  .reference-list li > :first-child {
+    grid-column: 1 / -1;
+  }
+  .library-creator {
+    padding: var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--panel-2);
+    align-items: stretch;
+  }
+  .library-creator label:not(.check):not(.candidate),
+  .clip-transcript {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    color: var(--text-muted);
+    font-size: 0.88rem;
+  }
+  .library-creator input:not([type="checkbox"]):not([type="radio"]),
+  .library-creator select,
+  .library-creator textarea {
+    box-sizing: border-box;
+    width: 100%;
+    padding: var(--space-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--panel);
+    color: var(--text);
+    font: inherit;
+  }
+  .design-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+    gap: var(--space-2);
+  }
+  .design-candidates {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .profile-override {
+    margin: var(--space-3) 0;
+    padding: var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--panel-2);
+  }
+  .profile-pool-actions {
+    margin: var(--space-2) 0;
   }
   .meta-panels {
     display: grid;
@@ -2207,7 +3113,8 @@
   .donor-hint {
     margin: var(--space-2) 0;
   }
-  .donor-select {
+  .donor-select,
+  .profile-select {
     box-sizing: border-box;
     max-width: 100%;
     min-width: 12rem;
@@ -2374,6 +3281,11 @@
   }
   .head h3 {
     margin: 0;
+  }
+  .cross-link {
+    font-size: 0.85rem;
+  }
+  .head .cross-link:last-of-type {
     margin-right: auto;
   }
   .warn-box {
@@ -2443,6 +3355,13 @@
     align-items: center;
     gap: var(--space-3);
     flex-wrap: wrap;
+  }
+  .pick-transcript {
+    margin: 0;
+    max-width: 42rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .pick-actions {
     display: flex;

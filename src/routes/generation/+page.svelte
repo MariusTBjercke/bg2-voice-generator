@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { goto } from "$app/navigation";
+  import { page } from "$app/state";
   import { invoke, assetUrl } from "$lib/utils/invoke";
   import { project } from "$lib/stores/project";
   import Section from "$lib/components/Section.svelte";
@@ -22,14 +24,33 @@
     generationScopeChips,
     normalizeGenerationScope,
     removeGenerationScopeChip,
+    speakerIdentityKey,
     type GenerationScope,
     type GenerationScopeArrayKey,
     type GenerationScopeItem,
     type GenerationScopeLabels,
   } from "$lib/filters/generation";
+  import {
+    pathWithoutGenerationFocus,
+    readGenerationFocusParam,
+    GENERATION_FOCUS_ORPHANS,
+    GENERATION_FOCUS_VOICE_CHANGED,
+  } from "$lib/navigation/generationDeepLink";
+  import { identityHref, pathWithoutIdentity, readIdentityParam } from "$lib/navigation/speakerDeepLink";
   import { groupSummary, speakerIdToGroupMap } from "$lib/speakers/groups";
   import { loadSpeakerGroups } from "$lib/stores/speakerGroups";
   import { progress } from "$lib/stores/progress";
+  import {
+    beginGenerationRequest,
+    bumpGeneratedAudioRevision,
+    ensureGameDir,
+    generationDomainNeedsRefresh,
+    generationRequestIsCurrent,
+    results,
+    rotateCompletedAudioRevisions,
+    setGenerationCache,
+    type CachedGenerationState,
+  } from "$lib/stores/results";
   import {
     ensureFiltersGameDir,
     getSavedFilter,
@@ -37,6 +58,7 @@
     filterCache,
   } from "$lib/stores/filters";
   import { get } from "svelte/store";
+  import { getInstallUiPreferences, updateInstallUiPreferences } from "$lib/stores/uiPreferences";
   import type {
     BatchGenResult,
     CompletedGeneration,
@@ -45,7 +67,7 @@
     EngineStatus,
     GenerationDiagnosticsRow,
     InstallResult,
-    Line,
+    GeneratableLine,
     LineResult,
     LineRenderOverrideWriteResult,
     OmniVoiceRenderSettingsPatch,
@@ -62,10 +84,11 @@
   // engine lifecycle (start/stop + a polled status) and renders lines through
   // generate_line. Generation is GATED on external Python + model + hardware, so
   // every path degrades gracefully: the engine may fail to start, and per-line
-  // synthesis can take minutes with no progress stream (item-06b). Only lines that
-  // are ready AND have a ready clone are offered (list_generatable_lines); each is
-  // safe to hand to generate_line. Generated Ogg clips live under the app-data workspace
-  // (asset scope from item-04c) so they can be auditioned in-app.
+  // synthesis can take minutes with no progress stream (item-06b). Ready/exported
+  // lines with a ready clone are offered for generation; blocked/skipped lines that
+  // still have a playable clip are listed for preview/removal only (Export may still
+  // include them). Generated Ogg clips live under the app-data workspace (asset scope
+  // from item-04c) so they can be auditioned in-app.
 
   const LINE_PAGE_SIZE = 100;
   const POLL_MS = 3000;
@@ -86,12 +109,7 @@
   // The compute-target setting the in-app installer reads (auto|cpu|cuda; "" = auto).
   const KEY_INSTALL_GPU = "omnivoice_install_gpu";
 
-  type GenState = {
-    status: "running" | "done" | "stale" | "text_stale" | "failed";
-    textChanged?: boolean;
-    result?: LineResult;
-    error?: string;
-  };
+  type GenState = CachedGenerationState;
 
   let status = $state<EngineStatus | null>(null);
   let starting = $state(false);
@@ -103,11 +121,11 @@
   let installCancelling = $state(false);
   let installGpu = $state("");
 
-  let lines = $state<Line[]>([]);
+  let lines = $state<GeneratableLine[]>([]);
   let loadingLines = $state(false);
   let linesLoaded = $state(false);
-  let linesLoadGen = 0;
   let linesError = $state<string | null>(null);
+  let criticalReady = $state(false);
   let linePage = $state(0);
   let gen = $state<Record<number, GenState>>({});
   let diagnostics = $state<Record<number, GenerationDiagnosticsRow["diagnostics"]>>({});
@@ -134,9 +152,13 @@
   let effectiveBindings = $state<EffectiveSpeakerBinding[]>([]);
   let scope = $state<GenerationScope>(emptyGenerationScope());
   let moreFiltersOpen = $state(false);
+  // Race has dozens of IE values; collapse to ~neighbor-filter height until expanded.
+  const RACE_COLLAPSE_LIMIT = 10;
+  let racesExpanded = $state(false);
   // Guards the filter write-back so the initial default never clobbers a saved filter
   // before hydration restores it (see the dir effect below).
   let filtersHydrated = $state(false);
+  let viewPreferencesDir = $state<string | null>(null);
 
   let audio = $state<HTMLAudioElement | null>(null);
   let playingId = $state<number | null>(null);
@@ -153,6 +175,7 @@
   let candidateNotes = $state<Record<number, string>>({});
   let tuningOpen = $state<Record<number, boolean>>({});
   let lineSettings = $state<Record<number, OmniVoiceRenderSettingsPatch>>({});
+  let cacheHydrated = $state(false);
 
   const dir = $derived($project.gameDir);
   const ready = $derived(status?.ready === true);
@@ -219,8 +242,15 @@
     const s = speakers.find((x) => x.id === id);
     return s ? (s.display_name ?? s.cre_resref) : `Speaker #${id}`;
   };
+  const speakerBindingHref = (id: number | null): string | null => {
+    if (id === null) return null;
+    const group = groupBySpeakerId.get(id);
+    if (group) return identityHref("/binding", group.identity_key);
+    const key = speakerIdentityKey(speakerById.get(id) ?? null);
+    return key ? identityHref("/binding", key) : null;
+  };
   const bindingBySpeaker = $derived(new Map(effectiveBindings.map((binding) => [binding.speaker_id, binding])));
-  const lineHasReadyBinding = (line: Line): boolean =>
+  const lineHasReadyBinding = (line: GeneratableLine): boolean =>
     line.speaker_id !== null && bindingBySpeaker.get(line.speaker_id)?.clone_status === "ready";
 
   function demographicFor(speaker: Speaker | null): DemographicGroup | null {
@@ -275,9 +305,14 @@
 
   const speakerOptions = $derived(uniqueOptions(
     identityGroups
-      .filter((g) => scopeItems.some((item) =>
-        item.speaker && groupBySpeakerId.get(item.speaker.id)?.identity_key === g.identity_key,
-      ))
+      .filter((g) =>
+        // Speakers with generatable lines, plus any currently selected filter
+        // (so deep-links / stale caches still show a real name, not a bare id).
+        scope.speakers.includes(g.identity_key) ||
+        scopeItems.some((item) =>
+          item.speaker && groupBySpeakerId.get(item.speaker.id)?.identity_key === g.identity_key,
+        )
+      )
       .map((g) => ({
         value: g.identity_key,
         label: g.display_name,
@@ -292,6 +327,18 @@
     value: String(item.speaker.race),
     label: item.demographic?.race_label ?? `Race ${item.speaker.race}`,
   }] : [])));
+  /** Collapsed race list keeps selected values visible even when they fall past the limit. */
+  const visibleRaceOptions = $derived((() => {
+    if (racesExpanded || raceOptions.length <= RACE_COLLAPSE_LIMIT) return raceOptions;
+    const selected = new Set(scope.races);
+    const head = raceOptions.slice(0, RACE_COLLAPSE_LIMIT);
+    const headValues = new Set(head.map((option) => option.value));
+    const pinned = raceOptions
+      .slice(RACE_COLLAPSE_LIMIT)
+      .filter((option) => selected.has(option.value) && !headValues.has(option.value));
+    return [...head, ...pinned];
+  })());
+  const collapsedRaceExtra = $derived(Math.max(0, raceOptions.length - RACE_COLLAPSE_LIMIT));
   const creatureOptions = $derived(uniqueOptions(scopeItems.flatMap((item) => item.speaker ? [{
     value: String(item.speaker.creature_category),
     label: item.demographic?.creature_category_label ?? `Category ${item.speaker.creature_category}`,
@@ -318,7 +365,10 @@
   }
 
   const scopeLabels = $derived<GenerationScopeLabels>({
-    speakers: labelRecord(speakerOptions),
+    speakers: {
+      ...Object.fromEntries(identityGroups.map((g) => [g.identity_key, g.display_name])),
+      ...labelRecord(speakerOptions),
+    },
     sexes: labelRecord(sexOptions),
     races: labelRecord(raceOptions),
     creatureCategories: labelRecord(creatureOptions),
@@ -333,13 +383,27 @@
       running: "Running",
       failed: "Failed",
     },
-    lineStates: { ready: "Ready", exported: "Exported" },
+    lineStates: {
+      ready: "Ready",
+      exported: "Exported",
+      blocked: "Blocked",
+      skipped: "Skipped",
+    },
     packAudio: { absent: "Pack audio absent", present: "Pack audio present" },
   });
   const filterCount = $derived(activeGenerationScopeCount(scope));
   const filterChips = $derived(generationScopeChips(scope, scopeLabels));
   const filteredLines = $derived(filterGenerationScope(scopeItems, scope).map((item) => item.line));
-  const readyFilteredLines = $derived(filteredLines.filter(lineHasReadyBinding));
+  /** Blocked/skipped lines stay listed when they still have clips; batch regen skips them. */
+  function lineIsRegeneratable(line: GeneratableLine): boolean {
+    return line.status === "ready" || line.status === "exported";
+  }
+  const readyFilteredLines = $derived(
+    filteredLines.filter((l) => lineIsRegeneratable(l) && lineHasReadyBinding(l)),
+  );
+  const orphanClipLines = $derived(
+    lines.filter((l) => !lineIsRegeneratable(l) && isPlayableGen(gen[l.id])),
+  );
   const effectiveCharnameStandIn = $derived(
     charnameStandIn.trim() || DEFAULT_CHARNAME_STANDIN,
   );
@@ -351,19 +415,22 @@
     return state?.status === "done" || state?.status === "stale" || state?.status === "text_stale";
   }
 
-  // Filtered lines with no clip yet - the default batch button's target set.
-  const missingLines = $derived(filteredLines.filter((l) => !isPlayableGen(gen[l.id])));
+  // Filtered regeneratable lines with no clip yet - the default batch button's target set.
+  const missingLines = $derived(
+    filteredLines.filter((l) => lineIsRegeneratable(l) && !isPlayableGen(gen[l.id])),
+  );
 
   const voiceChangedLines = $derived(
-    filteredLines.filter((l) => gen[l.id]?.status === "stale"),
+    filteredLines.filter((l) => lineIsRegeneratable(l) && gen[l.id]?.status === "stale"),
   );
   const textChangedLines = $derived(
     filteredLines.filter((l) => {
+      if (!lineIsRegeneratable(l)) return false;
       const state = gen[l.id];
       return state?.status === "text_stale" || state?.textChanged === true;
     }),
   );
-  function lineHasReadyClone(line: Line): boolean {
+  function lineHasReadyClone(line: GeneratableLine): boolean {
     if (line.speaker_id === null) return false;
     return bindingBySpeaker.get(line.speaker_id)?.clone_status === "ready";
   }
@@ -371,12 +438,31 @@
   const textChangedReadyLines = $derived(textChangedLines.filter(lineHasReadyClone));
   const changedLines = $derived(
     filteredLines.filter((l) => {
+      if (!lineIsRegeneratable(l)) return false;
       const state = gen[l.id];
       return state?.status === "stale" || state?.status === "text_stale" || state?.textChanged === true;
     }),
   );
   const changedReadyLines = $derived(changedLines.filter(lineHasReadyClone));
   const savedFilteredLines = $derived(filteredLines.filter((l) => isPlayableGen(gen[l.id])));
+
+  function orphanLineHint(line: GeneratableLine): string | null {
+    if (line.status === "blocked") {
+      return "Blocked by attribution. Remove the clip, or resolve it on Attribution.";
+    }
+    if (line.status === "skipped") {
+      return "Skipped (no speakable text). Remove the clip to keep it out of the pack.";
+    }
+    return null;
+  }
+
+  function showOrphanClips() {
+    scope = normalizeGenerationScope({
+      ...emptyGenerationScope(),
+      lineStates: ["blocked", "skipped"],
+    });
+    moreFiltersOpen = true;
+  }
   const prioritizedLines = $derived([...filteredLines].sort((a, b) => Number((diagnostics[b.id]?.flags.length ?? 0) > 0) - Number((diagnostics[a.id]?.flags.length ?? 0))));
   const pagedLines = $derived(
     prioritizedLines.slice(linePage * LINE_PAGE_SIZE, (linePage + 1) * LINE_PAGE_SIZE),
@@ -476,103 +562,94 @@
     }
   }
 
-  async function loadLines() {
-    if (!dir) {
-      lines = [];
-      linesLoaded = false;
-      return;
-    }
-    const gen = ++linesLoadGen;
-    loadingLines = true;
-    linesLoaded = false;
-    linesError = null;
-    try {
-      const list = await invoke<Line[]>("list_generatable_lines", { gameDir: dir });
-      if (gen !== linesLoadGen) return;
-      lines = list;
-    } catch (e) {
-      if (gen !== linesLoadGen) return;
-      linesError = String(e);
-      lines = [];
-    } finally {
-      if (gen === linesLoadGen) {
-        loadingLines = false;
-        linesLoaded = true;
-      }
-    }
-  }
-
-  // Best-effort scope metadata. A failed auxiliary read never blocks generation;
-  // its category simply has fewer labels/options until Refresh or remount.
+  // Best-effort scope metadata. Bindings are loaded with critical data (not here)
+  // so we do not double-fetch list_effective_speaker_bindings on every refresh.
+  // A failed auxiliary read never blocks generation; its category simply has fewer
+  // labels/options until Refresh or remount.
   async function loadScopeMetadata() {
     if (!dir) return;
-    const [speakerResult, groupResult, demographicResult, bindingResult] = await Promise.allSettled([
+    const token = beginGenerationRequest("metadata");
+    const [speakerResult, groupResult, demographicResult] = await Promise.allSettled([
       invoke<Speaker[]>("list_speakers", { gameDir: dir }),
       loadSpeakerGroups(dir),
       invoke<DemographicGroup[]>("list_demographic_groups", { gameDir: dir }),
-      invoke<EffectiveSpeakerBinding[]>("list_effective_speaker_bindings", { gameDir: dir }),
     ]);
-    speakers = speakerResult.status === "fulfilled" ? speakerResult.value : [];
-    identityGroups = groupResult.status === "fulfilled" ? groupResult.value : [];
-    demographics = demographicResult.status === "fulfilled" ? demographicResult.value : [];
-    effectiveBindings = bindingResult.status === "fulfilled" ? bindingResult.value : [];
+    if (!generationRequestIsCurrent(token)) return;
+    if (speakerResult.status === "fulfilled") speakers = speakerResult.value;
+    if (groupResult.status === "fulfilled") identityGroups = groupResult.value;
+    if (demographicResult.status === "fulfilled") demographics = demographicResult.value;
+    setGenerationCache({ speakers, identityGroups, demographics }, token);
   }
 
-  // Cold-start hydration: the `gen` status map is in-memory, so a tab switch would
-  // otherwise forget every line already rendered and show "Generate" again. Ask the
-  // backend which lines have a clip STILL on disk and seed those as done (marked
-  // `resumed`, since the clip pre-existed this session) so they show "Re-generate"
-  // and can be auditioned. Best-effort: a failure just leaves the map empty. Only
-  // promotes any backend-confirmed clip to done. This is intentionally authoritative:
-  // after remounting during a background batch, a local "running" marker can outlive
-  // the actual line render and must be replaced as soon as the backend reports it.
-  async function hydrateGenerations() {
+  /** Explicit Refresh: always reload every domain (bypasses the warm-cache gate). */
+  async function refreshLinesAndGenerations() {
+    const critical = refreshCritical();
+    void loadScopeMetadata();
+    await critical;
+    await Promise.all([loadCandidates(), loadDiagnostics()]);
+  }
+
+  async function refreshCritical() {
     if (!dir) return;
+    const token = beginGenerationRequest("critical");
+    loadingLines = true;
+    linesError = null;
+    criticalReady = false;
     try {
-      const done = await invoke<CompletedGeneration[]>("list_completed_generations", {
-        gameDir: dir,
-      });
-      const next = { ...gen };
-      for (const [lineId, state] of Object.entries(next)) {
-        if (state.status === "done" || state.status === "stale" || state.status === "text_stale") {
-          delete next[Number(lineId)];
-        }
-      }
-      for (const c of done) {
-        const status = c.voice_changed
-          ? "stale"
-          : c.text_changed
-            ? "text_stale"
-            : "done";
-        next[c.line_id] = {
-          status,
-          textChanged: c.text_changed,
-          result: { generation_id: 0, output_path: c.output_path, resumed: true },
+      const [nextLines, nextBindings, done] = await Promise.all([
+        invoke<GeneratableLine[]>("list_generatable_lines", { gameDir: dir }),
+        invoke<EffectiveSpeakerBinding[]>("list_effective_speaker_bindings", { gameDir: dir }),
+        invoke<CompletedGeneration[]>("list_completed_generations", { gameDir: dir }),
+      ]);
+      if (!generationRequestIsCurrent(token)) return;
+      const next: Record<number, GenState> = {};
+      for (const completed of done) {
+        next[completed.line_id] = {
+          status: completed.voice_changed ? "stale" : completed.text_changed ? "text_stale" : "done",
+          textChanged: completed.text_changed,
+          result: { generation_id: 0, output_path: completed.output_path, resumed: true },
         };
       }
+      const bumped = rotateCompletedAudioRevisions(done.map((item) => item.line_id));
+      lines = nextLines;
+      linesLoaded = true;
+      effectiveBindings = nextBindings;
       gen = next;
-    } catch {
-      // leave gen as-is; the lines simply show "Generate"
+      audioCacheBust = { ...audioCacheBust, ...bumped };
+      criticalReady = true;
+      setGenerationCache({
+        lines: nextLines,
+        linesLoaded: true,
+        effectiveBindings: nextBindings,
+        states: next,
+        audioRevisions: audioCacheBust,
+      }, token);
+    } catch (e) {
+      if (generationRequestIsCurrent(token)) linesError = String(e);
+    } finally {
+      if (generationRequestIsCurrent(token)) loadingLines = false;
     }
-  }
-
-  async function refreshLinesAndGenerations() {
-    await Promise.all([loadLines(), hydrateGenerations(), loadCandidates(), loadDiagnostics()]);
   }
 
   async function loadDiagnostics() {
     if (!dir) return;
+    const token = beginGenerationRequest("diagnostics");
     try {
       const rows = await invoke<GenerationDiagnosticsRow[]>("list_generation_diagnostics", { gameDir: dir });
+      if (!generationRequestIsCurrent(token)) return;
       diagnostics = Object.fromEntries(rows.map((row) => [row.line_id, row.diagnostics]));
-    } catch { diagnostics = {}; }
+      setGenerationCache({ diagnostics }, token);
+    } catch { /* retain cached diagnostics */ }
   }
 
   async function loadCandidates() {
     if (!dir) return;
+    const token = beginGenerationRequest("candidates");
     try {
       const rows = await invoke<RenderCandidate[]>("list_render_candidates", { gameDir: dir });
+      if (!generationRequestIsCurrent(token)) return;
       candidates = Object.fromEntries(rows.map((row) => [row.line_id, row]));
+      setGenerationCache({ candidates }, token);
     } catch {
       // Candidate controls remain usable even if this optional hydration fails.
     }
@@ -596,7 +673,11 @@
   async function saveLineSettings(lineId: number) {
     candidateBusy = { ...candidateBusy, [lineId]: true };
     try {
+      stopPlayback(lineId);
+      stopPlayback(-lineId);
       const result = await invoke<LineRenderOverrideWriteResult>("set_line_render_override", { lineId, settings: lineSettings[lineId] ?? {} });
+      bumpAudioCache(lineId);
+      bumpAudioCache(-lineId);
       const next = { ...gen }; delete next[lineId]; gen = next;
       const nextCandidates = { ...candidates }; delete nextCandidates[lineId]; candidates = nextCandidates;
       candidateNotes = { ...candidateNotes, [lineId]: result.override_state ? "Line override saved; accepted clip and candidate invalidated." : "Line override cleared." };
@@ -607,7 +688,11 @@
   async function clearLineSettings(lineId: number) {
     candidateBusy = { ...candidateBusy, [lineId]: true };
     try {
+      stopPlayback(lineId);
+      stopPlayback(-lineId);
       await invoke<LineRenderOverrideWriteResult>("clear_line_render_override", { lineId });
+      bumpAudioCache(lineId);
+      bumpAudioCache(-lineId);
       lineSettings = { ...lineSettings, [lineId]: {} };
       const next = { ...gen }; delete next[lineId]; gen = next;
       const nextCandidates = { ...candidates }; delete nextCandidates[lineId]; candidates = nextCandidates;
@@ -619,8 +704,8 @@
   async function renderCandidate(lineId: number) {
     candidateBusy = { ...candidateBusy, [lineId]: true };
     try {
-      const candidate = await invoke<RenderCandidate>("generate_render_candidate", { lineId });
       stopPlayback(-lineId);
+      const candidate = await invoke<RenderCandidate>("generate_render_candidate", { lineId });
       bumpAudioCache(-lineId);
       candidates = { ...candidates, [lineId]: candidate };
       candidateNotes = { ...candidateNotes, [lineId]: "Candidate ready. Listen before accepting; your accepted clip is unchanged." };
@@ -631,9 +716,11 @@
   async function acceptCandidate(lineId: number) {
     candidateBusy = { ...candidateBusy, [lineId]: true };
     try {
-      const result = await invoke<LineResult>("accept_render_candidate", { lineId });
       stopPlayback(lineId);
+      stopPlayback(-lineId);
+      const result = await invoke<LineResult>("accept_render_candidate", { lineId });
       bumpAudioCache(lineId);
+      bumpAudioCache(-lineId);
       gen = { ...gen, [lineId]: { status: "done", result } };
       const next = { ...candidates }; delete next[lineId]; candidates = next;
       candidateNotes = { ...candidateNotes, [lineId]: "Candidate accepted." };
@@ -644,7 +731,9 @@
   async function discardCandidate(lineId: number) {
     candidateBusy = { ...candidateBusy, [lineId]: true };
     try {
+      stopPlayback(-lineId);
       await invoke<boolean>("discard_render_candidate", { lineId });
+      bumpAudioCache(-lineId);
       const next = { ...candidates }; delete next[lineId]; candidates = next;
       candidateNotes = { ...candidateNotes, [lineId]: "Candidate discarded; accepted clip retained." };
     } catch (e) { candidateNotes = { ...candidateNotes, [lineId]: String(e) }; }
@@ -654,7 +743,7 @@
   // Webview asset URLs are cached by path; force-regenerate overwrites the same
   // `.ogg`, so each successful rewrite bumps a token used as `assetUrl` cache-bust.
   function bumpAudioCache(id: number) {
-    audioCacheBust = { ...audioCacheBust, [id]: Date.now() };
+    audioCacheBust = { ...audioCacheBust, [id]: bumpGeneratedAudioRevision(id) };
   }
 
   function stopPlayback(id: number | null = null) {
@@ -670,7 +759,7 @@
   // The explicit per-line button always RE-renders (force), so a line that already
   // has a clip regenerates instead of silently returning the resumed clip. The batch
   // "Generate all/these" path keeps its resume-skip semantics.
-  async function generate(line: Line) {
+  async function generate(line: GeneratableLine) {
     const previous = gen[line.id];
     stopPlayback(line.id);
     gen = { ...gen, [line.id]: { status: "running" } };
@@ -726,7 +815,6 @@
       });
       const next = { ...gen };
       const nextBust = { ...audioCacheBust };
-      const now = Date.now();
       for (const o of res.outcomes) {
         if (o.status === "failed") {
           const prior = previous[o.line_id];
@@ -735,7 +823,7 @@
             : { status: "failed", error: o.error ?? "generation failed" };
         } else {
           // Resume skips rewrite the same bytes; only bump when a new render landed.
-          if (o.status !== "resumed") nextBust[o.line_id] = now;
+          if (o.status !== "resumed") nextBust[o.line_id] = bumpGeneratedAudioRevision(o.line_id);
           next[o.line_id] = {
             status: "done",
             result: {
@@ -782,17 +870,15 @@
     removing = true;
     linesError = null;
     try {
+      if (playingId !== null && lineIds.includes(playingId)) stopPlayback(playingId);
       await invoke<RemoveGenerationsResult>("remove_generations", { gameDir: dir, lineIds });
-      if (playingId !== null && lineIds.includes(playingId)) {
-        stopPlayback(playingId);
-      }
       const nextBust = { ...audioCacheBust };
-      for (const lineId of lineIds) delete nextBust[lineId];
+      for (const lineId of lineIds) nextBust[lineId] = bumpGeneratedAudioRevision(lineId);
       audioCacheBust = nextBust;
       const next = { ...gen };
       for (const lineId of lineIds) delete next[lineId];
       gen = next;
-      await loadLines();
+      await refreshCritical();
     } catch (e) {
       linesError = String(e);
     } finally {
@@ -874,9 +960,15 @@
     const existing = synthesisPreviews[lineId];
     if (existing && existing !== "error") return;
     synthesisPreviews = { ...synthesisPreviews, [lineId]: "loading" };
+    const gameDir = dir;
     try {
       const result = await invoke<SynthesisPreview>("get_line_synthesis_preview", { lineId });
+      if (dir !== gameDir || get(results).gameDir !== gameDir) return;
       synthesisPreviews = { ...synthesisPreviews, [lineId]: result };
+      setGenerationCache({ synthesisPreviews: {
+        ...get(results).generation.synthesisPreviews,
+        [lineId]: result,
+      } });
     } catch {
       synthesisPreviews = { ...synthesisPreviews, [lineId]: "error" };
     }
@@ -884,9 +976,15 @@
 
   async function reloadSynthesisPreview(lineId: number) {
     synthesisPreviews = { ...synthesisPreviews, [lineId]: "loading" };
+    const gameDir = dir;
     try {
       const result = await invoke<SynthesisPreview>("get_line_synthesis_preview", { lineId });
+      if (dir !== gameDir || get(results).gameDir !== gameDir) return;
       synthesisPreviews = { ...synthesisPreviews, [lineId]: result };
+      setGenerationCache({ synthesisPreviews: {
+        ...get(results).generation.synthesisPreviews,
+        [lineId]: result,
+      } });
     } catch {
       synthesisPreviews = { ...synthesisPreviews, [lineId]: "error" };
     }
@@ -904,7 +1002,7 @@
       ...synthesisNotes,
       [lineId]: action === "saved" ? `Override saved.${detail}` : `Override cleared.${detail}`,
     };
-    await Promise.all([reloadSynthesisPreview(lineId), hydrateGenerations()]);
+    await Promise.all([reloadSynthesisPreview(lineId), refreshCritical()]);
   }
 
   $effect(() => {
@@ -925,11 +1023,60 @@
 
   $effect(() => {
     if (dir) {
-      void loadLines();
-      void loadScopeMetadata();
-      void hydrateGenerations();
-      void loadCandidates();
+      ensureGameDir(dir);
+      const cached = get(results).generation;
+      lines = cached.lines;
+      linesLoaded = cached.linesLoaded;
+      gen = cached.states;
+      diagnostics = cached.diagnostics;
+      candidates = cached.candidates;
+      synthesisPreviews = { ...cached.synthesisPreviews };
+      speakers = cached.speakers;
+      identityGroups = cached.identityGroups;
+      demographics = cached.demographics;
+      effectiveBindings = cached.effectiveBindings;
+      linePage = cached.linePage;
+      lineSettings = cached.lineSettings;
+      audioCacheBust = cached.audioRevisions;
+      cacheHydrated = true;
+
+      // Warm revisits skip domains whose dirty revision still matches applied.
+      // Mutations on other screens call invalidateGeneration so dirty advances.
+      const needCritical = generationDomainNeedsRefresh("critical");
+      const needMeta = generationDomainNeedsRefresh("metadata");
+      const needCand = generationDomainNeedsRefresh("candidates");
+      const needDiag = generationDomainNeedsRefresh("diagnostics");
+
+      if (needCritical) {
+        criticalReady = false;
+      } else if (cached.linesLoaded) {
+        criticalReady = true;
+        loadingLines = false;
+      } else {
+        criticalReady = false;
+      }
+
+      const criticalWork = needCritical ? refreshCritical() : Promise.resolve();
+      if (needMeta) void loadScopeMetadata();
+      // Candidates/diagnostics are optional chrome — wait for critical paint first.
+      void criticalWork.then(() => {
+        if (needCand) void loadCandidates();
+        if (needDiag) void loadDiagnostics();
+      });
     }
+  });
+
+  $effect(() => {
+    if (!cacheHydrated || !dir) return;
+    const previews: Record<number, SynthesisPreview> = {};
+    for (const [id, value] of Object.entries(synthesisPreviews)) {
+      if (value !== "loading" && value !== "error") previews[Number(id)] = value;
+    }
+    setGenerationCache({
+      lines, linesLoaded, states: gen, diagnostics, candidates, synthesisPreviews: previews,
+      speakers, identityGroups, demographics, effectiveBindings, linePage, lineSettings,
+      audioRevisions: audioCacheBust,
+    });
   });
 
   // Re-fetch lines when a blocking scan/harvest finishes while this tab is open.
@@ -937,7 +1084,7 @@
   $effect(() => {
     const busy = blockingOperation !== null;
     if (wasBlocking && !busy && dir) {
-      void loadLines();
+      void refreshCritical();
     }
     wasBlocking = busy;
   });
@@ -951,7 +1098,7 @@
   $effect(() => {
     const busy = genBusy;
     if (wasGenerationBusy && !busy && dir) {
-      void hydrateGenerations();
+      void refreshCritical();
     }
     wasGenerationBusy = busy;
   });
@@ -964,11 +1111,42 @@
   // writes to. `filtersHydrated` gates the write-back so the default value cannot
   // overwrite the saved filter on the first run.
   $effect(() => {
-    void dir;
+    const gameDir = dir;
     ensureFiltersGameDir(dir);
     const saved = getSavedFilter(get(filterCache), "generation");
     scope = saved ? normalizeGenerationScope(saved) : emptyGenerationScope();
+    if (gameDir && viewPreferencesDir !== gameDir) {
+      viewPreferencesDir = gameDir;
+      moreFiltersOpen = getInstallUiPreferences(gameDir).generationMoreFiltersOpen;
+    }
     filtersHydrated = true;
+  });
+
+  $effect(() => {
+    const deepKey = readIdentityParam(page.url);
+    if (!deepKey || !filtersHydrated) return;
+    if (scope.speakers.length !== 1 || scope.speakers[0] !== deepKey) {
+      scope = normalizeGenerationScope({ ...scope, speakers: [deepKey] });
+    }
+    void goto(pathWithoutIdentity(page.url), { replaceState: true, keepFocus: true });
+  });
+
+  $effect(() => {
+    const focus = readGenerationFocusParam(page.url);
+    if (!focus || !filtersHydrated) return;
+    if (focus === GENERATION_FOCUS_ORPHANS) {
+      scope = normalizeGenerationScope({
+        ...emptyGenerationScope(),
+        lineStates: ["blocked", "skipped"],
+      });
+    } else if (focus === GENERATION_FOCUS_VOICE_CHANGED) {
+      scope = normalizeGenerationScope({
+        ...emptyGenerationScope(),
+        renderStates: ["voice_changed"],
+      });
+    }
+    moreFiltersOpen = true;
+    void goto(pathWithoutGenerationFocus(page.url), { replaceState: true, keepFocus: true });
   });
 
   $effect(() => {
@@ -976,6 +1154,16 @@
     const snapshot = normalizeGenerationScope(scope);
     if (!filtersHydrated) return;
     setSavedFilter("generation", snapshot);
+  });
+
+  $effect(() => {
+    const gameDir = dir;
+    const open = moreFiltersOpen;
+    if (!gameDir || viewPreferencesDir !== gameDir) return;
+    updateInstallUiPreferences(gameDir, (current) => ({
+      ...current,
+      generationMoreFiltersOpen: open,
+    }));
   });
 </script>
 
@@ -1101,11 +1289,11 @@
           {/if}
         </h3>
         <Button variant="ghost" onclick={refreshLinesAndGenerations} disabled={loadingLines}>
-          {loadingLines ? "Loading…" : "Refresh"}
+          {loadingLines ? "Refreshing…" : "Refresh"}
         </Button>
         <Button
           onclick={() => generateAll("missing")}
-          disabled={!canGenerate || genBusy || removing || missingLines.length === 0}
+          disabled={!criticalReady || !canGenerate || genBusy || removing || missingLines.length === 0}
         >
           {#if genBusy}
             Generating…
@@ -1116,35 +1304,35 @@
         <Button
           variant="ghost"
           onclick={() => generateAll("text_changed")}
-          disabled={!canGenerate || genBusy || removing || textChangedReadyLines.length === 0}
+          disabled={!criticalReady || !canGenerate || genBusy || removing || textChangedReadyLines.length === 0}
         >
           Re-generate text-changed ({textChangedReadyLines.length})
         </Button>
         <Button
           variant="ghost"
           onclick={() => generateAll("voice_changed")}
-          disabled={!canGenerate || genBusy || removing || voiceChangedReadyLines.length === 0}
+          disabled={!criticalReady || !canGenerate || genBusy || removing || voiceChangedReadyLines.length === 0}
         >
           Re-generate voice-changed ({voiceChangedReadyLines.length})
         </Button>
         <Button
           variant="ghost"
           onclick={() => generateAll("changed")}
-          disabled={!canGenerate || genBusy || removing || changedReadyLines.length === 0}
+          disabled={!criticalReady || !canGenerate || genBusy || removing || changedReadyLines.length === 0}
         >
           Re-generate all changed ({changedReadyLines.length})
         </Button>
         <Button
           variant="ghost"
           onclick={() => generateAll("all")}
-          disabled={!canGenerate || genBusy || removing || readyFilteredLines.length === 0}
+          disabled={!criticalReady || !canGenerate || genBusy || removing || readyFilteredLines.length === 0}
         >
           Re-generate all ({readyFilteredLines.length})
         </Button>
         <Button
           variant="ghost"
           onclick={() => removeGenerated(savedFilteredLines.map((line) => line.id))}
-          disabled={genBusy || removing || savedFilteredLines.length === 0}
+          disabled={!criticalReady || genBusy || removing || savedFilteredLines.length === 0}
         >
           {removing ? "Removing…" : `Remove filtered generated (${savedFilteredLines.length})`}
         </Button>
@@ -1176,7 +1364,7 @@
             </Button>
             <span class="scope-count">{filteredLines.length} of {lines.length} lines</span>
             {#if filterCount > 0}
-              <Button variant="ghost" onclick={() => (scope = emptyGenerationScope())}>Clear all</Button>
+              <Button variant="ghost" onclick={() => { scope = emptyGenerationScope(); racesExpanded = false; }}>Clear all</Button>
             {/if}
           </div>
 
@@ -1210,11 +1398,23 @@
                     <label><input type="checkbox" checked={scope.sexes.includes(option.value)} onchange={(event) => toggleScopeValue("sexes", option.value, event.currentTarget.checked)} /> {option.label}</label>
                   {/each}
                 </fieldset>
-                <fieldset>
+                <fieldset class="race-filter">
                   <legend>Race</legend>
-                  {#each raceOptions as option (option.value)}
+                  {#each visibleRaceOptions as option (option.value)}
                     <label><input type="checkbox" checked={scope.races.includes(option.value)} onchange={(event) => toggleScopeValue("races", option.value, event.currentTarget.checked)} /> {option.label}</label>
                   {/each}
+                  {#if raceOptions.length > RACE_COLLAPSE_LIMIT}
+                    <button
+                      type="button"
+                      class="filter-expand"
+                      aria-expanded={racesExpanded}
+                      onclick={() => (racesExpanded = !racesExpanded)}
+                    >
+                      {racesExpanded
+                        ? "Show fewer races"
+                        : `Show all races (${collapsedRaceExtra} more)`}
+                    </button>
+                  {/if}
                 </fieldset>
                 <fieldset>
                   <legend>Creature category</legend>
@@ -1237,6 +1437,8 @@
                   <legend>Line state</legend>
                   <label><input type="checkbox" checked={scope.lineStates.includes("ready")} onchange={(event) => toggleScopeValue("lineStates", "ready", event.currentTarget.checked)} /> Ready</label>
                   <label><input type="checkbox" checked={scope.lineStates.includes("exported")} onchange={(event) => toggleScopeValue("lineStates", "exported", event.currentTarget.checked)} /> Exported</label>
+                  <label><input type="checkbox" checked={scope.lineStates.includes("blocked")} onchange={(event) => toggleScopeValue("lineStates", "blocked", event.currentTarget.checked)} /> Blocked</label>
+                  <label><input type="checkbox" checked={scope.lineStates.includes("skipped")} onchange={(event) => toggleScopeValue("lineStates", "skipped", event.currentTarget.checked)} /> Skipped</label>
                 </fieldset>
                 <fieldset>
                   <legend>Attached pack audio</legend>
@@ -1263,6 +1465,15 @@
               {/each}
             </div>
           {/if}
+        </div>
+      {/if}
+
+      {#if orphanClipLines.length > 0}
+        <div class="warn-box" role="status">
+          {orphanClipLines.length} generated clip{orphanClipLines.length === 1 ? " is" : "s are"} on
+          blocked or skipped lines and {orphanClipLines.length === 1 ? "is" : "are"} not included in
+          Re-generate all. Export may still pack {orphanClipLines.length === 1 ? "it" : "them"}.
+          <button type="button" class="linkish" onclick={showOrphanClips}>Show them</button>
         </div>
       {/if}
 
@@ -1316,7 +1527,11 @@
 
       <ErrorNotice message={linesError} />
 
-      {#if loadingLines}
+      {#if loadingLines && linesLoaded}
+        <p class="hint">Refreshing authoritative line and audio state…</p>
+      {/if}
+
+      {#if loadingLines && !linesLoaded}
         <p class="hint">
           {#if blockingOperation}
             Waiting for {blockingOperation.toLowerCase()} to finish — generatable lines
@@ -1340,7 +1555,7 @@
           <button
             type="button"
             class="link"
-            onclick={() => (scope = emptyGenerationScope())}
+            onclick={() => { scope = emptyGenerationScope(); racesExpanded = false; }}
             >Clear filters</button
           > to see all {lines.length}.
         </p>
@@ -1362,7 +1577,15 @@
               <div class="line-main">
                 <div class="line-meta">
                   <span class="mono">#{line.strref}</span>
-                  <span class="sub">{speakerName(line.speaker_id)}</span>
+                  {#if speakerBindingHref(line.speaker_id)}
+                    <a
+                      class="speaker-link"
+                      href={speakerBindingHref(line.speaker_id)}
+                      >{speakerName(line.speaker_id)}</a
+                    >
+                  {:else}
+                    <span class="sub">{speakerName(line.speaker_id)}</span>
+                  {/if}
                   {#if line.dlg_resref}
                     <span class="sub mono">{line.dlg_resref}:{line.state_index ?? "—"}</span>
                   {/if}
@@ -1388,6 +1611,15 @@
                   {:else if g?.status === "failed"}
                     <StatusBadge tone="danger">failed</StatusBadge>
                   {/if}
+                  {#if line.status === "blocked"}
+                    <span title="Attribution blocked this line; remove the clip or fix Attribution if you need a fresh render.">
+                      <StatusBadge tone="warn">blocked</StatusBadge>
+                    </span>
+                  {:else if line.status === "skipped"}
+                    <span title="Attribution skipped this line (no speakable text). Remove the clip if you do not want it in the pack.">
+                      <StatusBadge tone="neutral">skipped</StatusBadge>
+                    </span>
+                  {/if}
                   {#if diagnostics[line.id]?.flags.length}
                     <span title={diagnostics[line.id].flags.join(", ")}><StatusBadge tone="warn">needs review</StatusBadge></span>
                   {/if}
@@ -1402,12 +1634,6 @@
                 <div class="text">
                   <ExpandableText text={line.text} />
                 </div>
-                {#if lineUsesCharname(line.token_mask) && line.original_text}
-                  <div class="token-source">
-                    <span class="token-source-label">Token source:</span>
-                    <ExpandableText text={line.original_text} />
-                  </div>
-                {/if}
                 {#if lineSynthesisPreview(line.id) && lineSynthesisPreview(line.id) !== "loading" && lineSynthesisPreview(line.id) !== "error"}
                   {@const synth = lineSynthesisPreview(line.id) as SynthesisPreview}
                   <p class="synth-hint">Generation text only — subtitle/export unchanged.</p>
@@ -1466,17 +1692,17 @@
                     const opening = !tuningOpen[line.id];
                     tuningOpen = { ...tuningOpen, [line.id]: opening };
                     if (opening) void loadLineSettings(line.id);
-                  }} disabled={candidateBusy[line.id]}>
+                  }} disabled={!criticalReady || candidateBusy[line.id]}>
                     {tuningOpen[line.id] ? "Hide line tuning" : "Tune this line"}
                   </Button>
-                  <Button variant="ghost" onclick={() => renderCandidate(line.id)} disabled={!canGenerate || !lineHasReadyBinding(line) || genBusy || candidateBusy[line.id]}>Try candidate</Button>
+                  <Button variant="ghost" onclick={() => renderCandidate(line.id)} disabled={!criticalReady || !canGenerate || !lineIsRegeneratable(line) || !lineHasReadyBinding(line) || genBusy || candidateBusy[line.id]}>Try candidate</Button>
                   {#if candidates[line.id]?.status === "done"}
                     <StatusBadge tone="info">candidate ready</StatusBadge>
                     <button class="play" type="button" onclick={() => togglePlay(-line.id, candidates[line.id].output_path!)}>
                       {playingId === -line.id ? "Pause candidate" : "Play candidate"}
                     </button>
-                    <Button onclick={() => acceptCandidate(line.id)} disabled={candidateBusy[line.id]}>Accept candidate</Button>
-                    <Button variant="ghost" onclick={() => discardCandidate(line.id)} disabled={candidateBusy[line.id]}>Discard</Button>
+                    <Button onclick={() => acceptCandidate(line.id)} disabled={!criticalReady || candidateBusy[line.id]}>Accept candidate</Button>
+                    <Button variant="ghost" onclick={() => discardCandidate(line.id)} disabled={!criticalReady || candidateBusy[line.id]}>Discard</Button>
                   {:else if candidates[line.id]?.status === "running"}
                     <StatusBadge tone="info">rendering candidateâ€¦</StatusBadge>
                   {:else if candidates[line.id]?.status === "failed"}
@@ -1488,8 +1714,8 @@
                     <p class="hint">Optional local override. Blank fields inherit the clone; saving invalidates only this accepted line.</p>
                     <label>Speed <input aria-label={`Line ${line.strref} speed`} type="number" min="0.5" max="2" step="0.1" value={lineSettings[line.id]?.speed ?? ""} oninput={(e) => patchLineSetting(line.id, "speed", e.currentTarget.value)} /></label>
                     <label>Steps <input aria-label={`Line ${line.strref} steps`} type="number" min="1" step="1" value={lineSettings[line.id]?.num_steps ?? ""} oninput={(e) => patchLineSetting(line.id, "num_steps", e.currentTarget.value)} /></label>
-                    <Button onclick={() => saveLineSettings(line.id)} disabled={candidateBusy[line.id]}>Save line tuning</Button>
-                    <Button variant="ghost" onclick={() => clearLineSettings(line.id)} disabled={candidateBusy[line.id]}>Clear tuning</Button>
+                    <Button onclick={() => saveLineSettings(line.id)} disabled={!criticalReady || candidateBusy[line.id]}>Save line tuning</Button>
+                    <Button variant="ghost" onclick={() => clearLineSettings(line.id)} disabled={!criticalReady || candidateBusy[line.id]}>Clear tuning</Button>
                   </div>
                 {/if}
                 {#if candidateNotes[line.id]}<p class="synth-note">{candidateNotes[line.id]}</p>{/if}
@@ -1503,7 +1729,7 @@
                       {playingId === line.id ? "⏸ Pause" : "▶ Play"}
                     </button>
                     <p class="path mono" title={g.result.output_path}>{g.result.output_path}</p>
-                    <Button variant="ghost" onclick={() => removeGenerated([line.id])} disabled={removing || genBusy}>
+                    <Button variant="ghost" onclick={() => removeGenerated([line.id])} disabled={!criticalReady || removing || genBusy}>
                       Remove clip
                     </Button>
                   </div>
@@ -1514,11 +1740,13 @@
               <div class="line-action">
                 <Button
                   onclick={() => generate(line)}
-                  disabled={!canGenerate || !lineHasReadyBinding(line) || genBusy || removing || g?.status === "running"}
+                  disabled={!criticalReady || !canGenerate || !lineIsRegeneratable(line) || !lineHasReadyBinding(line) || genBusy || removing || g?.status === "running"}
                 >
                   {isPlayableGen(g) ? "Re-generate" : "Generate"}
                 </Button>
-                {#if g?.status === "stale" && !lineHasReadyBinding(line)}
+                {#if orphanLineHint(line)}
+                  <p class="hint binding-needed">{orphanLineHint(line)}</p>
+                {:else if g?.status === "stale" && !lineHasReadyBinding(line)}
                   <p class="hint binding-needed">Bind a voice to regenerate.</p>
                 {/if}
               </div>
@@ -1574,18 +1802,6 @@
   }
   .placeholder-note strong {
     color: var(--text);
-  }
-  .token-source {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    gap: var(--space-2);
-    margin: var(--space-1) 0 0;
-    font-size: 0.8rem;
-    color: var(--text-muted);
-  }
-  .token-source-label {
-    flex-shrink: 0;
   }
   .engine {
     display: flex;
@@ -1646,6 +1862,20 @@
     padding: var(--space-3) var(--space-4);
     color: var(--warn);
     margin: var(--space-4) 0 0;
+  }
+  .warn-box .linkish {
+    display: inline;
+    margin-left: var(--space-2);
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  .warn-box .linkish:hover {
+    opacity: 0.85;
   }
   .lines-head {
     display: flex;
@@ -1732,6 +1962,23 @@
     gap: var(--space-2);
     margin-top: var(--space-1);
     font-size: 0.88rem;
+  }
+  .filter-expand {
+    display: block;
+    margin-top: var(--space-2);
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--accent);
+    font: inherit;
+    font-size: 0.8rem;
+    text-align: left;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    cursor: pointer;
+  }
+  .filter-expand:hover {
+    opacity: 0.85;
   }
   .length-filter label {
     flex-wrap: wrap;
@@ -1845,6 +2092,7 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-2);
+    flex: 1 1 auto;
     min-width: 0;
   }
   .line-meta {
@@ -1894,6 +2142,12 @@
     font-size: 0.8rem;
     color: var(--text-muted);
   }
+  .speaker-link {
+    font-size: 0.8rem;
+    color: var(--accent);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
   .audio-row {
     display: flex;
     align-items: center;
@@ -1929,7 +2183,23 @@
     color: var(--danger);
   }
   .line-action {
-    flex-shrink: 0;
+    flex: 0 0 auto;
+    max-width: 12rem;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-2);
+  }
+  .line-action :global(.btn) {
+    white-space: nowrap;
+  }
+  .line-action .binding-needed {
+    margin: 0;
+    font-size: 0.78rem;
+    line-height: 1.35;
+    color: var(--text-muted);
+    white-space: normal;
+    overflow-wrap: break-word;
   }
   .mono {
     font-family: ui-monospace, "Cascadia Code", monospace;

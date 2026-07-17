@@ -1,4 +1,4 @@
-import type { DemographicGroup, EffectiveSpeakerBinding, Line, Speaker } from "$lib/types";
+import type { DemographicGroup, EffectiveSpeakerBinding, GeneratableLine, Speaker } from "$lib/types";
 
 export type GenerationRenderState =
   | "missing"
@@ -29,7 +29,7 @@ export interface GenerationScope {
 
 /** One already-loaded line joined to the metadata needed by the scope editor. */
 export interface GenerationScopeItem {
-  line: Line;
+  line: GeneratableLine;
   speaker: Speaker | null;
   demographic: DemographicGroup | null;
   binding: EffectiveSpeakerBinding | null;

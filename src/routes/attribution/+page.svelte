@@ -6,6 +6,8 @@
     ensureGameDir,
     resetDownstreamAfterAttribution,
     setAttribution,
+    invalidateGeneration,
+    invalidateReview,
   } from "$lib/stores/results";
   import Section from "$lib/components/Section.svelte";
   import Card from "$lib/components/Card.svelte";
@@ -16,7 +18,7 @@
   import Pager from "$lib/components/Pager.svelte";
   import SearchFilterBar from "$lib/components/SearchFilterBar.svelte";
   import ExpandableText from "$lib/components/ExpandableText.svelte";
-  import { filterItems, type FilterConfig, type FilterValues } from "$lib/filters";
+  import { type FilterConfig, type FilterValues } from "$lib/filters";
   import { progress } from "$lib/stores/progress";
   import {
     ensureFiltersGameDir,
@@ -25,7 +27,7 @@
     filterCache,
   } from "$lib/stores/filters";
   import { get } from "svelte/store";
-  import type { AttributionCounts, Line, SpeakerGroup } from "$lib/types";
+  import type { AttributionCounts, BlockedLinesPage, Line, SpeakerGroup } from "$lib/types";
   import { loadSpeakerGroups } from "$lib/stores/speakerGroups";
   import { speakerIdToGroupMap } from "$lib/speakers/groups";
   import { decodeTokenMask } from "$lib/utils/placeholderTokens";
@@ -43,6 +45,10 @@
   let wipeDownstream = $state(false);
   let error = $state<string | null>(null);
   let blockedPage = $state(0);
+  let blockedTotal = $state(0);
+  let tokenBlockedTotal = $state(0);
+  let blockedLoading = $state(false);
+  let blockedRequest = 0;
   let identityGroups = $state<SpeakerGroup[]>([]);
 
   // Live backend progress for THIS operation (fed by the shared event stream).
@@ -58,9 +64,9 @@
         gameDir: dir,
       });
       if (!c || $project.gameDir !== dir) return;
-      const b = await invoke<Line[]>("list_blocked_lines", { gameDir: dir });
-      if ($project.gameDir !== dir) return;
-      setAttribution(c, b);
+      setAttribution(c, []);
+      invalidateGeneration();
+      invalidateReview();
     } catch (e) {
       error = String(e);
     }
@@ -111,9 +117,7 @@
           gameDir: dir,
         });
         if (!c || $project.gameDir !== dir) return;
-        const b = await invoke<Line[]>("list_blocked_lines", { gameDir: dir });
-        if ($project.gameDir !== dir) return;
-        setAttribution(c, b);
+        setAttribution(c, []);
       } catch (e) {
         error = String(e);
       }
@@ -172,18 +176,56 @@
   const filterConfig: FilterConfig<Line> = {
     textPlaceholder: "strref, dlg:state, or text…",
     text: (l) => [l.strref, `${l.dlg_resref ?? ""}:${l.state_index ?? ""}`, l.text],
-    facets: [{ key: REASON_FACET, label: "Blocked reason", value: blockedReason }],
+    facets: [{
+      key: REASON_FACET,
+      label: "Blocked reason",
+      value: blockedReason,
+      options: [
+        "already voiced", "dynamic token", "not a state line",
+        "shared (different voice)", "unattributed", "other",
+      ].map((value) => ({ value, label: value })),
+    }],
   };
-  const filteredBlocked = $derived(filterItems(blocked, filterConfig, filterValues));
-  const pagedBlocked = $derived(
-    filteredBlocked.slice(blockedPage * BLOCKED_PAGE_SIZE, (blockedPage + 1) * BLOCKED_PAGE_SIZE),
-  );
   // Backend refreshes preserve the current review page. Only changing the search
   // or a facet returns to page one; Pager clamps if the last page disappears.
   $effect(() => {
     void filterValues.search;
     void JSON.stringify(filterValues.facets);
     blockedPage = 0;
+  });
+
+  async function loadBlockedPage(dir: string) {
+    const request = ++blockedRequest;
+    blockedLoading = true;
+    try {
+      const result = await invoke<BlockedLinesPage>("list_blocked_lines_page", {
+        gameDir: dir,
+        offset: blockedPage * BLOCKED_PAGE_SIZE,
+        limit: BLOCKED_PAGE_SIZE,
+        query: filterValues.search.trim() || undefined,
+        reason: filterValues.facets[REASON_FACET] ?? "all",
+      });
+      if (request !== blockedRequest || $project.gameDir !== dir) return;
+      blockedTotal = result.total;
+      tokenBlockedTotal = result.token_total;
+      const current = get(results).attribution.counts;
+      if (current) setAttribution(current, result.rows);
+    } catch (e) {
+      if (request === blockedRequest) error = String(e);
+    } finally {
+      if (request === blockedRequest) blockedLoading = false;
+    }
+  }
+
+  $effect(() => {
+    const dir = $project.gameDir;
+    void scanned;
+    void blockedPage;
+    void filterValues.search;
+    void filterValues.facets[REASON_FACET];
+    if (!dir || !scanned || !filtersHydrated) return;
+    const timer = setTimeout(() => void loadBlockedPage(dir), 250);
+    return () => clearTimeout(timer);
   });
 
   // Labeled stat cards, in a sensible reading order.
@@ -221,8 +263,7 @@
       }
       // Show counts immediately; blocked lines can load in a second round-trip.
       setAttribution(c, get(results).attribution.blocked);
-      const b = await invoke<Line[]>("list_blocked_lines", { gameDir: dir });
-      setAttribution(c, b);
+      setAttribution(c, []);
       blockedPage = 0;
     } catch (e) {
       error = String(e);
@@ -231,9 +272,7 @@
     }
   }
 
-  const tokenBlockedCount = $derived(
-    blocked.filter((l) => l.has_tokens || l.kind === "token").length,
-  );
+  const tokenBlockedCount = $derived(tokenBlockedTotal);
 
   function tokenLabels(line: Line): string {
     if (line.token_mask) {
@@ -318,19 +357,21 @@
 
   {#if scanned}
     <Card>
-      <h3>Blocked lines ({blocked.length})</h3>
-      {#if blocked.length === 0}
+      <h3>Blocked lines ({blockedTotal})</h3>
+      {#if blockedLoading && blocked.length === 0}
+        <p class="hint">Loading blocked lines…</p>
+      {:else if blockedTotal === 0 && !filterValues.search && (filterValues.facets[REASON_FACET] ?? "all") === "all"}
         <p class="hint">No blocked lines — every attributed line is ready.</p>
       {:else}
         <SearchFilterBar
           config={filterConfig}
           items={blocked}
           bind:values={filterValues}
-          shown={filteredBlocked.length}
-          total={blocked.length}
+          shown={blockedTotal}
+          total={counts?.blocked_lines ?? blockedTotal}
           label="blocked lines"
         />
-        {#if filteredBlocked.length === 0}
+        {#if blockedTotal === 0}
           <p class="hint">No blocked lines match the current filter.</p>
         {:else}
           <div class="table-wrap">
@@ -347,7 +388,7 @@
                 </tr>
               </thead>
               <tbody>
-                {#each pagedBlocked as line (line.id)}
+                {#each blocked as line (line.id)}
                   <tr>
                     <td class="mono">{line.strref}</td>
                     <td>{line.kind}</td>
@@ -372,7 +413,7 @@
           <Pager
             bind:page={blockedPage}
             pageSize={BLOCKED_PAGE_SIZE}
-            total={filteredBlocked.length}
+            total={blockedTotal}
             label="blocked lines"
           />
         {/if}

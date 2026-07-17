@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "$lib/utils/invoke";
+  import { invalidateGeneration } from "$lib/stores/results";
   import type { SynthesisWriteResult } from "$lib/types";
   import {
     findUnknownInlineTags,
@@ -71,6 +72,7 @@
         lineId,
         synthesisText: value,
       });
+      invalidateGeneration("synthesis", "critical");
       await onsaved?.(result, value);
     } catch (e) {
       error = String(e);
@@ -86,6 +88,7 @@
       const result = await invoke<SynthesisWriteResult>("clear_line_synthesis_override", {
         lineId,
       });
+      invalidateGeneration("synthesis", "critical");
       await oncleared?.(result);
     } catch (e) {
       error = String(e);

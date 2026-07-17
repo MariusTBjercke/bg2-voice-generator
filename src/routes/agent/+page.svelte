@@ -2,6 +2,19 @@
   import { get } from "svelte/store";
   import { invoke } from "$lib/utils/invoke";
   import { project } from "$lib/stores/project";
+  import { getInstallUiPreferences, updateInstallUiPreferences } from "$lib/stores/uiPreferences";
+  import {
+    beginReviewRequest,
+    ensureGameDir,
+    invalidateGeneration,
+    invalidateReview,
+    removeCachedReviewRow,
+    results,
+    reviewQuerySignature,
+    reviewRequestIsCurrent,
+    setReviewCache,
+    type ReviewTab,
+  } from "$lib/stores/results";
   import {
     ensureFiltersGameDir,
     filterCache,
@@ -15,7 +28,6 @@
     ListSynthesisReviewResult,
     SynthesisAgentResetResult,
     SynthesisCorpusAuditSummary,
-    SynthesisDecisionKind,
     SynthesisDecisionRow,
     SynthesisFlaggedRow,
     SynthesisPreview,
@@ -37,8 +49,6 @@
   const INVOKE_TIMEOUT_MS = 30_000;
   const SEARCH_DEBOUNCE_MS = 300;
   const FLAG_FACET = "flag";
-
-  type ReviewTab = SynthesisDecisionKind | "flagged" | "remaining";
 
   const ATTENTION_FLAG_OPTIONS: { value: string; label: string }[] = [
     { value: "stripped_unknown_cue", label: "unknown cues" },
@@ -98,6 +108,7 @@
   let actionNote = $state<string | null>(null);
   let editingLineId = $state<number | null>(null);
   let editPreviews = $state<Record<number, SynthesisPreview | "loading" | "error">>({});
+  let viewPreferencesDir = $state<string | null>(null);
   let searchDebounce: ReturnType<typeof setTimeout> | null = null;
   let skipFilterReload = false;
 
@@ -174,17 +185,25 @@
     auditLoading = true;
     error = null;
     auditError = null;
+    const summaryToken = beginReviewRequest("summary");
+    const auditToken = beginReviewRequest("audit");
     try {
-      const [nextSummary, nextAudit] = await Promise.all([
+      const [summaryResult, auditResult] = await Promise.allSettled([
         invoke<SynthesisTaggingSummary>("synthesis_tagging_summary", { gameDir: dir }),
         invoke<SynthesisCorpusAuditSummary>("synthesis_corpus_audit_summary", { gameDir: dir }),
       ]);
-      summary = nextSummary;
-      auditSummary = nextAudit;
-    } catch (e) {
-      const message = String(e);
-      error = message;
-      auditError = message;
+      if (summaryResult.status === "fulfilled" && reviewRequestIsCurrent(summaryToken)) {
+        summary = summaryResult.value;
+        setReviewCache({ summary }, summaryToken);
+      } else if (summaryResult.status === "rejected" && reviewRequestIsCurrent(summaryToken)) {
+        error = String(summaryResult.reason);
+      }
+      if (auditResult.status === "fulfilled" && reviewRequestIsCurrent(auditToken)) {
+        auditSummary = auditResult.value;
+        setReviewCache({ auditSummary }, auditToken);
+      } else if (auditResult.status === "rejected" && reviewRequestIsCurrent(auditToken)) {
+        auditError = String(auditResult.reason);
+      }
     } finally {
       if (showSpinner) loading = false;
       statsLoading = false;
@@ -194,8 +213,6 @@
 
   async function loadDecisions(resetPage = false) {
     if (!dir) {
-      decisionRows = [];
-      queueRows = [];
       decisionNextAfter = null;
       return;
     }
@@ -211,10 +228,9 @@
       decisionLoading = false;
       return;
     }
-    decisionRows = [];
-    queueRows = [];
     decisionLoading = true;
     decisionError = null;
+    const token = beginReviewRequest("queue");
     try {
       const query = serverQuery;
       const flag = serverFlag;
@@ -227,7 +243,9 @@
           query,
           flag,
         });
+        if (!reviewRequestIsCurrent(token)) return;
         queueRows = result.rows;
+        decisionRows = [];
         decisionNextAfter = result.next_after ?? null;
       } else if (decisionKind === "remaining") {
         const result = await invokeWithTimeout<ListSynthesisReviewResult>("list_synthesis_remaining", {
@@ -237,7 +255,9 @@
           query,
           flag,
         });
+        if (!reviewRequestIsCurrent(token)) return;
         queueRows = result.rows;
+        decisionRows = [];
         decisionNextAfter = result.next_after ?? null;
       } else {
         const result = await invokeWithTimeout<ListSynthesisDecisionsResult>("list_synthesis_decisions", {
@@ -247,16 +267,26 @@
           limit: PAGE_SIZE,
           query,
         });
+        if (!reviewRequestIsCurrent(token)) return;
         decisionRows = result.rows;
+        queueRows = [];
         decisionNextAfter = result.next_after ?? null;
       }
+      const cacheQuery = {
+        tab: decisionKind,
+        search: serverQuery ?? "",
+        flag: serverFlag ?? null,
+        after: decisionAfter,
+      };
+      setReviewCache({ page: {
+        signature: reviewQuerySignature(cacheQuery), query: cacheQuery,
+        decisionRows, queueRows, nextAfter: decisionNextAfter,
+        page: decisionPage, history: decisionHistory,
+      } }, token);
     } catch (e) {
-      decisionError = String(e);
-      decisionRows = [];
-      queueRows = [];
-      decisionNextAfter = null;
+      if (reviewRequestIsCurrent(token)) decisionError = String(e);
     } finally {
-      decisionLoading = false;
+      if (reviewRequestIsCurrent(token)) decisionLoading = false;
     }
   }
 
@@ -266,8 +296,7 @@
   }
 
   async function refreshAgentData(resetPage = false) {
-    await refreshAllStats();
-    await loadDecisions(resetPage);
+    await Promise.all([refreshAllStats(), loadDecisions(resetPage)]);
   }
 
   function selectKind(kind: ReviewTab) {
@@ -304,6 +333,8 @@
       decisionHistory = [...decisionHistory, decisionNextAfter];
     }
     decisionAfter = decisionHistory[decisionPage] ?? decisionNextAfter;
+    decisionRows = [];
+    queueRows = [];
     await loadDecisions();
   }
 
@@ -311,6 +342,8 @@
     if (decisionPage === 0) return;
     decisionPage -= 1;
     decisionAfter = decisionHistory[decisionPage] ?? 0;
+    decisionRows = [];
+    queueRows = [];
     await loadDecisions();
   }
 
@@ -325,6 +358,9 @@
       if (result.reset_generations > 0) {
         actionNote = `Cleared override; marked ${result.reset_generations} clip(s) as text changed (still playable).`;
       }
+      removeVisibleRow(lineId);
+      invalidateReview("summary", "audit", "queue");
+      invalidateGeneration("synthesis", "critical");
       await refreshAgentData();
     } catch (e) {
       decisionError = String(e);
@@ -340,6 +376,8 @@
     try {
       await invoke<void>("mark_synthesis_reviewed", { lineId });
       actionNote = "Current generation text accepted; the string is marked reviewed.";
+      removeVisibleRow(lineId);
+      invalidateReview("summary", "audit", "queue");
       await refreshAgentData();
     } catch (e) {
       decisionError = String(e);
@@ -349,18 +387,26 @@
   }
 
   async function editorSaved(result: SynthesisWriteResult) {
+    const lineId = editingLineId;
     editingLineId = null;
     actionNote = result.reset_generations > 0
       ? `Override saved; marked ${result.reset_generations} clip(s) as text changed (still playable).`
       : "Override saved.";
+    if (lineId !== null) removeVisibleRow(lineId);
+    invalidateReview("summary", "audit", "queue");
+    invalidateGeneration("synthesis", "critical");
     await refreshAgentData();
   }
 
   async function editorCleared(result: SynthesisWriteResult) {
+    const lineId = editingLineId;
     editingLineId = null;
     actionNote = result.reset_generations > 0
       ? `Override cleared; marked ${result.reset_generations} clip(s) as text changed (still playable).`
       : "Override cleared.";
+    if (lineId !== null) removeVisibleRow(lineId);
+    invalidateReview("summary", "audit", "queue");
+    invalidateGeneration("synthesis", "critical");
     await refreshAgentData();
   }
 
@@ -371,6 +417,8 @@
     try {
       await invoke<void>("unmark_synthesis_reviewed", { lineId });
       actionNote = "Review marker removed; string returns to the review queue.";
+      removeVisibleRow(lineId);
+      invalidateReview("summary", "audit", "queue");
       await refreshAgentData();
     } catch (e) {
       decisionError = String(e);
@@ -393,6 +441,8 @@
         gameDir: dir,
       });
       actionNote = `Auto-reviewed ${result.reviewed} plain line(s).`;
+      invalidateReview();
+      invalidateGeneration("synthesis", "critical");
       await refreshAgentData(true);
     } catch (e) {
       decisionError = String(e);
@@ -422,6 +472,8 @@
         `Reset complete: ${result.overrides_cleared} override(s), ` +
         `${result.reviews_cleared} review marker(s), ` +
         `${result.generations_reset} clip(s) marked text changed (still playable).`;
+      invalidateReview();
+      invalidateGeneration("synthesis", "critical");
       await refreshAgentData(true);
     } catch (e) {
       error = String(e);
@@ -475,11 +527,19 @@
     return preview.resolved_text;
   }
 
+  function removeVisibleRow(lineId: number) {
+    decisionRows = decisionRows.filter((row) => row.line_id !== lineId);
+    queueRows = queueRows.filter((row) => row.line_id !== lineId);
+    removeCachedReviewRow(lineId);
+  }
+
   let hydratedDir = $state<string | null>(null);
   $effect(() => {
     const gameDir = dir;
     if (!gameDir || hydratedDir === gameDir) return;
     hydratedDir = gameDir;
+    viewPreferencesDir = gameDir;
+    ensureGameDir(gameDir);
     ensureFiltersGameDir(gameDir);
     const saved = getSavedFilter(get(filterCache), "agent");
     skipFilterReload = true;
@@ -490,6 +550,29 @@
       };
     } else {
       filterValues = emptyValues(queueFilter);
+    }
+    decisionKind = getInstallUiPreferences(gameDir).reviewTab;
+    const cached = get(results).review;
+    summary = cached.summary;
+    auditSummary = cached.auditSummary;
+    if (cached.page) {
+      decisionKind = cached.page.query.tab;
+      const expected = reviewQuerySignature({
+        tab: decisionKind,
+        search: filterValues.search,
+        flag: (filterValues.facets[FLAG_FACET] ?? FACET_ALL) === FACET_ALL
+          ? null
+          : filterValues.facets[FLAG_FACET],
+        after: cached.page.query.after,
+      });
+      if (expected === cached.page.signature) {
+        decisionRows = cached.page.decisionRows;
+        queueRows = cached.page.queueRows;
+        decisionNextAfter = cached.page.nextAfter;
+        decisionAfter = cached.page.query.after;
+        decisionPage = cached.page.page;
+        decisionHistory = cached.page.history;
+      }
     }
     filtersHydrated = true;
     void refreshAgentData(true).finally(() => {
@@ -504,11 +587,20 @@
   });
 
   $effect(() => {
+    const gameDir = dir;
+    const tab = decisionKind;
+    if (!gameDir || viewPreferencesDir !== gameDir) return;
+    updateInstallUiPreferences(gameDir, (current) => ({ ...current, reviewTab: tab }));
+  });
+
+  $effect(() => {
     void filterValues.search;
     void JSON.stringify(filterValues.facets);
     if (!filtersHydrated || skipFilterReload || !dir) return;
     if (searchDebounce) clearTimeout(searchDebounce);
     searchDebounce = setTimeout(() => {
+      decisionRows = [];
+      queueRows = [];
       void loadDecisions(true);
     }, SEARCH_DEBOUNCE_MS);
     return () => {
@@ -665,16 +757,18 @@
       {/if}
       <ErrorNotice message={decisionError} />
 
+      {#if decisionLoading}
+        <p class="hint">Loading review queue…</p>
+      {/if}
+
       {#if reviewedDeferred}
         <p class="hint">
           This install has {summary?.reviewed ?? 0} reviewed strings. Loading the full list at
           once can be slow — open the first page when you need to browse or unmark entries.
         </p>
         <Button onclick={loadReviewedFirstPage}>Load first page</Button>
-      {:else if decisionLoading}
-        <p class="hint">Loading review queue…</p>
       {:else if decisionKind === "flagged" || decisionKind === "remaining"}
-        {#if queueRows.length === 0}
+        {#if queueRows.length === 0 && !decisionLoading}
           <p class="hint">
             {#if filtersActive}
               No strings match the current search on this page of the corpus.
@@ -729,7 +823,7 @@
             {/each}
           </ul>
         {/if}
-      {:else if decisionRows.length === 0}
+      {:else if decisionRows.length === 0 && !decisionLoading}
         <p class="hint">
           {#if filtersActive}
             No {decisionKind} entries match the current search.

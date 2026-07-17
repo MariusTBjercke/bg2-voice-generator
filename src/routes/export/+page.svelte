@@ -2,7 +2,8 @@
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
   import { invoke } from "$lib/utils/invoke";
   import { project } from "$lib/stores/project";
-  import { results, ensureGameDir, setExportResult } from "$lib/stores/results";
+  import { results, ensureGameDir, invalidateGeneration, setExportResult } from "$lib/stores/results";
+  import { getInstallUiPreferences, updateInstallUiPreferences } from "$lib/stores/uiPreferences";
   import Section from "$lib/components/Section.svelte";
   import Card from "$lib/components/Card.svelte";
   import Button from "$lib/components/Button.svelte";
@@ -10,6 +11,7 @@
   import ErrorNotice from "$lib/components/ErrorNotice.svelte";
   import ProgressBar from "$lib/components/ProgressBar.svelte";
   import { progress } from "$lib/stores/progress";
+  import { generationFocusHref } from "$lib/navigation/generationDeepLink";
   import type { CompletedGeneration, ExportResult } from "$lib/types";
 
   // Export: build a native WeiDU voice pack from the project's completed
@@ -32,6 +34,7 @@
   let error = $state<string | null>(null);
   let revealError = $state<string | null>(null);
   let voiceChangedCount = $state(0);
+  let preferencesDir = $state<string | null>(null);
 
   // The local `building` flag dies with the component on tab switch while the build
   // keeps running in the backend; OR in the surviving progress entry so a return to
@@ -42,7 +45,18 @@
   // shows a stale pack result.
   $effect(() => {
     ensureGameDir(dir);
+    if (dir && preferencesDir !== dir) {
+      preferencesDir = dir;
+      packName = getInstallUiPreferences(dir).exportPackName;
+    }
     void loadVoiceChangedCount(dir);
+  });
+
+  $effect(() => {
+    const gameDir = dir;
+    const name = packName;
+    if (!gameDir || preferencesDir !== gameDir) return;
+    updateInstallUiPreferences(gameDir, (current) => ({ ...current, exportPackName: name }));
   });
 
   async function loadVoiceChangedCount(gameDir: string | null) {
@@ -73,6 +87,7 @@
         packName: trimmed === "" ? undefined : trimmed,
       });
       setExportResult(result);
+      invalidateGeneration("critical");
     } catch (e) {
       error = String(e);
     } finally {
@@ -139,7 +154,10 @@
         <div class="warn-box" role="status">
           {voiceChangedCount} generated clip{voiceChangedCount === 1 ? " uses" : "s use"} an earlier
           speaker binding. Otherwise eligible clips will still be included in this export;
-          regenerate or remove them on the <a href="/generation">Generation</a> screen if needed.
+          regenerate or remove them on the
+          <a href={generationFocusHref("/generation", "voice_changed")}>Generation</a>
+          screen if needed. Clips on blocked/skipped lines also appear under
+          <a href={generationFocusHref("/generation", "orphans")}>blocked/skipped</a>.
         </div>
       {/if}
       <ErrorNotice message={error} />

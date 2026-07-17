@@ -1,7 +1,10 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { get } from "svelte/store";
   import { invoke } from "$lib/utils/invoke";
   import { project } from "$lib/stores/project";
+  import { invalidateGeneration, invalidateReview } from "$lib/stores/results";
+  import { uiPreferences, updateDictionaryUiPreferences } from "$lib/stores/uiPreferences";
   import Card from "./Card.svelte";
   import Button from "./Button.svelte";
   import ErrorNotice from "./ErrorNotice.svelte";
@@ -25,6 +28,7 @@
   let savedProfile = $state<PcProfile>("neutral");
   let values = $state<Record<string, string>>({});
   let savedValues = $state<Record<string, string>>({});
+  let preferencesHydrated = $state(false);
 
   const dirty = $derived(
     profile !== savedProfile ||
@@ -34,6 +38,8 @@
   );
 
   onMount(async () => {
+    showAdvanced = get(uiPreferences).dictionary.placeholderAdvancedOpen;
+    preferencesHydrated = true;
     try {
       const current =
         (await invoke<string | null>("get_setting", { key: KEY_PC_PROFILE })) ?? "neutral";
@@ -51,6 +57,12 @@
     } finally {
       loading = false;
     }
+  });
+
+  $effect(() => {
+    const open = showAdvanced;
+    if (!preferencesHydrated) return;
+    updateDictionaryUiPreferences((current) => ({ ...current, placeholderAdvancedOpen: open }));
   });
 
   function effective(spec: (typeof PLACEHOLDER_SPECS)[number]): string {
@@ -77,6 +89,8 @@
           gameDir: $project.gameDir,
         });
       }
+      invalidateGeneration("critical", "synthesis");
+      invalidateReview();
     } catch (cause) {
       error = String(cause);
     } finally {

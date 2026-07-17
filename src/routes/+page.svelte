@@ -3,6 +3,7 @@
   import { open } from "@tauri-apps/plugin-dialog";
   import { invoke } from "$lib/utils/invoke";
   import { project } from "$lib/stores/project";
+  import { getInstallUiPreferences, updateInstallUiPreferences } from "$lib/stores/uiPreferences";
   import Section from "$lib/components/Section.svelte";
   import Card from "$lib/components/Card.svelte";
   import Button from "$lib/components/Button.svelte";
@@ -12,8 +13,8 @@
 
   // Install setup: pick the game folder, persist it as the `game_dir` setting,
   // then read its languages. The active locale is held in the shared `project`
-  // store (the backend takes `locale` per-call on scan/harvest; there is no
-  // persisted locale setting), so downstream screens reuse it without re-asking.
+  // store and remembered as per-install UI state; the backend still takes locale
+  // per-call on scan/harvest and has no persisted `active_language` setting.
   const GAME_DIR_KEY = "game_dir";
 
   let gameDir = $state<string | null>(null);
@@ -25,6 +26,7 @@
   onMount(async () => {
     try {
       gameDir = (await invoke<string | null>("get_setting", { key: GAME_DIR_KEY })) ?? null;
+      if (gameDir) locale = getInstallUiPreferences(gameDir).locale;
     } catch (e) {
       error = String(e);
     }
@@ -49,6 +51,7 @@
       if (!locale || !langs.locales.includes(locale)) {
         locale = langs.active ?? langs.locales[0] ?? null;
       }
+      updateInstallUiPreferences(dir, (current) => ({ ...current, locale }));
     } catch (e) {
       error = String(e);
     } finally {
@@ -79,8 +82,13 @@
       return;
     }
     gameDir = dir;
-    locale = null; // reset so the new install's detected locale wins
+    locale = getInstallUiPreferences(dir).locale;
     await loadLanguages(dir);
+    syncStore();
+  }
+
+  function selectLocale() {
+    if (gameDir) updateInstallUiPreferences(gameDir, (current) => ({ ...current, locale }));
     syncStore();
   }
 </script>
@@ -120,7 +128,7 @@
       {:else}
         <label class="field">
           <span>Active language</span>
-          <select bind:value={locale} onchange={syncStore}>
+          <select bind:value={locale} onchange={selectLocale}>
             {#each languages.locales as loc (loc)}
               <option value={loc}>{loc}{loc === languages.active ? " (detected)" : ""}</option>
             {/each}

@@ -1,6 +1,13 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { get } from "svelte/store";
   import { invoke } from "$lib/utils/invoke";
+  import { invalidateGeneration, invalidateReview } from "$lib/stores/results";
+  import {
+    uiPreferences,
+    updateDictionaryUiPreferences,
+    type DictionaryTab,
+  } from "$lib/stores/uiPreferences";
   import Section from "$lib/components/Section.svelte";
   import Card from "$lib/components/Card.svelte";
   import Button from "$lib/components/Button.svelte";
@@ -16,9 +23,7 @@
     TagRuleWriteResult,
   } from "$lib/types";
 
-  type Tab = "placeholders" | "rules" | "tags";
-
-  let tab = $state<Tab>("placeholders");
+  let tab = $state<DictionaryTab>("placeholders");
   let rules = $state<DictionaryRule[]>([]);
   let tagRules = $state<TagRule[]>([]);
   let tagCatalog = $state<string[]>([]);
@@ -39,6 +44,7 @@
   let tagEditFind = $state("");
   let tagEditTag = $state("[dissatisfaction-hnn]");
   let tagEditMatch = $state<TagMatchKind>("whole_word");
+  let preferencesHydrated = $state(false);
 
   const enabledCount = $derived(rules.filter((rule) => rule.enabled).length);
   const tagEnabledCount = $derived(tagRules.filter((rule) => rule.enabled).length);
@@ -65,7 +71,27 @@
   );
 
   onMount(async () => {
+    const preferences = get(uiPreferences).dictionary;
+    tab = preferences.tab;
+    search = preferences.pronunciationSearch;
+    tagSearch = preferences.tagSearch;
+    testText = preferences.pronunciationTestText;
+    tagTestText = preferences.tagTestText;
+    preferencesHydrated = true;
     await Promise.all([loadRules(), loadTagRules()]);
+  });
+
+  $effect(() => {
+    const snapshot = { tab, search, tagSearch, testText, tagTestText };
+    if (!preferencesHydrated) return;
+    updateDictionaryUiPreferences((current) => ({
+      ...current,
+      tab: snapshot.tab,
+      pronunciationSearch: snapshot.search,
+      tagSearch: snapshot.tagSearch,
+      pronunciationTestText: snapshot.testText,
+      tagTestText: snapshot.tagTestText,
+    }));
   });
 
   async function loadRules() {
@@ -143,6 +169,11 @@
     return kind === "stage_cue" ? "stage cue" : "spoken word";
   }
 
+  function markTextMappingChanged() {
+    invalidateGeneration("critical", "synthesis");
+    invalidateReview();
+  }
+
   async function saveRule() {
     busy = true;
     error = null;
@@ -156,6 +187,7 @@
       });
       editingId = null;
       note = `Saved pronunciation rule. Marked ${result.reset_generations} clip(s) as text changed (still playable).`;
+      markTextMappingChanged();
       await loadRules();
       await testRules();
     } catch (cause) {
@@ -178,6 +210,7 @@
       });
       tagEditingId = null;
       note = `Saved tag rule. Marked ${result.reset_generations} clip(s) as text changed (still playable).`;
+      markTextMappingChanged();
       await loadTagRules();
       await testTagRules();
     } catch (cause) {
@@ -196,6 +229,7 @@
         enabled: !rule.enabled,
       });
       note = `${rule.enabled ? "Disabled" : "Enabled"} rule. Marked ${result.reset_generations} clip(s) as text changed (still playable).`;
+      markTextMappingChanged();
       await loadRules();
       await testRules();
     } catch (cause) {
@@ -214,6 +248,7 @@
         enabled: !rule.enabled,
       });
       note = `${rule.enabled ? "Disabled" : "Enabled"} tag rule. Marked ${result.reset_generations} clip(s) as text changed (still playable).`;
+      markTextMappingChanged();
       await loadTagRules();
       await testTagRules();
     } catch (cause) {
@@ -232,6 +267,7 @@
         id: rule.id,
       });
       note = `Deleted rule. Marked ${result.reset_generations} clip(s) as text changed (still playable).`;
+      markTextMappingChanged();
       await loadRules();
       await testRules();
     } catch (cause) {
@@ -248,6 +284,7 @@
     try {
       const result = await invoke<TagRuleWriteResult>("delete_tag_rule", { id: rule.id });
       note = `Deleted tag rule. Marked ${result.reset_generations} clip(s) as text changed (still playable).`;
+      markTextMappingChanged();
       await loadTagRules();
       await testTagRules();
     } catch (cause) {
@@ -263,6 +300,7 @@
     try {
       const result = await invoke<DictionaryWriteResult>("reset_dictionary_defaults");
       note = `Restored pronunciation defaults. Marked ${result.reset_generations} clip(s) as text changed (still playable).`;
+      markTextMappingChanged();
       await loadRules();
       await testRules();
     } catch (cause) {
@@ -278,6 +316,7 @@
     try {
       const result = await invoke<TagRuleWriteResult>("reset_tag_rule_defaults");
       note = `Restored tag-rule defaults. Marked ${result.reset_generations} clip(s) as text changed (still playable).`;
+      markTextMappingChanged();
       await loadTagRules();
       await testTagRules();
     } catch (cause) {

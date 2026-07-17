@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import type { DemographicGroup, EffectiveSpeakerBinding, Line, Speaker } from "$lib/types";
+import type { DemographicGroup, EffectiveSpeakerBinding, GeneratableLine, Speaker } from "$lib/types";
 import {
   activeGenerationScopeCount,
   emptyGenerationScope,
@@ -43,6 +43,7 @@ function makeSpeaker(id: number, name: string, race = 6): Speaker {
     dialogue_resref: `${name.toLocaleLowerCase()}dlg`,
     provenance_json: "{}",
     confidence: 1,
+    excluded: false,
   };
 }
 
@@ -50,8 +51,8 @@ function makeLine(
   id: number,
   speakerId: number,
   text: string,
-  extra: Partial<Line> = {},
-): Line {
+  extra: Partial<GeneratableLine> = {},
+): GeneratableLine {
   return {
     id,
     project_id: 1,
@@ -59,7 +60,6 @@ function makeLine(
     dlg_resref: id === 1 ? "xzardlg" : "montdlg",
     state_index: id,
     text,
-    original_text: text,
     flags: 0,
     existing_sound_resref: null,
     kind: "state",
@@ -83,6 +83,9 @@ function binding(speakerId: number, donorId: number, inherited: boolean): Effect
     clone_status: "ready",
     sample_id: speakerId,
     sample_path: `voice-${speakerId}.wav`,
+    voice_profile_id: null,
+    voice_profile_name: null,
+    voice_profile_origin: null,
     donor_speaker_id: donorId,
     donor_display_name: donorId === 1 ? "Xzar" : "Montaron",
     inherited,
@@ -96,7 +99,7 @@ function item(
   inherited: boolean,
   donorId: number,
   renderState: GenerationRenderState = "missing",
-  lineExtra: Partial<Line> = {},
+  lineExtra: Partial<GeneratableLine> = {},
 ): GenerationScopeItem {
   const speaker = makeSpeaker(id, name, id === 1 ? 6 : 5);
   return {
@@ -152,6 +155,23 @@ describe("generation scope", () => {
     expect(filterGenerationScope(rows, scoped({ lineStates: ["exported"] }))).toEqual([rows[1]]);
     expect(filterGenerationScope(rows, scoped({ packAudio: ["present"] }))).toEqual([rows[1]]);
     expect(filterGenerationScope(rows, scoped({ packAudio: ["absent"], dlgs: ["xzardlg"] }))).toEqual([rows[0]]);
+  });
+
+  test("matches blocked and skipped line states used for orphan clips", () => {
+    const blocked = item(4, "Keldorn", "There is no sin in it.", false, 4, "voice_changed", {
+      status: "blocked",
+      dlg_resref: "bkeldor",
+    });
+    const skipped = item(5, "HaerDalis", "<NO TEXT>", false, 5, "generated", {
+      status: "skipped",
+      dlg_resref: "haerda",
+    });
+    const mixed = [...rows, blocked, skipped];
+    expect(filterGenerationScope(mixed, scoped({ lineStates: ["blocked"] }))).toEqual([blocked]);
+    expect(filterGenerationScope(mixed, scoped({ lineStates: ["skipped"] }))).toEqual([skipped]);
+    expect(filterGenerationScope(mixed, scoped({ lineStates: ["blocked", "skipped"] })).map((r) => r.line.id)).toEqual([
+      4, 5,
+    ]);
   });
 
   test("applies inclusive text-length bounds and ignores invalid numeric bounds", () => {
