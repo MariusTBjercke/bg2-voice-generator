@@ -19,6 +19,10 @@ use crate::models::{LineKind, SharedResolution};
 /// needs. `clip_on_disk` is filled here from the stored `output_path` so the plan
 /// stays pure. Lines missing a speaker/clone still come back (with empty resref /
 /// `default` tier) so the plan can defer them explicitly.
+///
+/// `voice_changed` uses the same currency rules as
+/// [`crate::db::generation::completed_generations_for_project`]: profile id when
+/// the clone is profile-bound, otherwise primary sample id.
 pub fn list_export_candidates(
     conn: &Connection,
     project_id: i64,
@@ -31,8 +35,11 @@ pub fn list_export_candidates(
                 COALESCE(grp.resolution, 'reuse_same_voice'), \
                 CASE WHEN c.id IS NULL OR c.status != 'ready' \
                        OR g.render_settings_hash IS NULL \
-                       OR g.reference_sample_id IS NULL OR c.primary_sample_id IS NULL \
-                       OR g.reference_sample_id != c.primary_sample_id \
+                       OR (c.voice_profile_id IS NOT NULL AND \
+                           NOT (g.voice_profile_id_snapshot IS c.voice_profile_id)) \
+                       OR (c.voice_profile_id IS NULL AND (g.reference_sample_id IS NULL \
+                           OR c.primary_sample_id IS NULL \
+                           OR g.reference_sample_id != c.primary_sample_id)) \
                      THEN 1 ELSE 0 END, \
                 COALESCE(s.excluded, 0) \
          FROM generation g \
@@ -235,6 +242,82 @@ mod tests {
         assert!(cand.voice_changed);
         assert_eq!(cand.audio_source_path, "/ws/x.wav");
         assert!(!cand.clip_on_disk);
+    }
+
+    #[test]
+    fn profile_bound_clone_with_null_primary_is_not_voice_changed_when_snapshot_matches() {
+        // Matches Generation: profile id is the currency check; primary_sample_id may be NULL.
+        let c = db();
+        done_line(&c, 22570, "/ws/x.wav");
+        let sid: i64 = c.query_row("SELECT id FROM speaker LIMIT 1", [], |r| r.get(0)).unwrap();
+        c.execute(
+            "INSERT INTO voice_profile(project_id,display_name,origin,availability,created_at,updated_at) \
+             VALUES(1,'Pool','designed','available','now','now')",
+            [],
+        )
+        .unwrap();
+        let profile_id = c.last_insert_rowid();
+        c.execute(
+            "UPDATE clone SET primary_sample_id=NULL, voice_profile_id=?1, status='ready' \
+             WHERE speaker_id=?2",
+            params![profile_id, sid],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE generation SET voice_profile_id_snapshot=?1, reference_sample_id=NULL \
+             WHERE output_path='/ws/x.wav'",
+            params![profile_id],
+        )
+        .unwrap();
+
+        let cand = list_export_candidates(&c, 1).unwrap().pop().unwrap();
+        assert!(
+            !cand.voice_changed,
+            "current profile snapshot must not report voice_changed"
+        );
+    }
+
+    #[test]
+    fn profile_rebind_marks_export_candidate_voice_changed() {
+        let c = db();
+        done_line(&c, 22570, "/ws/x.wav");
+        let sid: i64 = c.query_row("SELECT id FROM speaker LIMIT 1", [], |r| r.get(0)).unwrap();
+        c.execute(
+            "INSERT INTO voice_profile(project_id,display_name,origin,availability,created_at,updated_at) \
+             VALUES(1,'Old','designed','available','now','now'), \
+                   (1,'New','designed','available','now','now')",
+            [],
+        )
+        .unwrap();
+        let old_profile: i64 = c
+            .query_row(
+                "SELECT id FROM voice_profile WHERE display_name='Old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let new_profile: i64 = c
+            .query_row(
+                "SELECT id FROM voice_profile WHERE display_name='New'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        c.execute(
+            "UPDATE clone SET primary_sample_id=NULL, voice_profile_id=?1, status='ready' \
+             WHERE speaker_id=?2",
+            params![new_profile, sid],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE generation SET voice_profile_id_snapshot=?1, reference_sample_id=NULL \
+             WHERE output_path='/ws/x.wav'",
+            params![old_profile],
+        )
+        .unwrap();
+
+        let cand = list_export_candidates(&c, 1).unwrap().pop().unwrap();
+        assert!(cand.voice_changed);
     }
 
     #[test]
