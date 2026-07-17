@@ -51,9 +51,14 @@ per-call** (there is no persisted `active_language` key). The **Dictionary** scr
 configures spoken stand-ins for dynamic TLK tokens (`<CHARNAME>`, `<PRO_HISHER>`, etc.) plus
 machine-wide generation-only pronunciation rules.
 **Attribution** scans CRE-owned DLGs plus companion banter/interjection DLGs from
-`interdia.2da` and prefix-matched side-chain companion DLGs (e.g. `jaheiraj.dlg`;
+`interdia.2da`, companion post/join DLGs from `pdialog.2da` (e.g. `yoshp.dlg`),
+and prefix-matched side-chain companion DLGs (e.g. `jaheiraj.dlg`;
 `scan_attribution` accepts optional `wipeDownstream` to reset
-harvest/bindings/generation). **Binding** pairs approved reference clips with speakers via
+harvest/bindings/generation). **Harvest** pulls reference clips from uniquely owned main
+CRE dialogue, the same companion DLG trees (quality-capped, text/duration gated), CRE
+sound slots, and an Attribution **gap-fill** for speakers with Ready lines but few
+automatic samples (uniquely attributed official VO only); re-running `harvest_references`
+is **additive** (keeps approvals/bindings, inserts only new sound resrefs). **Binding** pairs approved reference clips with speakers via
 per-speaker clones and/or demographic default pools (metadata binding). Transfer (`export_project` /
 `import_project`) moves project STATE only — it is **audio-free**; an import reports
 `needs_local_rescan` and the receiving machine rebuilds audio locally.
@@ -94,13 +99,14 @@ writing SQLite directly. Review markers and overrides are local and are not tran
 ## Code layout
 
 **Backend (`src-tauri/src/`).** `lib.rs` owns `AppState`, plugin registration, the SQLite
-bootstrap, and the full `invoke_handler` — the canonical registry of the **86 commands** the
+bootstrap, and the full `invoke_handler` — the canonical registry of the **106 commands** the
 backend exposes (add a command there or the UI can't reach it). `main.rs` is the thin binary
 entry. `error.rs` = `AppError` (serializes to a plain string). `models.rs` = the shared
 structs mirrored as TS, with the `contract_tests` anchor. `paths.rs` = portable-vs-dev
 `ToolLayout` resolution. `fingerprint/` = the install fingerprint.
 
-- `commands/` — thin Tauri wrappers that lock the DB mutex and delegate to the domain
+- `commands/` — thin Tauri wrappers that use the writer DB mutex or independent read-only
+  WAL connections and delegate to the domain
   modules: `startup` (`health_check`), `settings`, `extractor` (languages + TLK/DLG/CRE
   inspectors), `attribution`, `harvest`, `generate` (engine + `install_engine` + `bind_clone`
   + `generate_line` + `generate_lines_batched` + `assign_fallback_voices`),

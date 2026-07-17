@@ -96,7 +96,8 @@ reads from the one before it, so run them in sequence the first time.
 1. **Setup** (the landing screen). Click **Choose game folder…** and pick your BG2EE
    install (the folder with `chitin.key`, `override/`, and `lang/`). The choice is
    remembered across restarts. The app then lists the installed languages under `lang/`
-   and lets you pick the active locale; that locale is used for the scan/harvest calls.
+   and lets you pick the active locale; that per-install choice is also remembered and is
+   used for the scan/harvest calls.
    An invalid folder shows a friendly "no languages found" message.
 
 2. **Dictionary** (optional, but recommended before the first scan). The **Placeholders** tab
@@ -124,8 +125,15 @@ reads from the one before it, so run them in sequence the first time.
    when you want a clean slate.
 
 4. **Harvest & approve.** Click **Harvest references** to pull short clips of each
-   speaker's existing official audio (this step needs `ffmpeg`; a clear warning appears if
-   it's missing). The speaker list groups variant CREs into **identity groups** (e.g. every
+   speaker's existing official audio from uniquely owned main CRE dialogue, companion
+   banter/post/join/side dialogue (capped to the best usable clips per speaker), and
+   sound-slot barks (this step needs `ffmpeg`; a clear warning appears if it's missing).
+   Speakers who still have Ready lines but few automatic samples also get an Attribution
+   **gap-fill** pass (uniquely attributed official VO only, capped). Laughs, grunts, and
+   clips whose duration cannot match the TLK transcript are skipped.
+   **Re-harvest is additive**: existing samples, approvals, bindings, and voice-profile
+   links are kept; only newly discovered sound resrefs are decoded and saved as pending.
+   The speaker list groups variant CREs into **identity groups** (e.g. every
    `jahei*` form of Jaheira). Pick a group to see candidate samples with quality scores,
    press ▶ to audition a clip in-app, and **Approve** or **Reject** each one. Use
    **Auto-approve best for all speakers** (or the per-group **Approve best**) to accept
@@ -134,14 +142,22 @@ reads from the one before it, so run them in sequence the first time.
    pending samples (engine required). Long lists are paged and filterable; progress/cancel
    work as on Attribution.
 
-5. **Bind.** Set **demographic defaults** first: the app groups speakers by sex/race/category
-   and lets you build donor pools from speakers who already have approved samples. Use
-   **Auto-configure all** or **Suggest best donor** per group, then **Apply defaults** so
-   speakers without their own clip inherit a voice from their demographic pool. Optionally
-   use **Speaker overrides** to bind a specific approved sample per identity group
-   (**Bind** / **Auto-bind all**); a bind propagates to every variant in the group. A
-   demographic-only setup is complete and ready for generation; the screen shows
-   effective-voice readiness per group.
+5. **Bind.** The collapsible **Voice library** holds reusable, project-scoped voice
+   profiles. A profile may come from approved harvested game audio, one to four audio
+   files you import with exact manual transcripts, or a structured OmniVoice design
+   audition. Imported audio is copied and normalized locally. Voice design renders three
+   seeded candidates; saving one freezes that audition as local reference audio, so later
+   dialogue uses ordinary voice cloning and does not drift between lines.
+
+   Build demographic **Voice pools** from any mixture of harvested, imported, and designed
+   profiles, then **Apply defaults** for stable per-speaker distribution across each pool.
+   A personal profile or approved harvested sample overrides the pool and applies to the
+   full identity group. Profiles report their origin and local availability; audio-free
+   project imports mark imported/designed profiles as needing local audio or a fresh
+   audition. Use **Exclude from pack** on a character to keep Generate all/missing and
+   Export from voicing them (useful for mute companions). If they already have generated
+   clips, you are asked whether to delete those too; declining still excludes them from
+   packs while keeping the files for a later re-include.
 
 6. **Generate.** This is the only screen that uses the OmniVoice engine. On a fresh
    install the engine card shows **Install engine** — click it once to provision the local
@@ -160,7 +176,10 @@ reads from the one before it, so run them in sequence the first time.
    **Voice changed**. Dictionary / override / stand-in transcript drifts are marked
    **Text changed** the same way. Use **Re-generate voice-changed** or
    **Re-generate text-changed** within the current filter, or remove
-   individual/all-filtered generated clips when you do not want them in the pack. To reset a
+   individual/all-filtered generated clips when you do not want them in the pack.
+   Blocked or skipped lines that still have a clip also appear here (filter **Line
+   state → Blocked/Skipped**, or follow the Export warning links) so you can preview
+   or remove them — they are not included in **Re-generate all**. To reset a
    broken install, delete `engine-runtime/` (or rebuild the portable copy with
    `-CleanRuntime`) and install again. Generation is the GPU-heavy, model-dependent step;
    everything else works without it.
@@ -173,7 +192,7 @@ reads from the one before it, so run them in sequence the first time.
 
    Generation keeps the original TLK text for display/export, but prepares a separate
    OmniVoice transcript. The **stage-direction mapper** always converts supported cues
-   in place (`*sigh*` → `[sigh]`, laugh/gasp variants likewise). Cues without a model
+   in place (`*sigh*` → `[sigh]`, laugh/grin/gasp variants likewise). Cues without a model
    control, including `*sniff*` and `*breath*`, are stripped along with unknown `*...*`
    and game `[...]` annotations. Upgrading from a build that emitted unsupported
    `[sniff]` / `[breath]` tags automatically returns affected clips to pending and clears only
@@ -259,7 +278,8 @@ reads from the one before it, so run them in sequence the first time.
    manuscript while attaching the generated audio.
 
 8. **Transfer** (optional). Move a project between machines. **Export project…** writes an
-   audio-free `.zip` of the state (speakers/lines/decisions); **import** it on another
+   audio-free `.zip` of the state (speakers/lines/decisions plus voice-profile names,
+   recipes, transcripts, and harvested natural keys—but never profile audio or paths); **import** it on another
    install and the app tells you it `needs_local_rescan` — re-run Attribution → Harvest →
    Generate → Export there to rebuild the audio locally. No game audio is ever transferred.
 
@@ -296,10 +316,11 @@ The **Lines** total on the Attribution screen is **not** every spoken line in Ba
 Gate II. It is every **NPC dialogue state** the tool finds on the path CRE →
 `dialog_resref` → DLG actor state → TLK strref, **plus companion banter and
 interjections** from `interdia.2da` (e.g. `BJAHEIR.dlg` for Jaheira), **plus
-companion side-chain DLGs** whose resref shares the party prefix (e.g.
-`jaheiraj.dlg` for Jaheira's Harper line), in *your*
-install (mods included).
-Player choices, journal text, combat soundsets, post-dialogue files from
+companion post/join dialogue** from `pdialog.2da` (e.g. `YOSHP.dlg` /
+`YOSHJ.dlg` for party reform and in-party talk), **plus companion side-chain
+DLGs** whose resref shares a party prefix (e.g. `jaheiraj.dlg` for Jaheira's
+Harper line), in *your* install (mods included).
+Player choices, journal text, combat soundsets, dream scripts from
 `pdialog.2da`, and DLGs no creature or companion table points at are out of
 scope.
 
@@ -336,10 +357,10 @@ edge cases the tool deliberately does not auto-patch. Your totals will differ wi
 language, and Placeholder settings — always treat the Attribution counts as
 **install-specific**, and note the fingerprint/mod setup when sharing a pack.
 
-This is NPC conversation states plus companion banter/interjections from `interdia.2da`
-and companion side-chain DLGs (`jaheiraj`-style prefix orphans); it does not claim
-full voicing of player lines, journals, `pdialog.2da` post-dialogue, or
-barks.
+This is NPC conversation states plus companion banter/interjections from `interdia.2da`,
+companion post/join files from `pdialog.2da`, and companion side-chain DLGs
+(`jaheiraj`-style prefix orphans); it does not claim full voicing of player lines,
+journals, dream scripts, or barks.
 
 ## Troubleshooting
 
