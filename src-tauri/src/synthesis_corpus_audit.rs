@@ -229,10 +229,17 @@ mod tests {
 
     #[test]
     fn spoken_stage_direction_flags_unknown_sound_like_cues() {
-        let flags = audit_source_text("That is amusing. *grin*", true);
+        let flags = audit_source_text("That is amusing. *snarl*", true);
         assert!(flags.contains(&CorpusAuditFlag::SpokenStageDirection));
         assert!(needs_agent_attention(&flags));
         assert!(!flags.contains(&CorpusAuditFlag::MappedOk));
+    }
+
+    #[test]
+    fn mapped_grin_is_not_spoken_stage_direction() {
+        let flags = audit_source_text("That is amusing. *grin*", true);
+        assert!(!flags.contains(&CorpusAuditFlag::SpokenStageDirection));
+        assert_eq!(flags, vec![CorpusAuditFlag::MappedOk]);
     }
 
     #[test]

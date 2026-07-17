@@ -32,10 +32,13 @@ import type {
   Speaker,
   SpeakerGroup,
   SpeakerVariant,
+  SetSpeakerGroupExcludedResult,
   ReconcileGroupBindingsResult,
   Archetype,
   SharedStrrefGroup,
   Line,
+  GeneratableLine,
+  BlockedLinesPage,
   ReferenceSample,
   Clone,
   CloneReference,
@@ -100,7 +103,10 @@ import type {
   ListSynthesisReviewResult,
   AutoReviewPlainResult,
   ExportResult,
-  OperationProgress
+  OperationProgress,
+  DesignVoiceAttributes,
+  VoiceProfileReference,
+  VoiceProfile,
 } from './index';
 
 // Sorted runtime key set of a value (mirrors the Rust `keys` helper).
@@ -114,6 +120,12 @@ describe('TS<->Rust model contract (mirror of models.rs contract_tests)', () => 
   it('struct key sets match the Rust serde shapes', () => {
     expect(keys(s<HealthReport>({ app_version: '', db_path: '', schema_version: 0 })))
       .toEqual(want('app_version', 'db_path', 'schema_version'));
+    expect(keys(s<DesignVoiceAttributes>({ gender: 'female', age: 'young adult', pitch: 'high pitch', whisper: false, accent: null })))
+      .toEqual(want('gender', 'age', 'pitch', 'whisper', 'accent'));
+    expect(keys(s<VoiceProfileReference>({ id: 0, voice_profile_id: 0, reference_sample_id: null, managed_path: null, resolved_audio_path: null, source_strref: null, source_sound_resref: null, transcript: '', sort_order: 0, fingerprint: null })))
+      .toEqual(want('id', 'voice_profile_id', 'reference_sample_id', 'managed_path', 'resolved_audio_path', 'source_strref', 'source_sound_resref', 'transcript', 'sort_order', 'fingerprint'));
+    expect(keys(s<VoiceProfile>({ id: 0, project_id: 0, display_name: '', origin: 'imported', harvested_speaker_id: null, design: null, availability: 'available', reference_fingerprint: null, references: [], created_at: '', updated_at: '' })))
+      .toEqual(want('id', 'project_id', 'display_name', 'origin', 'harvested_speaker_id', 'design', 'availability', 'reference_fingerprint', 'references', 'created_at', 'updated_at'));
 
     expect(keys(s<GameLanguages>({ locales: [], active: null })))
       .toEqual(want('locales', 'active'));
@@ -149,12 +161,14 @@ describe('TS<->Rust model contract (mirror of models.rs contract_tests)', () => 
       .toEqual(want('id', 'game_root', 'edition', 'active_language', 'generator_version', 'created_at'));
     expect(keys(s<InstallFingerprint>({ id: 0, project_id: 0, edition_version: '', language: '', mod_state_hash: '', source_hashes_json: '', export_version: '', captured_at: '' })))
       .toEqual(want('id', 'project_id', 'edition_version', 'language', 'mod_state_hash', 'source_hashes_json', 'export_version', 'captured_at'));
-    expect(keys(s<Speaker>({ id: 0, project_id: 0, cre_resref: '', display_name: null, long_name_strref: null, sex: 0, race: 0, class: 0, kit: 0, alignment: 0, creature_category: 0, dialogue_resref: null, provenance_json: '', confidence: 0 })))
-      .toEqual(want('id', 'project_id', 'cre_resref', 'display_name', 'long_name_strref', 'sex', 'race', 'class', 'kit', 'alignment', 'creature_category', 'dialogue_resref', 'provenance_json', 'confidence'));
+    expect(keys(s<Speaker>({ id: 0, project_id: 0, cre_resref: '', display_name: null, long_name_strref: null, sex: 0, race: 0, class: 0, kit: 0, alignment: 0, creature_category: 0, dialogue_resref: null, provenance_json: '', confidence: 0, excluded: false })))
+      .toEqual(want('id', 'project_id', 'cre_resref', 'display_name', 'long_name_strref', 'sex', 'race', 'class', 'kit', 'alignment', 'creature_category', 'dialogue_resref', 'provenance_json', 'confidence', 'excluded'));
     expect(keys(s<SpeakerVariant>({ speaker_id: 0, cre_resref: '', line_count: 0, approved_sample_count: 0 })))
       .toEqual(want('speaker_id', 'cre_resref', 'line_count', 'approved_sample_count'));
-    expect(keys(s<SpeakerGroup>({ identity_key: '', display_name: '', long_name_strref: null, variant_count: 0, line_count: 0, approved_sample_count: 0, clone_status: null, binding_source: null, variants: [] })))
-      .toEqual(want('identity_key', 'display_name', 'long_name_strref', 'variant_count', 'line_count', 'approved_sample_count', 'clone_status', 'binding_source', 'variants'));
+    expect(keys(s<SpeakerGroup>({ identity_key: '', display_name: '', long_name_strref: null, variant_count: 0, line_count: 0, approved_sample_count: 0, approved_sound_count: 0, sample_count: 0, clone_status: null, binding_source: null, variants: [], excluded: false })))
+      .toEqual(want('identity_key', 'display_name', 'long_name_strref', 'variant_count', 'line_count', 'approved_sample_count', 'approved_sound_count', 'sample_count', 'clone_status', 'binding_source', 'variants', 'excluded'));
+    expect(keys(s<SetSpeakerGroupExcludedResult>({ speakers_updated: 0, generations_cleared: 0, files_deleted: 0 })))
+      .toEqual(want('speakers_updated', 'generations_cleared', 'files_deleted'));
     expect(keys(s<ReconcileGroupBindingsResult>({ groups_reconciled: 0, clones_propagated: 0, groups_skipped: 0 })))
       .toEqual(want('groups_reconciled', 'clones_propagated', 'groups_skipped'));
     expect(keys(s<Archetype>({ id: 0, name: '', tags_json: '' })))
@@ -163,10 +177,14 @@ describe('TS<->Rust model contract (mirror of models.rs contract_tests)', () => 
       .toEqual(want('id', 'strref', 'resolution'));
     expect(keys(s<Line>({ id: 0, project_id: 0, strref: 0, dlg_resref: null, state_index: null, text: '', original_text: '', flags: 0, existing_sound_resref: null, kind: 'state', is_voiced: false, has_tokens: false, token_mask: 0, shared_group_id: null, speaker_id: null, attribution_confidence: 0, status: 'pending' })))
       .toEqual(want('id', 'project_id', 'strref', 'dlg_resref', 'state_index', 'text', 'original_text', 'flags', 'existing_sound_resref', 'kind', 'is_voiced', 'has_tokens', 'token_mask', 'shared_group_id', 'speaker_id', 'attribution_confidence', 'status'));
+    expect(keys(s<GeneratableLine>({ id: 0, project_id: 0, strref: 0, dlg_resref: null, state_index: null, text: '', flags: 0, existing_sound_resref: null, kind: 'state', is_voiced: false, has_tokens: false, token_mask: 0, shared_group_id: null, speaker_id: null, attribution_confidence: 0, status: 'pending' })))
+      .toEqual(want('id', 'project_id', 'strref', 'dlg_resref', 'state_index', 'text', 'flags', 'existing_sound_resref', 'kind', 'is_voiced', 'has_tokens', 'token_mask', 'shared_group_id', 'speaker_id', 'attribution_confidence', 'status'));
+    expect(keys(s<BlockedLinesPage>({ rows: [], total: 0, token_total: 0 })))
+      .toEqual(want('rows', 'total', 'token_total'));
     expect(keys(s<ReferenceSample>({ id: 0, speaker_id: 0, source_strref: null, source_sound_resref: null, provenance_json: '', scores_json: '', decision: 'pending', local_derivative_path: null })))
       .toEqual(want('id', 'speaker_id', 'source_strref', 'source_sound_resref', 'provenance_json', 'scores_json', 'decision', 'local_derivative_path'));
-    expect(keys(s<Clone>({ id: 0, speaker_id: 0, primary_sample_id: null, binding_source: 'default', status: 'pending', render_settings_json: '' })))
-      .toEqual(want('id', 'speaker_id', 'primary_sample_id', 'binding_source', 'status', 'render_settings_json'));
+    expect(keys(s<Clone>({ id: 0, speaker_id: 0, primary_sample_id: null, voice_profile_id: null, binding_source: 'default', status: 'pending', render_settings_json: '' })))
+      .toEqual(want('id', 'speaker_id', 'primary_sample_id', 'voice_profile_id', 'binding_source', 'status', 'render_settings_json'));
     expect(keys(s<CloneReference>({ clone_id: 0, sample_id: 0, sort_order: 0 })))
       .toEqual(want('clone_id', 'sample_id', 'sort_order'));
     expect(keys(s<BindingPreview>({ output_path: '', reference: 'single', sample_ids: [], reference_duration_secs: 0, settings_fingerprint: '' })))
@@ -175,8 +193,8 @@ describe('TS<->Rust model contract (mirror of models.rs contract_tests)', () => 
       .toEqual(want('clone', 'references', 'reset_generations', 'files_deleted', 'files_missing'));
     expect(keys(s<CloneRenderSettingsUpdate>({ clone: {} as Clone, reset_generations: 0, files_deleted: 0, files_missing: 0 })))
       .toEqual(want('clone', 'reset_generations', 'files_deleted', 'files_missing'));
-    expect(keys(s<Generation>({ id: 0, line_id: 0, clone_id: null, reference_sample_id: null, binding_source_snapshot: null, status: 'pending', output_path: null, attempts: 0, resumable_state_json: '', render_settings_json: null, render_settings_hash: null, reference_fingerprint: null, diagnostics_json: null })))
-      .toEqual(want('id', 'line_id', 'clone_id', 'reference_sample_id', 'binding_source_snapshot', 'status', 'output_path', 'attempts', 'resumable_state_json', 'render_settings_json', 'render_settings_hash', 'reference_fingerprint', 'diagnostics_json'));
+    expect(keys(s<Generation>({ id: 0, line_id: 0, clone_id: null, voice_profile_id_snapshot: null, reference_sample_id: null, binding_source_snapshot: null, status: 'pending', output_path: null, attempts: 0, resumable_state_json: '', render_settings_json: null, render_settings_hash: null, reference_fingerprint: null, diagnostics_json: null })))
+      .toEqual(want('id', 'line_id', 'clone_id', 'voice_profile_id_snapshot', 'reference_sample_id', 'binding_source_snapshot', 'status', 'output_path', 'attempts', 'resumable_state_json', 'render_settings_json', 'render_settings_hash', 'reference_fingerprint', 'diagnostics_json'));
     expect(keys(s<LineRenderOverride>({ line_id: 0, settings: {}, resolved_settings: {} as OmniVoiceRenderSettings })))
       .toEqual(want('line_id', 'settings', 'resolved_settings'));
     expect(keys(s<RenderCandidate>({ line_id: 0, status: 'pending', output_path: null, text_snapshot: '', clone_id: 0, reference_sample_id: 0, reference_fingerprint: '', render_settings_json: '', render_settings_hash: '', state_json: '' })))
@@ -194,10 +212,10 @@ describe('TS<->Rust model contract (mirror of models.rs contract_tests)', () => 
       .toEqual(want('speakers', 'lines', 'ready_lines', 'blocked_lines', 'skipped_lines', 'shared_groups', 'deferred_groups', 'companion_lines_added', 'companion_dlgs_scanned', 'companion_rows_unmapped', 'companion_side_dlgs_scanned', 'companion_side_lines_added'));
     expect(keys(s<ReapplyTokenResult>({ updated: 0, newly_ready: 0, newly_blocked: 0, newly_skipped: 0, reset_generations: 0 })))
       .toEqual(want('updated', 'newly_ready', 'newly_blocked', 'newly_skipped', 'reset_generations'));
-    expect(keys(s<HarvestReport>({ speakers_with_sources: 0, candidates_seen: 0, samples_harvested: 0, decode_failures: 0, candidates_skipped: 0, automatic_samples: 0, manual_only_samples: 0, conflicting_aliases_skipped: 0, ffmpeg_missing: false })))
-      .toEqual(want('speakers_with_sources', 'candidates_seen', 'samples_harvested', 'decode_failures', 'candidates_skipped', 'automatic_samples', 'manual_only_samples', 'conflicting_aliases_skipped', 'ffmpeg_missing'));
-    expect(keys(s<HarvestPersistCounts>({ samples: 0, speakers: 0, unmatched: 0, decisions_preserved: 0, clones_invalidated: 0 })))
-      .toEqual(want('samples', 'speakers', 'unmatched', 'decisions_preserved', 'clones_invalidated'));
+    expect(keys(s<HarvestReport>({ speakers_with_sources: 0, candidates_seen: 0, samples_harvested: 0, decode_failures: 0, candidates_skipped: 0, candidates_already_present: 0, gap_fill_candidates: 0, gap_fill_samples: 0, automatic_samples: 0, manual_only_samples: 0, conflicting_aliases_skipped: 0, ffmpeg_missing: false })))
+      .toEqual(want('speakers_with_sources', 'candidates_seen', 'samples_harvested', 'decode_failures', 'candidates_skipped', 'candidates_already_present', 'gap_fill_candidates', 'gap_fill_samples', 'automatic_samples', 'manual_only_samples', 'conflicting_aliases_skipped', 'ffmpeg_missing'));
+    expect(keys(s<HarvestPersistCounts>({ samples: 0, speakers: 0, unmatched: 0, decisions_preserved: 0, clones_invalidated: 0, samples_added: 0, samples_skipped_existing: 0 })))
+      .toEqual(want('samples', 'speakers', 'unmatched', 'decisions_preserved', 'clones_invalidated', 'samples_added', 'samples_skipped_existing'));
     expect(keys(s<HarvestResult>({ report: {} as HarvestReport, persisted: {} as HarvestPersistCounts })))
       .toEqual(want('report', 'persisted'));
     expect(keys(s<AutoApproveResult>({ speakers_considered: 0, speakers_skipped: 0, samples_approved: 0, samples_rejected: 0 })))
@@ -214,12 +232,12 @@ describe('TS<->Rust model contract (mirror of models.rs contract_tests)', () => 
       .toEqual(want('speakers_assigned', 'speakers_failed', 'speakers_skipped', 'assignments'));
     expect(keys(s<DemographicGroup>({ sex: 0, race: 0, creature_category: 0, sex_label: '', race_label: '', creature_category_label: '', speaker_count: 0, line_count: 0, pool_size: 0, configured: false, unvoiced_count: 0, ready_clone_count: 0 })))
       .toEqual(want('sex', 'race', 'creature_category', 'sex_label', 'race_label', 'creature_category_label', 'speaker_count', 'line_count', 'pool_size', 'configured', 'unvoiced_count', 'ready_clone_count'));
-    expect(keys(s<MetadataBinding>({ sex: 0, race: 0, creature_category: 0, sex_label: '', race_label: '', creature_category_label: '', donor_speaker_ids: [] })))
-      .toEqual(want('sex', 'race', 'creature_category', 'sex_label', 'race_label', 'creature_category_label', 'donor_speaker_ids'));
-    expect(keys(s<EffectiveSpeakerBinding>({ speaker_id: 0, line_count: 0, clone_id: null, binding_source: null, clone_status: null, sample_id: null, sample_path: null, donor_speaker_id: null, donor_display_name: null, inherited: false })))
-      .toEqual(want('speaker_id', 'line_count', 'clone_id', 'binding_source', 'clone_status', 'sample_id', 'sample_path', 'donor_speaker_id', 'donor_display_name', 'inherited'));
-    expect(keys(s<MetadataAssignment>({ speaker_id: 0, donor_speaker_id: 0, matched_sex: false, matched_creature_category: false, matched_race: false, matched_class: false, from_pool: false })))
-      .toEqual(want('speaker_id', 'donor_speaker_id', 'matched_sex', 'matched_creature_category', 'matched_race', 'matched_class', 'from_pool'));
+    expect(keys(s<MetadataBinding>({ sex: 0, race: 0, creature_category: 0, sex_label: '', race_label: '', creature_category_label: '', donor_speaker_ids: [], voice_profile_ids: [] })))
+      .toEqual(want('sex', 'race', 'creature_category', 'sex_label', 'race_label', 'creature_category_label', 'donor_speaker_ids', 'voice_profile_ids'));
+    expect(keys(s<EffectiveSpeakerBinding>({ speaker_id: 0, line_count: 0, clone_id: null, binding_source: null, clone_status: null, sample_id: null, sample_path: null, voice_profile_id: null, voice_profile_name: null, voice_profile_origin: null, donor_speaker_id: null, donor_display_name: null, inherited: false })))
+      .toEqual(want('speaker_id', 'line_count', 'clone_id', 'binding_source', 'clone_status', 'sample_id', 'sample_path', 'voice_profile_id', 'voice_profile_name', 'voice_profile_origin', 'donor_speaker_id', 'donor_display_name', 'inherited'));
+    expect(keys(s<MetadataAssignment>({ speaker_id: 0, donor_speaker_id: 0, voice_profile_id: null, matched_sex: false, matched_creature_category: false, matched_race: false, matched_class: false, from_pool: false })))
+      .toEqual(want('speaker_id', 'donor_speaker_id', 'voice_profile_id', 'matched_sex', 'matched_creature_category', 'matched_race', 'matched_class', 'from_pool'));
     expect(keys(s<ApplyMetadataResult>({ speakers_pool_bound: 0, speakers_auto_bound: 0, speakers_failed: 0, speakers_skipped: 0, assignments: [] })))
       .toEqual(want('speakers_pool_bound', 'speakers_auto_bound', 'speakers_failed', 'speakers_skipped', 'assignments'));
     expect(keys(s<AutoConfigureMetadataPoolsResult>({ groups_configured: 0, groups_skipped_no_donor: 0, groups_skipped_already_set: 0 })))
@@ -230,9 +248,9 @@ describe('TS<->Rust model contract (mirror of models.rs contract_tests)', () => 
       .toEqual(want('origin', 'cre_resref', 'source_sound_resref', 'attribution_confidence', 'source_text', 'eligibility', 'shared_source_count'));
     expect(keys(s<SampleScore>({ overall: 0, provenance: 0, attribution: 0, duration: 0, loudness: 0, cleanliness: 0, naturalness: 0, pitch: 0, speech: 0, text_richness: 0, ordinary_speech: 0, duration_secs: 0 })))
       .toEqual(want('overall', 'provenance', 'attribution', 'duration', 'loudness', 'cleanliness', 'naturalness', 'pitch', 'speech', 'text_richness', 'ordinary_speech', 'duration_secs'));
-    expect(keys(s<EngineStatus>({ running: false, ready: false, base_url: '', model_id: null, load_error: null, owned: false, installed: false, device: null, cuda_name: null, fork: null })))
-      .toEqual(want('running', 'ready', 'base_url', 'model_id', 'load_error', 'owned', 'installed', 'device', 'cuda_name', 'fork'));
-    expect(keys(s<BindCloneResult>({ clone: { id: 0, speaker_id: 0, primary_sample_id: null, binding_source: 'default', status: 'ready', render_settings_json: '' }, reference_duration_secs: 0, duration_warning: null })))
+    expect(keys(s<EngineStatus>({ running: false, ready: false, base_url: '', model_id: null, load_error: null, owned: false, installed: false, device: null, cuda_name: null, fork: null, voice_design: false })))
+      .toEqual(want('running', 'ready', 'base_url', 'model_id', 'load_error', 'owned', 'installed', 'device', 'cuda_name', 'fork', 'voice_design'));
+    expect(keys(s<BindCloneResult>({ clone: { id: 0, speaker_id: 0, primary_sample_id: null, voice_profile_id: null, binding_source: 'default', status: 'ready', render_settings_json: '' }, reference_duration_secs: 0, duration_warning: null })))
       .toEqual(want('clone', 'reference_duration_secs', 'duration_warning'));
     expect(keys(s<LineResult>({ generation_id: 0, output_path: '', resumed: false })))
       .toEqual(want('generation_id', 'output_path', 'resumed'));

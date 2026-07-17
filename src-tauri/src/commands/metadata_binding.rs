@@ -23,6 +23,73 @@ use crate::generator::metadata_binding::{
 use crate::models::{BindingSource, CloneStatus, Speaker};
 use crate::AppState;
 
+fn binding_is_empty(conn: &rusqlite::Connection, binding_id: i64) -> Result<bool, AppError> {
+    Ok(crate::db::metadata_binding::profiles_for_binding(conn, binding_id)?.is_empty()
+        && crate::db::metadata_binding::donors_for_binding(conn, binding_id)?.is_empty())
+}
+
+fn compatibility_donor_id(
+    conn: &rusqlite::Connection,
+    profile: &crate::models::VoiceProfile,
+) -> Result<Option<i64>, AppError> {
+    let Some(speaker_id) = profile.harvested_speaker_id else {
+        return Ok(None);
+    };
+    Ok(Some(
+        bindable_donor_speaker_id(conn, profile.project_id, speaker_id)?.unwrap_or(speaker_id),
+    ))
+}
+
+fn add_profile_membership(
+    conn: &rusqlite::Connection,
+    binding_id: i64,
+    profile: &crate::models::VoiceProfile,
+) -> Result<(), AppError> {
+    crate::db::metadata_binding::add_profile(conn, binding_id, profile.id)?;
+    if let Some(speaker_id) = compatibility_donor_id(conn, profile)? {
+        add_donor(conn, binding_id, speaker_id)?;
+    }
+    Ok(())
+}
+
+fn remove_profile_membership(
+    conn: &rusqlite::Connection,
+    binding_id: i64,
+    profile: &crate::models::VoiceProfile,
+) -> Result<(), AppError> {
+    crate::db::metadata_binding::remove_profile(conn, binding_id, profile.id)?;
+    if let Some(speaker_id) = compatibility_donor_id(conn, profile)? {
+        let mut still_represented = false;
+        for remaining_id in crate::db::metadata_binding::profiles_for_binding(conn, binding_id)? {
+            let Some(remaining) = crate::db::voice_profiles::profile_by_id(conn, remaining_id)? else {
+                continue;
+            };
+            if compatibility_donor_id(conn, &remaining)? == Some(speaker_id) {
+                still_represented = true;
+                break;
+            }
+        }
+        if !still_represented {
+            remove_donor(conn, binding_id, speaker_id)?;
+        }
+    }
+    Ok(())
+}
+
+async fn run_db_read<T, F>(state: &AppState, work: F) -> Result<T, AppError>
+where
+    T: Send + 'static,
+    F: FnOnce(&rusqlite::Connection) -> Result<T, AppError> + Send + 'static,
+{
+    let path = state.db_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = crate::db::open_read_db(&path)?;
+        work(&conn)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("database read task failed: {e}")))?
+}
+
 fn project_id_for_game_dir(conn: &rusqlite::Connection, game_dir: &str) -> Result<Option<i64>, AppError> {
     conn.query_row(
         "SELECT id FROM project WHERE game_root=?1",
@@ -60,6 +127,7 @@ pub struct MetadataBinding {
     pub race_label: String,
     pub creature_category_label: String,
     pub donor_speaker_ids: Vec<i64>,
+    pub voice_profile_ids: Vec<i64>,
 }
 
 /// One metadata assignment detail for the UI.
@@ -67,6 +135,7 @@ pub struct MetadataBinding {
 pub struct MetadataAssignment {
     pub speaker_id: i64,
     pub donor_speaker_id: i64,
+    pub voice_profile_id: Option<i64>,
     pub matched_sex: bool,
     pub matched_creature_category: bool,
     pub matched_race: bool,
@@ -108,6 +177,9 @@ pub struct EffectiveSpeakerBinding {
     pub clone_status: Option<CloneStatus>,
     pub sample_id: Option<i64>,
     pub sample_path: Option<String>,
+    pub voice_profile_id: Option<i64>,
+    pub voice_profile_name: Option<String>,
+    pub voice_profile_origin: Option<crate::models::VoiceProfileOrigin>,
     pub donor_speaker_id: Option<i64>,
     pub donor_display_name: Option<String>,
     pub inherited: bool,
@@ -124,13 +196,15 @@ fn effective_bindings_for_project(
              WHERE project_id = ?1 AND speaker_id IS NOT NULL GROUP BY speaker_id \
          ) \
          SELECT s.id, COALESCE(lc.line_count, 0), c.id, c.binding_source, c.status, \
-                rs.id, rs.local_derivative_path, donor.id, \
-                COALESCE(donor.display_name, donor.cre_resref) \
+                rs.id, COALESCE(rs.local_derivative_path,vpr.managed_path), donor.id, \
+                COALESCE(donor.display_name, donor.cre_resref), vp.id, vp.display_name, vp.origin \
          FROM speaker s \
          LEFT JOIN line_counts lc ON lc.speaker_id = s.id \
          LEFT JOIN clone c ON c.speaker_id = s.id \
          LEFT JOIN reference_sample rs ON rs.id = c.primary_sample_id \
          LEFT JOIN speaker donor ON donor.id = rs.speaker_id \
+         LEFT JOIN voice_profile vp ON vp.id=c.voice_profile_id \
+         LEFT JOIN voice_profile_reference vpr ON vpr.voice_profile_id=vp.id AND vpr.sort_order=0 \
          WHERE s.project_id = ?1 AND (?2 IS NULL OR s.id = ?2) \
          ORDER BY COALESCE(s.display_name, s.cre_resref), s.id",
     )?;
@@ -145,6 +219,9 @@ fn effective_bindings_for_project(
                 clone_status: r.get(4)?,
                 sample_id: r.get(5)?,
                 sample_path: r.get(6)?,
+                voice_profile_id: r.get(9)?,
+                voice_profile_name: r.get(10)?,
+                voice_profile_origin: r.get(11)?,
                 donor_speaker_id: r.get(7)?,
                 donor_display_name: r.get(8)?,
                 inherited: binding_source == Some(BindingSource::Generic),
@@ -184,6 +261,7 @@ fn binding_from_row(maps: &DemographicLabelMaps, row: MetadataBindingRow) -> Met
         race_label,
         creature_category_label,
         donor_speaker_ids: row.donor_speaker_ids,
+        voice_profile_ids: row.voice_profile_ids,
     }
 }
 
@@ -193,13 +271,11 @@ pub async fn list_demographic_groups(
     state: State<'_, AppState>,
     game_dir: String,
 ) -> Result<Vec<DemographicGroup>, AppError> {
-    let rows = {
-        let conn = state.db.lock().await;
-        let Some(project_id) = project_id_for_game_dir(&conn, &game_dir)? else {
-            return Ok(Vec::new());
-        };
-        demographic_groups(&conn, project_id)?
-    };
+    let game_dir_for_db = game_dir.clone();
+    let rows = run_db_read(&state, move |conn| {
+        let Some(project_id) = project_id_for_game_dir(conn, &game_dir_for_db)? else { return Ok(Vec::new()); };
+        demographic_groups(conn, project_id)
+    }).await?;
     let maps = tokio::task::spawn_blocking(move || {
         DemographicLabelMaps::load(Path::new(&game_dir))
     })
@@ -214,13 +290,11 @@ pub async fn list_metadata_bindings(
     state: State<'_, AppState>,
     game_dir: String,
 ) -> Result<Vec<MetadataBinding>, AppError> {
-    let rows = {
-        let conn = state.db.lock().await;
-        let Some(project_id) = project_id_for_game_dir(&conn, &game_dir)? else {
-            return Ok(Vec::new());
-        };
-        metadata_bindings_for_project(&conn, project_id)?
-    };
+    let game_dir_for_db = game_dir.clone();
+    let rows = run_db_read(&state, move |conn| {
+        let Some(project_id) = project_id_for_game_dir(conn, &game_dir_for_db)? else { return Ok(Vec::new()); };
+        metadata_bindings_for_project(conn, project_id)
+    }).await?;
     let maps = tokio::task::spawn_blocking(move || {
         DemographicLabelMaps::load(Path::new(&game_dir))
     })
@@ -238,11 +312,10 @@ pub async fn list_effective_speaker_bindings(
     state: State<'_, AppState>,
     game_dir: String,
 ) -> Result<Vec<EffectiveSpeakerBinding>, AppError> {
-    let conn = state.db.lock().await;
-    let Some(project_id) = project_id_for_game_dir(&conn, &game_dir)? else {
-        return Ok(Vec::new());
-    };
-    effective_bindings_for_project(&conn, project_id, None)
+    run_db_read(&state, move |conn| {
+        let Some(project_id) = project_id_for_game_dir(conn, &game_dir)? else { return Ok(Vec::new()); };
+        effective_bindings_for_project(conn, project_id, None)
+    }).await
 }
 
 /// Remove a personal binding and restore the speaker's configured demographic
@@ -303,6 +376,10 @@ pub async fn add_metadata_donor(
     })?;
     let binding_id = ensure_binding(&conn, project_id, sex, race, creature_category)?;
     add_donor(&conn, binding_id, bindable)?;
+    let (sample_id, _) = crate::db::generation::approved_primary_sample(&conn, bindable)?
+        .ok_or_else(|| AppError::Other("donor lost its approved sample".into()))?;
+    let profile_id = crate::db::voice_profiles::ensure_harvested_profile(&conn, project_id, &[sample_id])?;
+    crate::db::metadata_binding::add_profile(&conn, binding_id, profile_id)?;
     Ok(())
 }
 
@@ -325,8 +402,61 @@ pub async fn remove_metadata_donor(
     }
     let binding_id = ensure_binding(&conn, project_id, sex, race, creature_category)?;
     remove_donor(&conn, binding_id, donor_speaker_id)?;
-    if donors_for_key(&conn, project_id, sex, race, creature_category)?.is_empty() {
+    let mut mirrored_profiles = Vec::new();
+    for profile_id in crate::db::metadata_binding::profiles_for_binding(&conn, binding_id)? {
+        let Some(profile) = crate::db::voice_profiles::profile_by_id(&conn, profile_id)? else {
+            continue;
+        };
+        if compatibility_donor_id(&conn, &profile)? == Some(donor_speaker_id) {
+            mirrored_profiles.push(profile_id);
+        }
+    }
+    for profile_id in mirrored_profiles {
+        crate::db::metadata_binding::remove_profile(&conn, binding_id, profile_id)?;
+    }
+    if binding_is_empty(&conn, binding_id)? {
         clear_binding(&conn, project_id, sex, race, creature_category)?;
+    }
+    Ok(())
+}
+
+/// Add any available reusable voice to a demographic pool.
+#[tauri::command]
+pub async fn add_metadata_profile(
+    state: State<'_, AppState>, game_dir: String, sex: i64, race: i64,
+    creature_category: i64, voice_profile_id: i64,
+) -> Result<(), AppError> {
+    let conn = state.db.lock().await;
+    let project_id = project_id_for_game_dir(&conn, &game_dir)?
+        .ok_or_else(|| AppError::Other("unknown game directory".into()))?;
+    let profile = crate::db::voice_profiles::profile_by_id(&conn, voice_profile_id)?
+        .filter(|profile| profile.project_id == project_id && profile.availability == crate::models::VoiceProfileAvailability::Available)
+        .ok_or_else(|| AppError::Other("voice profile is unavailable or outside this project".into()))?;
+    if profile.references.is_empty() { return Err(AppError::Other("voice profile has no local references".into())); }
+    let binding_id = ensure_binding(&conn, project_id, sex, race, creature_category)?;
+    add_profile_membership(&conn, binding_id, &profile)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn remove_metadata_profile(
+    state: State<'_, AppState>, game_dir: String, sex: i64, race: i64,
+    creature_category: i64, voice_profile_id: i64,
+) -> Result<(), AppError> {
+    let conn = state.db.lock().await;
+    let project_id = project_id_for_game_dir(&conn, &game_dir)?
+        .ok_or_else(|| AppError::Other("unknown game directory".into()))?;
+    if let Some(binding_id) = crate::db::metadata_binding::binding_id_for_key(
+        &conn, project_id, sex, race, creature_category,
+    )? {
+        if let Some(profile) = crate::db::voice_profiles::profile_by_id(&conn, voice_profile_id)?
+            .filter(|profile| profile.project_id == project_id)
+        {
+            remove_profile_membership(&conn, binding_id, &profile)?;
+        }
+        if binding_is_empty(&conn, binding_id)? {
+            clear_binding(&conn, project_id, sex, race, creature_category)?;
+        }
     }
     Ok(())
 }
@@ -483,6 +613,7 @@ pub async fn apply_metadata_bindings(
             .map(|a| MetadataAssignment {
                 speaker_id: a.speaker_id,
                 donor_speaker_id: a.donor_speaker_id,
+                voice_profile_id: a.voice_profile_id,
                 matched_sex: a.matched_sex,
                 matched_creature_category: a.matched_creature_category,
                 matched_race: a.matched_race,
@@ -542,5 +673,36 @@ mod tests {
         let unbound = rows.iter().find(|row| row.speaker_id == 3).unwrap();
         assert_eq!(unbound.clone_id, None);
         assert!(!unbound.inherited);
+    }
+
+    #[test]
+    fn harvested_profile_membership_keeps_compatibility_donor_in_sync() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        schema::run_migrations(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO project (game_root, edition, active_language, generator_version, created_at) \
+             VALUES ('r', 'BG2EE', 'en_US', '0.1.0', 'now')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO speaker (project_id, cre_resref, display_name) VALUES (1, 'donor', 'Donor')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO reference_sample (speaker_id, source_strref, source_sound_resref, provenance_json, decision, local_derivative_path) \
+             VALUES (1, 42, 'DONOR01', '{\"source_text\":\"Example.\"}', 'approved', 'donor.wav')",
+            [],
+        ).unwrap();
+        let profile_id = crate::db::voice_profiles::ensure_harvested_profile(&conn, 1, &[1]).unwrap();
+        let profile = crate::db::voice_profiles::profile_by_id(&conn, profile_id).unwrap().unwrap();
+        let binding_id = ensure_binding(&conn, 1, 1, 2, 3).unwrap();
+
+        add_profile_membership(&conn, binding_id, &profile).unwrap();
+        assert_eq!(crate::db::metadata_binding::profiles_for_binding(&conn, binding_id).unwrap(), vec![profile_id]);
+        assert_eq!(crate::db::metadata_binding::donors_for_binding(&conn, binding_id).unwrap(), vec![1]);
+
+        remove_profile_membership(&conn, binding_id, &profile).unwrap();
+        assert!(crate::db::metadata_binding::profiles_for_binding(&conn, binding_id).unwrap().is_empty());
+        assert!(crate::db::metadata_binding::donors_for_binding(&conn, binding_id).unwrap().is_empty());
     }
 }

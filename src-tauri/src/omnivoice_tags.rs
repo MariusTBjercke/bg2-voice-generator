@@ -204,6 +204,7 @@ mod tests {
         assert_eq!(stage_direction_to_tag("sigh sigh"), Some("[sigh]"));
         assert_eq!(stage_direction_to_tag("does does"), None);
         assert_eq!(stage_direction_to_tag("cackle"), Some("[laughter]"));
+        assert_eq!(stage_direction_to_tag("grin"), Some("[laughter]"));
         assert_eq!(stage_direction_to_tag("Achoo!"), None);
     }
 

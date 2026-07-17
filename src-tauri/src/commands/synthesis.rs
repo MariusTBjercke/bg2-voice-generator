@@ -11,6 +11,32 @@ use crate::models::{
 };
 use crate::AppState;
 
+async fn prepare_cached_project(
+    state: &AppState,
+    game_dir: &str,
+) -> Result<Option<i64>, AppError> {
+    let conn = state.db.lock().await;
+    let Some(project_id) = project_id(&conn, game_dir)? else {
+        return Ok(None);
+    };
+    crate::synthesis::ensure_corpus_cache(&conn, project_id, mapper_enabled())?;
+    Ok(Some(project_id))
+}
+
+async fn run_read<T, F>(state: &AppState, work: F) -> Result<T, AppError>
+where
+    T: Send + 'static,
+    F: FnOnce(&rusqlite::Connection) -> Result<T, AppError> + Send + 'static,
+{
+    let path = state.db_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = crate::db::open_read_db(&path)?;
+        work(&conn)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("database read task failed: {e}")))?
+}
+
 fn mapper_enabled() -> bool {
     true
 }
@@ -99,8 +125,7 @@ pub async fn synthesis_tagging_summary(
     state: State<'_, AppState>,
     game_dir: String,
 ) -> Result<SynthesisTaggingSummary, AppError> {
-    let conn = state.db.lock().await;
-    let Some(project_id) = project_id(&conn, &game_dir)? else {
+    let Some(project_id) = prepare_cached_project(&state, &game_dir).await? else {
         return Ok(SynthesisTaggingSummary {
             unique_strings: 0,
             overridden: 0,
@@ -109,7 +134,10 @@ pub async fn synthesis_tagging_summary(
             suspicious: 0,
         });
     };
-    crate::synthesis::tagging_summary(&conn, Some(project_id), mapper_enabled())
+    run_read(&state, move |conn| {
+        crate::synthesis::tagging_summary(conn, Some(project_id), mapper_enabled())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -121,22 +149,21 @@ pub async fn list_synthesis_decisions(
     limit: Option<usize>,
     query: Option<String>,
 ) -> Result<ListSynthesisDecisionsResult, AppError> {
-    let conn = state.db.lock().await;
-    let Some(project_id) = project_id(&conn, &game_dir)? else {
-        return Ok(ListSynthesisDecisionsResult {
-            rows: vec![],
-            next_after: None,
-        });
-    };
-    crate::synthesis::list_decisions(
-        &conn,
-        project_id,
-        kind,
-        after.unwrap_or(0),
-        limit.unwrap_or(50),
-        mapper_enabled(),
-        query.as_deref(),
-    )
+    run_read(&state, move |conn| {
+        let Some(project_id) = project_id(conn, &game_dir)? else {
+            return Ok(ListSynthesisDecisionsResult { rows: vec![], next_after: None });
+        };
+        crate::synthesis::list_decisions(
+            conn,
+            project_id,
+            kind,
+            after.unwrap_or(0),
+            limit.unwrap_or(50),
+            mapper_enabled(),
+            query.as_deref(),
+        )
+    })
+    .await
 }
 
 #[tauri::command]
@@ -160,8 +187,7 @@ pub async fn synthesis_corpus_audit_summary(
     state: State<'_, AppState>,
     game_dir: String,
 ) -> Result<SynthesisCorpusAuditSummary, AppError> {
-    let conn = state.db.lock().await;
-    let Some(project_id) = project_id(&conn, &game_dir)? else {
+    let Some(project_id) = prepare_cached_project(&state, &game_dir).await? else {
         return Ok(SynthesisCorpusAuditSummary {
             unique_strings: 0,
             plain_ok: 0,
@@ -177,7 +203,17 @@ pub async fn synthesis_corpus_audit_summary(
             stale_reviews_cleared: 0,
         });
     };
-    crate::synthesis::corpus_audit_summary(&conn, project_id, mapper_enabled())
+    // Reconciliation can delete stale review markers, so do that short write first.
+    let stale_reviews_cleared = {
+        let conn = state.db.lock().await;
+        crate::synthesis::reconcile_stale_reviews(&conn, project_id, mapper_enabled())?
+    };
+    let mut summary = run_read(&state, move |conn| {
+        crate::synthesis::corpus_audit_summary_readonly(conn, project_id)
+    })
+    .await?;
+    summary.stale_reviews_cleared = stale_reviews_cleared;
+    Ok(summary)
 }
 
 #[tauri::command]
@@ -190,23 +226,22 @@ pub async fn list_synthesis_flagged(
     query: Option<String>,
     flag: Option<String>,
 ) -> Result<ListSynthesisFlaggedResult, AppError> {
-    let conn = state.db.lock().await;
-    let Some(project_id) = project_id(&conn, &game_dir)? else {
-        return Ok(ListSynthesisFlaggedResult {
-            rows: vec![],
-            next_after: None,
-        });
-    };
-    crate::synthesis::list_flagged(
-        &conn,
-        project_id,
-        after.unwrap_or(0),
-        limit.unwrap_or(50),
-        mapper_enabled(),
-        undecided_only.unwrap_or(true),
-        query.as_deref(),
-        flag.as_deref(),
-    )
+    run_read(&state, move |conn| {
+        let Some(project_id) = project_id(conn, &game_dir)? else {
+            return Ok(ListSynthesisFlaggedResult { rows: vec![], next_after: None });
+        };
+        crate::synthesis::list_flagged(
+            conn,
+            project_id,
+            after.unwrap_or(0),
+            limit.unwrap_or(50),
+            mapper_enabled(),
+            undecided_only.unwrap_or(true),
+            query.as_deref(),
+            flag.as_deref(),
+        )
+    })
+    .await
 }
 
 #[tauri::command]
@@ -218,22 +253,21 @@ pub async fn list_synthesis_remaining(
     query: Option<String>,
     flag: Option<String>,
 ) -> Result<ListSynthesisReviewResult, AppError> {
-    let conn = state.db.lock().await;
-    let Some(project_id) = project_id(&conn, &game_dir)? else {
-        return Ok(ListSynthesisReviewResult {
-            rows: vec![],
-            next_after: None,
-        });
-    };
-    crate::synthesis::list_remaining(
-        &conn,
-        project_id,
-        after.unwrap_or(0),
-        limit.unwrap_or(50),
-        mapper_enabled(),
-        query.as_deref(),
-        flag.as_deref(),
-    )
+    run_read(&state, move |conn| {
+        let Some(project_id) = project_id(conn, &game_dir)? else {
+            return Ok(ListSynthesisReviewResult { rows: vec![], next_after: None });
+        };
+        crate::synthesis::list_remaining(
+            conn,
+            project_id,
+            after.unwrap_or(0),
+            limit.unwrap_or(50),
+            mapper_enabled(),
+            query.as_deref(),
+            flag.as_deref(),
+        )
+    })
+    .await
 }
 
 #[tauri::command]

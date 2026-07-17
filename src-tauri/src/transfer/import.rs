@@ -141,8 +141,8 @@ fn insert_bundle(
         let mut stmt = tx.prepare(
             "INSERT INTO speaker \
                 (project_id, cre_resref, display_name, long_name_strref, sex, race, class, kit, alignment, \
-                 creature_category, dialogue_resref, provenance_json, confidence) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 creature_category, dialogue_resref, provenance_json, confidence, excluded) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )?;
         for s in &bundle.speakers {
             stmt.execute(params![
@@ -159,6 +159,7 @@ fn insert_bundle(
                 s.dialogue_resref,
                 s.provenance_json,
                 s.confidence,
+                if s.excluded { 1i64 } else { 0 },
             ])?;
             speaker_ids.insert(s.cre_resref.clone(), tx.last_insert_rowid());
         }
@@ -212,8 +213,9 @@ fn insert_bundle(
 
     let lines = insert_lines(tx, project_id, bundle, &speaker_ids, &group_ids)?;
     let decisions = insert_sample_decisions(tx, bundle, &speaker_ids)?;
-    let clones = insert_clones(tx, bundle, &speaker_ids)?;
-    let _metadata_bindings = insert_metadata_bindings(tx, project_id, bundle, &speaker_ids)?;
+    let profile_ids = insert_voice_profiles(tx, project_id, bundle, &speaker_ids)?;
+    let clones = insert_clones(tx, bundle, &speaker_ids, &profile_ids)?;
+    let _metadata_bindings = insert_metadata_bindings(tx, project_id, bundle, &speaker_ids, &profile_ids)?;
 
     Ok(TransferImportResult {
         project_id,
@@ -223,6 +225,41 @@ fn insert_bundle(
         clones,
         needs_local_rescan: true,
     })
+}
+
+fn insert_voice_profiles(
+    tx: &rusqlite::Transaction, project_id: i64, bundle: &TransferBundle,
+    speaker_ids: &HashMap<String,i64>,
+) -> Result<HashMap<String,i64>, AppError> {
+    let mut ids = HashMap::new();
+    for profile in &bundle.voice_profiles {
+        let harvested_speaker_id = profile.harvested_speaker_cre_resref.as_ref().and_then(|key| speaker_ids.get(key)).copied();
+        // Audio-free imports are deliberately unavailable. Designed profiles must be
+        // auditioned again; imported profiles must be re-supplied locally.
+        tx.execute(
+            "INSERT INTO voice_profile(project_id,display_name,origin,harvested_speaker_id,design_spec_json,availability,created_at,updated_at) \
+             VALUES(?1,?2,?3,?4,?5,'missing_local_audio',?6,?6)",
+            params![project_id,profile.display_name,profile.origin,harvested_speaker_id,profile.design_spec_json,chrono::Utc::now().to_rfc3339()],
+        )?;
+        let profile_id = tx.last_insert_rowid();
+        ids.insert(profile.key.clone(), profile_id);
+        for reference in &profile.references {
+            let sample_id = if let Some(owner_key) = &reference.sample_speaker_cre_resref {
+                if let Some(owner) = speaker_ids.get(owner_key) {
+                    tx.query_row(
+                        "SELECT id FROM reference_sample WHERE speaker_id=?1 AND source_strref IS ?2 AND source_sound_resref IS ?3 ORDER BY id LIMIT 1",
+                        params![owner,reference.source_strref,reference.source_sound_resref], |r| r.get::<_,i64>(0),
+                    ).optional()?
+                } else { None }
+            } else { None };
+            tx.execute(
+                "INSERT INTO voice_profile_reference(voice_profile_id,reference_sample_id,managed_path,transcript,sort_order) \
+                 VALUES(?1,?2,NULL,?3,?4)",
+                params![profile_id,sample_id,reference.transcript,reference.sort_order],
+            )?;
+        }
+    }
+    Ok(ids)
 }
 
 fn insert_lines(
@@ -314,10 +351,11 @@ fn insert_clones(
     tx: &rusqlite::Transaction,
     bundle: &TransferBundle,
     speaker_ids: &HashMap<String, i64>,
+    profile_ids: &HashMap<String, i64>,
 ) -> Result<i64, AppError> {
     let mut stmt = tx.prepare(
-        "INSERT INTO clone (speaker_id, primary_sample_id, binding_source, status, \
-             render_settings_json) VALUES (?1, NULL, ?2, 'pending', ?3)",
+        "INSERT INTO clone (speaker_id, primary_sample_id,voice_profile_id, binding_source, status, \
+             render_settings_json) VALUES (?1, NULL, ?2, ?3, 'pending', ?4)",
     )?;
     let mut count = 0i64;
     for c in &bundle.clones {
@@ -326,7 +364,8 @@ fn insert_clones(
         };
         c.render_settings.validate().map_err(AppError::Other)?;
         let render_settings_json = serde_json::to_string(&c.render_settings)?;
-        stmt.execute(params![sid, c.binding_source, render_settings_json])?;
+        let profile_id = c.voice_profile_key.as_ref().and_then(|key| profile_ids.get(key)).copied();
+        stmt.execute(params![sid,profile_id, c.binding_source, render_settings_json])?;
         let clone_id = tx.last_insert_rowid();
         let project_id: i64 = tx.query_row(
             "SELECT project_id FROM speaker WHERE id=?1",
@@ -380,6 +419,7 @@ fn insert_metadata_bindings(
     project_id: i64,
     bundle: &TransferBundle,
     speaker_ids: &HashMap<String, i64>,
+    profile_ids: &HashMap<String, i64>,
 ) -> Result<i64, AppError> {
     use crate::db::metadata_binding::import_binding;
     let mut count = 0i64;
@@ -397,6 +437,15 @@ fn insert_metadata_bindings(
             b.creature_category,
             &donor_ids,
         )?;
+        if let Some(binding_id) = crate::db::metadata_binding::binding_id_for_key(
+            tx,project_id,b.sex,b.race,b.creature_category,
+        )? {
+            for key in &b.voice_profile_keys {
+                if let Some(profile_id) = profile_ids.get(key) {
+                    crate::db::metadata_binding::add_profile(tx,binding_id,*profile_id)?;
+                }
+            }
+        }
         count += 1;
     }
     Ok(count)
@@ -497,6 +546,17 @@ mod tests {
             ],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO voice_profile(project_id,display_name,origin,availability,reference_fingerprint,created_at,updated_at) \
+             VALUES(?1,'Imported narrator','imported','available','profile-fingerprint','now','now')",
+            [pid],
+        ).unwrap();
+        let imported_profile = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO voice_profile_reference(voice_profile_id,managed_path,transcript,sort_order,fingerprint) \
+             VALUES(?1,'C:\\private\\voices\\narrator.wav','The road goes ever on.',0,'reference-fingerprint')",
+            [imported_profile],
+        ).unwrap();
         pid
     }
 
@@ -516,7 +576,9 @@ mod tests {
                 && !project_json.contains("imoen02.wav")
                 && !project_json.contains("42.ogg")
                 && !project_json.contains("local_derivative")
-                && !project_json.contains("output_path"),
+                && !project_json.contains("output_path")
+                && !project_json.contains("narrator.wav")
+                && !project_json.contains("C:\\\\private"),
             "bundle must not carry any game-derived audio path: {project_json}"
         );
         assert!(project_json.contains("\"decision\": \"approved\""));
@@ -608,6 +670,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(generations, 0, "generated state/audio must not transfer");
+        let imported_profile: (String, String, Option<String>) = conn.query_row(
+            "SELECT vp.origin,vp.availability,vpr.managed_path FROM voice_profile vp \
+             JOIN voice_profile_reference vpr ON vpr.voice_profile_id=vp.id \
+             WHERE vp.project_id=?1 AND vp.display_name='Imported narrator'",
+            [result.project_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).unwrap();
+        assert_eq!(imported_profile, ("imported".into(),"missing_local_audio".into(),None));
 
         // A local re-harvest remaps the transferred natural-key membership onto
         // fresh local sample ids and paths; no source-machine path is needed.

@@ -26,6 +26,7 @@ pub struct MetadataBindingRow {
     pub race: i64,
     pub creature_category: i64,
     pub donor_speaker_ids: Vec<i64>,
+    pub voice_profile_ids: Vec<i64>,
 }
 
 /// List every distinct `(sex, race, creature_category)` in the project with counts.
@@ -55,11 +56,11 @@ pub fn demographic_groups(
              LEFT JOIN line l ON l.project_id = ?1 AND l.speaker_id = d.speaker_id \
              GROUP BY d.sex, d.race, d.creature_category \
          ), pool_counts AS ( \
-             SELECT mb.sex, mb.race, mb.creature_category, COUNT(*) AS pool_size \
-             FROM metadata_binding mb \
-             JOIN metadata_binding_donor mbd ON mbd.binding_id = mb.id \
-             WHERE mb.project_id = ?1 \
-             GROUP BY mb.sex, mb.race, mb.creature_category \
+             SELECT mb.sex, mb.race, mb.creature_category, \
+                    CASE WHEN EXISTS(SELECT 1 FROM metadata_binding_profile p WHERE p.binding_id=mb.id) \
+                         THEN (SELECT COUNT(*) FROM metadata_binding_profile p WHERE p.binding_id=mb.id) \
+                         ELSE (SELECT COUNT(*) FROM metadata_binding_donor d WHERE d.binding_id=mb.id) END AS pool_size \
+             FROM metadata_binding mb WHERE mb.project_id = ?1 \
          ), ready_counts AS ( \
              SELECT d.sex, d.race, d.creature_category, COUNT(c.id) AS ready_clone_count \
              FROM demo d \
@@ -119,9 +120,42 @@ pub fn metadata_bindings_for_project(
             race,
             creature_category,
             donor_speaker_ids: donors_for_binding(conn, id)?,
+            voice_profile_ids: profiles_for_binding(conn, id)?,
         });
     }
     Ok(out)
+}
+
+pub fn profiles_for_binding(conn: &Connection, binding_id: i64) -> Result<Vec<i64>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT voice_profile_id FROM metadata_binding_profile WHERE binding_id=?1 ORDER BY sort_order,voice_profile_id",
+    )?;
+    let rows = stmt.query_map([binding_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn profiles_for_key(
+    conn: &Connection, project_id: i64, sex: i64, race: i64, creature_category: i64,
+) -> Result<Vec<i64>, AppError> {
+    let Some(binding_id) = binding_id_for_key(conn, project_id, sex, race, creature_category)? else { return Ok(Vec::new()); };
+    profiles_for_binding(conn, binding_id)
+}
+
+pub fn add_profile(conn: &Connection, binding_id: i64, profile_id: i64) -> Result<bool, AppError> {
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO metadata_binding_profile(binding_id,voice_profile_id,sort_order) \
+         VALUES(?1,?2,COALESCE((SELECT MAX(sort_order)+1 FROM metadata_binding_profile WHERE binding_id=?1),0))",
+        params![binding_id,profile_id],
+    )?;
+    Ok(n > 0)
+}
+
+pub fn remove_profile(conn: &Connection, binding_id: i64, profile_id: i64) -> Result<bool, AppError> {
+    Ok(conn.execute(
+        "DELETE FROM metadata_binding_profile WHERE binding_id=?1 AND voice_profile_id=?2",
+        params![binding_id,profile_id],
+    )? > 0)
 }
 
 /// Donor speaker ids for one binding row.
@@ -450,6 +484,7 @@ pub fn metadata_apply_targets(
     let sql =
         "SELECT s.id, s.sex, s.race, s.class, s.creature_category FROM speaker s \
          WHERE s.project_id = ?1 \
+           AND s.excluded = 0 \
            AND NOT EXISTS ( \
                SELECT 1 FROM clone c WHERE c.speaker_id = s.id \
                  AND c.binding_source IN ('default', 'override')) \

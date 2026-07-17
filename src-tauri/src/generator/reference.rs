@@ -447,8 +447,8 @@ fn load_member_candidates(
     Ok(out)
 }
 
-/// Replace membership transactionally and invalidate only this clone's generations.
-/// The caller may remove the returned local output paths after commit.
+/// Replace membership transactionally and soft-invalidate this clone's done clips
+/// (clear their render-time sample snapshot). Paths are not returned for deletion.
 pub fn replace_members(
     conn: &mut Connection,
     clone_id: i64,
@@ -529,15 +529,6 @@ pub fn replace_members_with_binding(
         tx.commit()?;
         return Ok((members_for_clone(conn, clone_id)?, Vec::new()));
     }
-    let output_paths = {
-        let mut stmt = tx.prepare(
-            "SELECT output_path FROM generation WHERE clone_id=?1 AND output_path IS NOT NULL",
-        )?;
-        let rows = stmt
-            .query_map([clone_id], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows
-    };
     tx.execute("DELETE FROM clone_reference WHERE clone_id=?1", [clone_id])?;
     for (sort_order, sample_id) in ordered_sample_ids.iter().enumerate() {
         tx.execute(
@@ -555,15 +546,15 @@ pub fn replace_members_with_binding(
             params![clone_id, source],
         )?;
     }
+    // Soft-invalidate: keep done+path playable; clear the render-time sample
+    // snapshot so voice_changed reports stale until regenerated.
     tx.execute(
-        "UPDATE generation SET status='pending', resumable_state_json='{}', \
-             reference_sample_id=NULL, binding_source_snapshot=NULL, \
-             render_settings_json=NULL, render_settings_hash=NULL, reference_fingerprint=NULL \
-         WHERE clone_id=?1",
+        "UPDATE generation SET reference_sample_id=NULL \
+         WHERE clone_id=?1 AND status='done' AND output_path IS NOT NULL",
         [clone_id],
     )?;
     tx.commit()?;
-    Ok((members_for_clone(conn, clone_id)?, output_paths))
+    Ok((members_for_clone(conn, clone_id)?, Vec::new()))
 }
 
 #[cfg(test)]

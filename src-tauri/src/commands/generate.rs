@@ -31,7 +31,8 @@ use crate::db::generation::{
     render_settings_for_clone, set_clone_status, unvoiced_speakers, update_clone_render_settings,
     upsert_clone, write_line_render_override, mark_done,
 };
-use crate::db::queries::{line_from_row, LINE_COLUMNS};
+use crate::db::queries::{generatable_line_from_row, GENERATABLE_LINE_COLUMNS};
+use crate::models::GeneratableLine;
 use crate::error::AppError;
 use crate::extractor::{lang, tlk::Tlk};
 use crate::generator::batch::{generate_batch, plan_batches, resolve_limits, sort_jobs_by_text_length};
@@ -40,8 +41,8 @@ use crate::generator::fanout::{dedup_jobs, fanout_dest_paths, fanout_wav, DedupB
 use crate::generator::run::{candidate_output_path_for, generate_line as run_generate_line, output_path_for, LineJob, LineResult};
 use crate::models::{
     BindingPreview, BindingPreviewReference, BindingSource, Clone, CloneReferencesUpdate,
-    CloneRenderSettingsUpdate, CloneStatus, Line, OmniVoiceRenderSettings,
-    LineRenderOverride, LineRenderOverrideWriteResult, OmniVoiceRenderSettingsPatch,
+    CloneRenderSettingsUpdate, CloneStatus, OmniVoiceRenderSettings,
+    LineRenderOverride, LineRenderOverrideWriteResult, LineStatus, OmniVoiceRenderSettingsPatch,
     RenderCandidate, GenerationDiagnosticsRow,
 };
 use crate::tts::omnivoice::synthesize_to_file;
@@ -49,6 +50,20 @@ use crate::tts::{
     detect_gpu, resolve_gpu_choice, run_install, EngineStatus, GpuChoice, InstallStep,
 };
 use crate::AppState;
+
+async fn run_db_read<T, F>(state: &AppState, work: F) -> Result<T, AppError>
+where
+    T: Send + 'static,
+    F: FnOnce(&rusqlite::Connection) -> Result<T, AppError> + Send + 'static,
+{
+    let path = state.db_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = crate::db::open_read_db(&path)?;
+        work(&conn)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("database read task failed: {e}")))?
+}
 
 /// Probe the engine without spawning it.
 #[tauri::command]
@@ -174,7 +189,7 @@ pub struct BindCloneResult {
 /// With `sample_id` the named approved sample is bound as an explicit `override`;
 /// without it the best approved sample in the group is bound as the factual `default`.
 /// When `identity_key` is set, the clone is attached to the sample owner and
-/// propagated to every variant in that display group.
+/// propagated to every variant in that display group (same as `auto_bind_all`).
 #[tauri::command]
 pub async fn bind_clone(
     state: State<'_, AppState>,
@@ -184,10 +199,9 @@ pub async fn bind_clone(
     game_dir: Option<String>,
 ) -> Result<BindCloneResult, AppError> {
     let conn = state.db.lock().await;
+    let display_identity_key = identity_key;
     let mut pre_sample: Option<i64> = None;
-    let mut display_identity_key: Option<String> = None;
-    let mut speaker_id = if let Some(key) = identity_key {
-        display_identity_key = Some(key.clone());
+    let mut speaker_id = if let Some(ref key) = display_identity_key {
         let game_dir = game_dir
             .ok_or_else(|| AppError::Other("bind_clone with identity_key requires game_dir".into()))?;
         let project_id: i64 = conn
@@ -198,7 +212,7 @@ pub async fn bind_clone(
             )
             .map_err(|_| AppError::Other("unknown game directory".into()))?;
         let (sid, sid_sample, _path) =
-            crate::db::speaker_groups::best_approved_sample_in_group(&conn, project_id, &key)?
+            crate::db::speaker_groups::best_approved_sample_in_group(&conn, project_id, key)?
                 .ok_or_else(|| {
                     AppError::Other(format!(
                         "identity group {key} has no approved reference clip with a local derivative"
@@ -243,27 +257,26 @@ pub async fn bind_clone(
     };
     let validated = validate_file(Path::new(&derivative))?;
     let duration_warning = reference_duration_warning(validated.duration_secs);
-    let clone_id = upsert_clone(&conn, speaker_id, sample_id, source)?;
-    set_clone_status(&conn, clone_id, CloneStatus::Ready)?;
     let project_id: i64 = conn.query_row(
         "SELECT project_id FROM speaker WHERE id=?1",
         params![speaker_id],
         |row| row.get(0),
     )?;
-    if let Some(key) = display_identity_key.as_deref() {
+    let profile_id = crate::db::voice_profiles::ensure_harvested_profile(
+        &conn, project_id, &[sample_id],
+    )?;
+    crate::db::voice_profiles::bind_profile_to_group(
+        &conn, project_id, speaker_id, profile_id, source,
+    )?;
+    // Display groups (same long-name strref) list every variant's samples as
+    // interchangeable picks. Operational identity keeps non-companion CREs
+    // separate, so bind_profile_to_group alone only updates the sample owner —
+    // propagate so Binding's representative clone / bound badge stay in sync.
+    if let Some(ref key) = display_identity_key {
         crate::db::speaker_groups::propagate_clone_to_identity_key(
             &conn,
             project_id,
             key,
-            speaker_id,
-            sample_id,
-            source,
-            CloneStatus::Ready,
-        )?;
-    } else {
-        crate::db::speaker_groups::propagate_clone_to_group(
-            &conn,
-            project_id,
             speaker_id,
             sample_id,
             source,
@@ -325,6 +338,10 @@ pub async fn auto_bind_all(
     let mut result = AutoBindResult::default();
     let display_groups = crate::db::speaker_groups::list_speaker_groups(&conn, project_id)?;
     for group in display_groups {
+        if group.excluded {
+            result.speakers_skipped += group.variant_count as usize;
+            continue;
+        }
         let identity_key = group.identity_key;
         let member_ids = crate::db::speaker_groups::speaker_ids_in_group(
             &conn,
@@ -374,6 +391,7 @@ pub async fn auto_bind_all(
         };
 
         let mut already_consistent = true;
+        let mut shared_profile: Option<Option<i64>> = None;
         for member_id in &member_ids {
             let Some(existing) = clone_for_speaker(&conn, *member_id)? else {
                 already_consistent = false;
@@ -385,6 +403,14 @@ pub async fn auto_bind_all(
             {
                 already_consistent = false;
                 break;
+            }
+            match shared_profile {
+                None => shared_profile = Some(existing.voice_profile_id),
+                Some(profile) if profile != existing.voice_profile_id => {
+                    already_consistent = false;
+                    break;
+                }
+                Some(_) => {}
             }
         }
         if already_consistent {
@@ -559,18 +585,12 @@ pub async fn list_clones(
     state: State<'_, AppState>,
     game_dir: String,
 ) -> Result<Vec<Clone>, AppError> {
-    let conn = state.db.lock().await;
-    let project_id: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM project WHERE game_root=?1",
-            params![game_dir],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let Some(project_id) = project_id else {
-        return Ok(Vec::new());
-    };
-    clones_for_project(&conn, project_id)
+    run_db_read(&state, move |conn| {
+        let project_id: Option<i64> = conn
+            .query_row("SELECT id FROM project WHERE game_root=?1", params![game_dir], |r| r.get(0))
+            .optional()?;
+        project_id.map(|id| clones_for_project(conn, id)).transpose().map(|v| v.unwrap_or_default())
+    }).await
 }
 
 /// Read one clone's validated, default-resolved OmniVoice settings.
@@ -585,17 +605,17 @@ pub async fn get_clone_render_settings(
     render_settings_for_clone(&clone)
 }
 
-/// Save clone settings, reset only generations rendered with that clone id, then
-/// best-effort remove only their canonical project-local output files.
+/// Save clone settings and soft-invalidate only generations rendered with that
+/// clone id. Done clips stay playable and surface as voice-changed until regen.
 #[tauri::command]
 pub async fn set_clone_render_settings(
     state: State<'_, AppState>,
     clone_id: i64,
     settings: OmniVoiceRenderSettings,
 ) -> Result<CloneRenderSettingsUpdate, AppError> {
-    let (change, generated_dir) = {
+    let change = {
         let mut conn = state.db.lock().await;
-        let project_id: i64 = conn
+        let _: i64 = conn
             .query_row(
                 "SELECT s.project_id FROM clone c JOIN speaker s ON s.id=c.speaker_id \
                  WHERE c.id=?1",
@@ -604,31 +624,27 @@ pub async fn set_clone_render_settings(
             )
             .optional()?
             .ok_or_else(|| AppError::Other(format!("no clone with id {clone_id}")))?;
-        let generated_dir = workspace_dir(&state.db_path, project_id).join("generated");
-        let change = update_clone_render_settings(&mut conn, clone_id, &settings)?;
-        (change, generated_dir)
+        update_clone_render_settings(&mut conn, clone_id, &settings)?
     };
 
-    let (files_deleted, files_missing) =
-        remove_invalidated_clone_outputs(&generated_dir, &change.output_paths);
     Ok(CloneRenderSettingsUpdate {
         clone: change.clone,
         reset_generations: change.reset_generations,
-        files_deleted,
-        files_missing,
+        files_deleted: 0,
+        files_missing: 0,
     })
 }
 
 /// Persist an explicitly selected one-to-four sample reference set. This is the
-/// destructive half of the binding preview workflow: preview never calls it. The
-/// DB transition commits before canonical local outputs are removed.
+/// adoption half of the binding preview workflow: preview never calls it. Done
+/// clips stay playable and surface as voice-changed until regenerated.
 #[tauri::command]
 pub async fn set_clone_references(
     state: State<'_, AppState>,
     clone_id: i64,
     sample_ids: Vec<i64>,
 ) -> Result<CloneReferencesUpdate, AppError> {
-    let (clone, references, reset_generations, output_paths, generated_dir) = {
+    let (clone, references, reset_generations) = {
         let mut conn = state.db.lock().await;
         let project_id: i64 = conn
             .query_row(
@@ -646,26 +662,15 @@ pub async fn set_clone_references(
         let changed = existing != sample_ids;
         let reset_generations = if changed {
             conn.query_row(
-                "SELECT COUNT(*) FROM generation WHERE clone_id=?1",
+                "SELECT COUNT(*) FROM generation \
+                 WHERE clone_id=?1 AND status='done' AND output_path IS NOT NULL",
                 [clone_id],
                 |row| row.get::<_, i64>(0),
             )? as usize
         } else {
             0
         };
-        let output_paths = if changed {
-            let mut stmt = conn.prepare(
-                "SELECT line_id, output_path FROM generation \
-                 WHERE clone_id=?1 AND output_path IS NOT NULL",
-            )?;
-            let rows = stmt
-                .query_map([clone_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<rusqlite::Result<Vec<(i64, String)>>>()?;
-            rows
-        } else {
-            Vec::new()
-        };
-        let (references, _stored_paths) =
+        let (references, _paths) =
             crate::generator::reference::replace_members_with_binding(
                 &mut conn,
                 clone_id,
@@ -690,22 +695,14 @@ pub async fn set_clone_references(
                 Path::new(&derivative),
             )?;
         }
-        (
-            clone,
-            references,
-            reset_generations,
-            output_paths,
-            workspace_dir(&state.db_path, project_id).join("generated"),
-        )
+        (clone, references, reset_generations)
     };
-    let (files_deleted, files_missing) =
-        remove_invalidated_clone_outputs(&generated_dir, &output_paths);
     Ok(CloneReferencesUpdate {
         clone,
         references,
         reset_generations,
-        files_deleted,
-        files_missing,
+        files_deleted: 0,
+        files_missing: 0,
     })
 }
 
@@ -798,18 +795,44 @@ fn resolve_binding_preview_reference(
     sample_id: Option<i64>,
 ) -> Result<crate::generator::reference::ResolvedReference, AppError> {
     match reference {
+        // Match generation: profile-bound clones (imported/designed/harvested
+        // profiles) resolve through the voice-profile path. Falling through to
+        // harvest membership fails for imported/designed clones whose
+        // primary_sample_id is NULL.
         BindingPreviewReference::Current => {
-            crate::generator::reference::resolve_for_generation(conn, clone, workspace, |id| {
-                reference_of(conn, id)
-            })
+            if let Some(profile_id) = clone.voice_profile_id {
+                crate::db::voice_profiles::resolve_for_generation(conn, profile_id, workspace)
+            } else {
+                crate::generator::reference::resolve_for_generation(conn, clone, workspace, |id| {
+                    reference_of(conn, id)
+                })
+            }
         }
         BindingPreviewReference::Single => {
-            let sample_id = sample_id.or(clone.primary_sample_id).ok_or_else(|| {
-                AppError::Other("bound clone has no primary reference sample".into())
-            })?;
-            ensure_preview_sample_belongs_to_clone(conn, clone, sample_id)?;
-            let (path, transcript) = reference_of(conn, sample_id)?;
-            crate::generator::reference::resolve_single_reference(sample_id, path, transcript)
+            if let Some(sample_id) = sample_id {
+                ensure_preview_sample_belongs_to_clone(conn, clone, sample_id)?;
+                let (path, transcript) = reference_of(conn, sample_id)?;
+                return crate::generator::reference::resolve_single_reference(
+                    sample_id, path, transcript,
+                );
+            }
+            if let Some(primary) = clone.primary_sample_id {
+                ensure_preview_sample_belongs_to_clone(conn, clone, primary)?;
+                let (path, transcript) = reference_of(conn, primary)?;
+                return crate::generator::reference::resolve_single_reference(
+                    primary, path, transcript,
+                );
+            }
+            // Imported/designed profiles have no harvest primary; "bound primary"
+            // means the profile's frozen prompt.
+            if let Some(profile_id) = clone.voice_profile_id {
+                return crate::db::voice_profiles::resolve_for_generation(
+                    conn, profile_id, workspace,
+                );
+            }
+            Err(AppError::Other(
+                "bound clone has no primary reference sample".into(),
+            ))
         }
         BindingPreviewReference::Composite => {
             let selection = crate::generator::reference::propose_composite_for_clone(
@@ -831,6 +854,11 @@ fn ensure_preview_sample_belongs_to_clone(
     clone: &Clone,
     sample_id: i64,
 ) -> Result<(), AppError> {
+    // Already bound on this clone (may be a display-group sibling after
+    // auto_bind / bind_clone propagation).
+    if clone.primary_sample_id == Some(sample_id) {
+        return Ok(());
+    }
     let owner: i64 = conn
         .query_row(
             "SELECT speaker_id FROM reference_sample WHERE id=?1 AND decision='approved' \
@@ -854,14 +882,29 @@ fn ensure_preview_sample_belongs_to_clone(
         [owner],
         |row| row.get(0),
     )?;
-    let clone_key = crate::db::speaker_groups::identity_key_for_speaker(conn, clone.speaker_id)?;
-    let owner_key = crate::db::speaker_groups::identity_key_for_speaker(conn, owner)?;
-    if clone_project != owner_project || clone_key != owner_key {
+    if clone_project != owner_project {
         return Err(AppError::Other(format!(
             "sample {sample_id} is outside the clone's identity group"
         )));
     }
-    Ok(())
+    let clone_key = crate::db::speaker_groups::identity_key_for_speaker(conn, clone.speaker_id)?;
+    let owner_key = crate::db::speaker_groups::identity_key_for_speaker(conn, owner)?;
+    if clone_key == owner_key {
+        return Ok(());
+    }
+    // Binding lists every CRE in a display-name group; allow those sibling clips.
+    let clone_display = crate::db::speaker_groups::display_identity_key_for_speaker(
+        conn,
+        clone.speaker_id,
+    )?;
+    let owner_display =
+        crate::db::speaker_groups::display_identity_key_for_speaker(conn, owner)?;
+    if clone_display == owner_display {
+        return Ok(());
+    }
+    Err(AppError::Other(format!(
+        "sample {sample_id} is outside the clone's identity group"
+    )))
 }
 
 static BINDING_PREVIEW_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -904,29 +947,6 @@ fn cleanup_old_binding_previews(dir: &Path) {
             let _ = std::fs::remove_file(path);
         }
     }
-}
-
-/// Delete only canonical `<workspace>/generated/<line_id>.ogg` paths returned by
-/// the committed DB invalidation. Unexpected/stale paths are left untouched.
-fn remove_invalidated_clone_outputs(
-    generated_dir: &Path,
-    output_paths: &[(i64, String)],
-) -> (usize, usize) {
-    let mut files_deleted = 0usize;
-    let mut files_missing = 0usize;
-    for (line_id, stored) in output_paths {
-        let expected = generated_dir.join(format!("{line_id}.ogg"));
-        let stored = PathBuf::from(stored);
-        if stored != expected || !stored.exists() {
-            files_missing += 1;
-            continue;
-        }
-        match std::fs::remove_file(&stored) {
-            Ok(()) => files_deleted += 1,
-            Err(_) => files_missing += 1,
-        }
-    }
-    (files_deleted, files_missing)
 }
 
 /// Generate ONE line, resumably: skips a line already produced on disk, otherwise
@@ -1036,9 +1056,10 @@ pub async fn list_render_candidates(
     state: State<'_, AppState>,
     game_dir: String,
 ) -> Result<Vec<RenderCandidate>, AppError> {
-    let conn = state.db.lock().await;
-    let project_id: Option<i64> = conn.query_row("SELECT id FROM project WHERE game_root=?1", [game_dir], |r| r.get(0)).optional()?;
-    project_id.map(|id| candidates_for_project(&conn, id)).transpose().map(|v| v.unwrap_or_default())
+    run_db_read(&state, move |conn| {
+        let project_id: Option<i64> = conn.query_row("SELECT id FROM project WHERE game_root=?1", [game_dir], |r| r.get(0)).optional()?;
+        project_id.map(|id| candidates_for_project(conn, id)).transpose().map(|v| v.unwrap_or_default())
+    }).await
 }
 
 /// Render a separate local candidate. The accepted `generation` row and its Ogg are
@@ -1570,20 +1591,13 @@ async fn ensure_engine_ready(state: &AppState) -> Result<(), AppError> {
 pub async fn list_generatable_lines(
     state: State<'_, AppState>,
     game_dir: String,
-) -> Result<Vec<Line>, AppError> {
-    use rusqlite::OptionalExtension;
-    let conn = state.db.lock().await;
-    let project_id: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM project WHERE game_root=?1",
-            params![game_dir],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let Some(project_id) = project_id else {
-        return Ok(Vec::new());
-    };
-    generatable_lines(&conn, project_id)
+) -> Result<Vec<GeneratableLine>, AppError> {
+    run_db_read(&state, move |conn| {
+        let project_id: Option<i64> = conn
+            .query_row("SELECT id FROM project WHERE game_root=?1", params![game_dir], |r| r.get(0))
+            .optional()?;
+        project_id.map(|id| generatable_lines(conn, id)).transpose().map(|v| v.unwrap_or_default())
+    }).await
 }
 
 /// A line that already has a rendered clip on disk, mirrored as `CompletedGeneration`
@@ -1616,7 +1630,6 @@ pub async fn list_completed_generations(
     state: State<'_, AppState>,
     game_dir: String,
 ) -> Result<Vec<CompletedGeneration>, AppError> {
-    use rusqlite::OptionalExtension;
     let conn = state.db.lock().await;
     let project_id: Option<i64> = conn
         .query_row(
@@ -1630,19 +1643,28 @@ pub async fn list_completed_generations(
     };
     let workspace = workspace_dir(&state.db_path, project_id);
     let _ = recover_orphaned_generation_files(&conn, project_id, &workspace)?;
-    let rows = completed_generations_for_project(&conn, project_id)?;
-    Ok(rows
-        .into_iter()
-        .filter(|(_, path, _, _)| Path::new(path).exists())
-        .map(
-            |(line_id, output_path, voice_changed, text_changed)| CompletedGeneration {
+    drop(conn);
+    let generated_dir = workspace.join("generated");
+    run_db_read(&state, move |read_conn| {
+        let rows = completed_generations_for_project(read_conn, project_id)?;
+        let existing = std::fs::read_dir(&generated_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect::<std::collections::HashSet<_>>();
+        Ok(rows
+            .into_iter()
+            .filter(|(_, path, _, _)| existing.contains(Path::new(path)))
+            .map(|(line_id, output_path, voice_changed, text_changed)| CompletedGeneration {
                 line_id,
                 output_path,
                 voice_changed,
                 text_changed,
-            },
-        )
-        .collect())
+            })
+            .collect())
+    })
+    .await
 }
 
 /// Local diagnostics for completed clips. Legacy clips simply have no row until
@@ -1652,9 +1674,10 @@ pub async fn list_generation_diagnostics(
     state: State<'_, AppState>,
     game_dir: String,
 ) -> Result<Vec<GenerationDiagnosticsRow>, AppError> {
-    let conn = state.db.lock().await;
-    let project_id: Option<i64> = conn.query_row("SELECT id FROM project WHERE game_root=?1", [game_dir], |r| r.get(0)).optional()?;
-    project_id.map(|id| crate::db::generation::generation_diagnostics_for_project(&conn, id)).transpose().map(|v| v.unwrap_or_default())
+    run_db_read(&state, move |conn| {
+        let project_id: Option<i64> = conn.query_row("SELECT id FROM project WHERE game_root=?1", [game_dir], |r| r.get(0)).optional()?;
+        project_id.map(|id| crate::db::generation::generation_diagnostics_for_project(conn, id)).transpose().map(|v| v.unwrap_or_default())
+    }).await
 }
 
 /// Remove selected generated clips and their resume records. Only the canonical
@@ -1717,27 +1740,41 @@ pub async fn remove_generations(
     Ok(result)
 }
 
-/// Query the project's `ready`/`exported` lines that either have a ready current
-/// clone or a saved completed clip. The latter keeps voice-changed audio visible for
-/// preview/removal even when its binding has been cleared. Kept separate so it is
-/// unit-testable without a Tauri `State`.
+/// Query the project's generation-screen lines: `ready`/`exported` rows that either
+/// have a ready clone or a saved completed clip, plus `blocked`/`skipped` rows that
+/// still carry a playable clip. The latter keeps orphaned audio visible for
+/// preview/removal after attribution moves a line off the regeneratable set (Export
+/// still counts those clips; without this they are invisible on Generation).
+/// Kept separate so it is unit-testable without a Tauri `State`.
 fn generatable_lines(
     conn: &rusqlite::Connection,
     project_id: i64,
-) -> Result<Vec<Line>, AppError> {
+) -> Result<Vec<GeneratableLine>, AppError> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT {LINE_COLUMNS} FROM line \
-         WHERE project_id=?1 AND status IN ('ready', 'exported') \
-         AND (speaker_id IN (SELECT speaker_id FROM clone WHERE status='ready') \
-              OR id IN (SELECT line_id FROM generation WHERE status='done')) \
+        "SELECT {GENERATABLE_LINE_COLUMNS} FROM line \
+         WHERE project_id=?1 \
+         AND speaker_id IN (SELECT id FROM speaker WHERE excluded = 0) \
+         AND ( \
+           (status IN ('ready', 'exported') \
+            AND (speaker_id IN (SELECT speaker_id FROM clone WHERE status='ready') \
+                 OR id IN (SELECT line_id FROM generation WHERE status='done'))) \
+           OR (status IN ('blocked', 'skipped') \
+               AND id IN (SELECT line_id FROM generation \
+                          WHERE status='done' AND output_path IS NOT NULL)) \
+         ) \
          ORDER BY dlg_resref, state_index"
     ))?;
     let rows = stmt
-        .query_map(params![project_id], line_from_row)?
+        .query_map(params![project_id], generatable_line_from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows
         .into_iter()
-        .filter(|line| crate::extractor::spoken_text::has_speakable_dialogue(&line.text))
+        // Ready/exported rows still require speakable dialogue. Blocked/skipped
+        // orphans keep non-speakable text (e.g. `<NO TEXT>`) so Remove clip works.
+        .filter(|line| {
+            matches!(line.status, LineStatus::Blocked | LineStatus::Skipped)
+                || crate::extractor::spoken_text::has_speakable_dialogue(&line.text)
+        })
         .collect())
 }
 
@@ -1767,6 +1804,20 @@ fn resolve_job(
     let speaker_id = speaker_id
         .ok_or_else(|| AppError::Other(format!("line {line_id} has no attributed speaker")))?;
 
+    let speaker_excluded: bool = conn
+        .query_row(
+            "SELECT excluded FROM speaker WHERE id = ?1",
+            params![speaker_id],
+            |r| Ok(r.get::<_, i64>(0)? != 0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if speaker_excluded {
+        return Err(AppError::Other(format!(
+            "speaker {speaker_id} is excluded from generate/export"
+        )));
+    }
+
     let reps = crate::extractor::token_resolve::read_token_replacements(conn)?;
     let text = crate::extractor::token_resolve::effective_spoken_text(
         &original_text,
@@ -1775,6 +1826,7 @@ fn resolve_job(
     );
     if text != stored_text {
         conn.execute("UPDATE line SET text=?2 WHERE id=?1", params![line_id, &text])?;
+        crate::synthesis::invalidate_corpus_cache(conn, Some(project_id))?;
         conn.execute(
             "UPDATE generation SET status='pending', output_path=NULL \
              WHERE line_id=?1 AND status IN ('done', 'running')",
@@ -1799,12 +1851,16 @@ fn resolve_job(
     }
 
     let workspace = workspace_dir(db_path, project_id);
-    let resolved_reference = crate::generator::reference::resolve_for_generation(
-        conn,
-        &clone,
-        &workspace,
-        |sample_id| reference_of(conn, sample_id),
-    )?;
+    let resolved_reference = if let Some(profile_id) = clone.voice_profile_id {
+        crate::db::voice_profiles::resolve_for_generation(conn, profile_id, &workspace)?
+    } else {
+        crate::generator::reference::resolve_for_generation(
+            conn,
+            &clone,
+            &workspace,
+            |sample_id| reference_of(conn, sample_id),
+        )?
+    };
 
     let spoken = crate::synthesis::resolve_synthesis_text(conn, &text, true)?.text;
     if !crate::extractor::spoken_text::has_speakable_content(&spoken) {
@@ -1824,6 +1880,7 @@ fn resolve_job(
     let job = LineJob {
         line_id,
         clone_id: clone.id,
+        voice_profile_id: clone.voice_profile_id,
         reference_sample_id: resolved_reference.primary_sample_id,
         binding_source: clone.binding_source,
         text: spoken,
@@ -1996,7 +2053,7 @@ mod tests {
         let want = insert_line(&conn, pid, 1, Some(ready_spk), "ready");
         // Excluded: ready line whose speaker's clone is not ready.
         insert_line(&conn, pid, 2, Some(pending_spk), "ready");
-        // Excluded: blocked line even though the speaker's clone is ready.
+        // Excluded: blocked line with no completed clip (even with a ready clone).
         insert_line(&conn, pid, 3, Some(ready_spk), "blocked");
         // Excluded: ready line with no attributed speaker (and thus no clone).
         insert_line(&conn, pid, 4, None, "ready");
@@ -2010,12 +2067,74 @@ mod tests {
     }
 
     #[test]
+    fn generatable_lines_include_blocked_and_skipped_with_done_clips() {
+        let conn = mem_db();
+        let pid = insert_project(&conn);
+        let spk = insert_speaker(&conn, pid, "IMOEN");
+        insert_clone(&conn, spk, "ready");
+
+        let ready = insert_line(&conn, pid, 1, Some(spk), "ready");
+        let blocked = insert_line(&conn, pid, 2, Some(spk), "blocked");
+        let skipped = insert_line(&conn, pid, 3, Some(spk), "skipped");
+        // Blocked without a clip stays off the Generation list.
+        insert_line(&conn, pid, 4, Some(spk), "blocked");
+
+        conn.execute(
+            "INSERT INTO generation (line_id, status, output_path) VALUES (?1, 'done', '/ws/blocked.ogg')",
+            params![blocked],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO generation (line_id, status, output_path) VALUES (?1, 'done', '/ws/skipped.ogg')",
+            params![skipped],
+        )
+        .unwrap();
+        // Non-speakable skipped text must still surface when a clip exists.
+        conn.execute(
+            "UPDATE line SET text='<NO TEXT>' WHERE id=?1",
+            params![skipped],
+        )
+        .unwrap();
+
+        let lines = generatable_lines(&conn, pid).unwrap();
+        let mut ids: Vec<i64> = lines.iter().map(|l| l.id).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![ready, blocked, skipped],
+            "orphaned blocked/skipped clips stay visible for preview/removal"
+        );
+        let skipped_row = lines.iter().find(|l| l.id == skipped).unwrap();
+        assert_eq!(skipped_row.text, "<NO TEXT>");
+        assert_eq!(skipped_row.status, LineStatus::Skipped);
+    }
+
+    #[test]
     fn generatable_lines_empty_when_no_ready_clone() {
         let conn = mem_db();
         let pid = insert_project(&conn);
         let spk = insert_speaker(&conn, pid, "IMOEN");
         insert_line(&conn, pid, 1, Some(spk), "ready");
         assert!(generatable_lines(&conn, pid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn generatable_lines_omit_excluded_speakers() {
+        let conn = mem_db();
+        let pid = insert_project(&conn);
+        let kept = insert_speaker(&conn, pid, "IMOEN");
+        let excluded = insert_speaker(&conn, pid, "BEAR");
+        insert_clone(&conn, kept, "ready");
+        insert_clone(&conn, excluded, "ready");
+        conn.execute(
+            "UPDATE speaker SET excluded=1 WHERE id=?1",
+            params![excluded],
+        )
+        .unwrap();
+        let want = insert_line(&conn, pid, 1, Some(kept), "ready");
+        insert_line(&conn, pid, 2, Some(excluded), "ready");
+        let lines = generatable_lines(&conn, pid).unwrap();
+        assert_eq!(lines.iter().map(|l| l.id).collect::<Vec<_>>(), vec![want]);
     }
 
     #[test]
@@ -2088,27 +2207,6 @@ mod tests {
     }
 
     #[test]
-    fn invalidated_output_cleanup_deletes_only_canonical_project_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let generated = dir.path().join("generated");
-        std::fs::create_dir_all(&generated).unwrap();
-        let canonical = generated.join("7.ogg");
-        let outside = dir.path().join("outside.ogg");
-        std::fs::write(&canonical, b"generated").unwrap();
-        std::fs::write(&outside, b"user file").unwrap();
-
-        let paths = vec![
-            (7, canonical.to_string_lossy().to_string()),
-            (8, outside.to_string_lossy().to_string()),
-            (9, generated.join("9.ogg").to_string_lossy().to_string()),
-        ];
-        let (deleted, missing) = remove_invalidated_clone_outputs(&generated, &paths);
-        assert_eq!((deleted, missing), (1, 2));
-        assert!(!canonical.exists());
-        assert!(outside.exists(), "non-canonical output path must never be deleted");
-    }
-
-    #[test]
     fn preview_single_reference_is_scoped_to_the_clone_identity_group() {
         let conn = mem_db();
         let pid = insert_project(&conn);
@@ -2143,6 +2241,112 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("outside the clone's identity group"));
+    }
+
+    #[test]
+    fn preview_allows_display_group_sibling_and_bound_primary() {
+        use crate::audio::wav::build_pcm_wav;
+        use crate::generator::clone::REFERENCE_SAMPLE_RATE;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wav = |name: &str| {
+            let path = dir.path().join(name);
+            let samples: Vec<i16> = (0..REFERENCE_SAMPLE_RATE).map(|_| 8_000).collect();
+            std::fs::write(&path, build_pcm_wav(REFERENCE_SAMPLE_RATE, &samples)).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+
+        let conn = mem_db();
+        let pid = insert_project(&conn);
+        // Same display-name strref, no companion proof → separate operational identities.
+        let kalah = insert_speaker(&conn, pid, "KALAH");
+        let kalah2 = insert_speaker(&conn, pid, "KALAH2");
+        conn.execute(
+            "UPDATE speaker SET long_name_strref=4242 WHERE id IN (?1, ?2)",
+            params![kalah, kalah2],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO reference_sample(speaker_id,source_strref,provenance_json,scores_json,decision,local_derivative_path) \
+             VALUES(?1,9,'{}','{}','approved',?2)",
+            params![kalah2, wav("kalah09.wav")],
+        )
+        .unwrap();
+        let sibling_sample = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO clone(speaker_id,primary_sample_id,binding_source,status) \
+             VALUES(?1,?2,'override','ready')",
+            params![kalah, sibling_sample],
+        )
+        .unwrap();
+        let clone = clone_for_speaker(&conn, kalah).unwrap().unwrap();
+
+        // Bound primary owned by the sibling CRE must still preview.
+        ensure_preview_sample_belongs_to_clone(&conn, &clone, sibling_sample).unwrap();
+    }
+
+    #[test]
+    fn preview_current_resolves_imported_profile_without_primary_sample() {
+        use crate::audio::wav::build_pcm_wav;
+        use crate::generator::clone::REFERENCE_SAMPLE_RATE;
+        use crate::models::BindingPreviewReference;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("imported.wav");
+        std::fs::write(
+            &wav,
+            build_pcm_wav(
+                REFERENCE_SAMPLE_RATE,
+                &vec![8_000; REFERENCE_SAMPLE_RATE as usize],
+            ),
+        )
+        .unwrap();
+
+        let conn = mem_db();
+        let pid = insert_project(&conn);
+        let speaker = insert_speaker(&conn, pid, "KALAH");
+        conn.execute(
+            "INSERT INTO voice_profile(project_id,display_name,origin,availability,created_at,updated_at) \
+             VALUES(?1,'Marius Test','imported','available','now','now')",
+            [pid],
+        )
+        .unwrap();
+        let profile_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO voice_profile_reference(voice_profile_id,managed_path,transcript,sort_order) \
+             VALUES(?1,?2,'Exact words spoken.',0)",
+            params![profile_id, wav.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO clone(speaker_id,primary_sample_id,voice_profile_id,binding_source,status) \
+             VALUES(?1,NULL,?2,'override','ready')",
+            params![speaker, profile_id],
+        )
+        .unwrap();
+        let clone = clone_for_speaker(&conn, speaker).unwrap().unwrap();
+        assert!(clone.primary_sample_id.is_none());
+
+        let resolved = resolve_binding_preview_reference(
+            &conn,
+            &clone,
+            dir.path(),
+            BindingPreviewReference::Current,
+            None,
+        )
+        .unwrap();
+        assert_eq!(resolved.path, wav);
+        assert_eq!(resolved.transcript, "Exact words spoken.");
+
+        let single = resolve_binding_preview_reference(
+            &conn,
+            &clone,
+            dir.path(),
+            BindingPreviewReference::Single,
+            None,
+        )
+        .unwrap();
+        assert_eq!(single.path, wav);
     }
 
     #[test]

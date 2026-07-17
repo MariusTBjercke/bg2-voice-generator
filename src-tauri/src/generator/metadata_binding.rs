@@ -9,7 +9,7 @@ use rusqlite::Connection;
 use crate::db::generation::{
     approved_primary_sample, fallback_donor_pool, set_clone_status, upsert_clone,
 };
-use crate::db::metadata_binding::{donors_for_key, metadata_apply_targets};
+use crate::db::metadata_binding::{donors_for_key, metadata_apply_targets, profiles_for_key};
 use crate::db::speaker_groups::{identity_key_for_speaker, speaker_ids_in_group};
 use crate::error::AppError;
 use crate::generator::binding::{best_donor, Demographics, DemographicMatch, DonorCandidate};
@@ -101,6 +101,7 @@ pub fn pick_donor_for_speaker(
 pub struct MetadataAssignment {
     pub speaker_id: i64,
     pub donor_speaker_id: i64,
+    pub voice_profile_id: Option<i64>,
     pub matched_sex: bool,
     pub matched_creature_category: bool,
     pub matched_race: bool,
@@ -143,6 +144,27 @@ fn apply_one(
     auto_fill_unmapped: bool,
 ) -> Result<Option<MetadataAssignment>, AppError> {
     let (speaker_id, sex, race, class, cat) = target;
+    let profile_ids = profiles_for_key(conn, project_id, sex, race, cat)?;
+    if !profile_ids.is_empty() {
+        let salt = pool_salt(&profile_ids);
+        let profile_id = profile_ids[stable_donor_index(speaker_id, project_id, salt, profile_ids.len())];
+        let profile = crate::db::voice_profiles::profile_by_id(conn, profile_id)?
+            .ok_or_else(|| AppError::Other(format!("voice profile {profile_id} vanished from its pool")))?;
+        crate::db::voice_profiles::bind_profile_to_group(
+            conn, project_id, speaker_id, profile_id, BindingSource::Generic,
+        )?;
+        let donor_speaker_id = profile.harvested_speaker_id.unwrap_or(0);
+        return Ok(Some(MetadataAssignment {
+            speaker_id,
+            donor_speaker_id,
+            voice_profile_id: Some(profile_id),
+            matched_sex: false,
+            matched_creature_category: false,
+            matched_race: false,
+            matched_class: false,
+            from_pool: true,
+        }));
+    }
     let Some((donor_speaker_id, sample_id, derivative, m, from_pool)) =
         pick_donor_for_speaker(
             conn,
@@ -159,10 +181,15 @@ fn apply_one(
         return Ok(None);
     };
 
-    let clone_id = upsert_clone(conn, speaker_id, sample_id, BindingSource::Generic)?;
     match validate_file(Path::new(&derivative)) {
-        Ok(_) => set_clone_status(conn, clone_id, CloneStatus::Ready)?,
+        Ok(_) => {
+            let profile_id = crate::db::voice_profiles::ensure_harvested_profile(conn, project_id, &[sample_id])?;
+            crate::db::voice_profiles::bind_profile_to_group(
+                conn, project_id, speaker_id, profile_id, BindingSource::Generic,
+            )?;
+        },
         Err(_) => {
+            let clone_id = upsert_clone(conn, speaker_id, sample_id, BindingSource::Generic)?;
             set_clone_status(conn, clone_id, CloneStatus::Failed)?;
             return Err(AppError::Other(format!(
                 "demographic donor {donor_speaker_id} has an invalid reference clip"
@@ -172,6 +199,7 @@ fn apply_one(
     Ok(Some(MetadataAssignment {
         speaker_id,
         donor_speaker_id,
+        voice_profile_id: crate::db::voice_profiles::ensure_harvested_profile(conn, project_id, &[sample_id]).ok(),
         matched_sex: m.sex,
         matched_creature_category: m.creature_category,
         matched_race: m.race,

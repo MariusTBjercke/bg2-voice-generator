@@ -79,6 +79,7 @@ pub async fn upsert_tag_rule(
     };
     let reset_generations =
         crate::tag_rules::mark_matching_generations_synthesis_stale_many(&tx, &stale)?;
+    crate::synthesis::invalidate_corpus_cache(&tx, None)?;
     tx.commit()?;
     Ok(TagRuleWriteResult {
         rule: crate::tag_rules::rule_by_id(&conn, rule_id)?,
@@ -103,6 +104,7 @@ pub async fn set_tag_rule_enabled(
     let reset_generations = if changed == 0 {
         0
     } else {
+        crate::synthesis::invalidate_corpus_cache(&tx, None)?;
         crate::tag_rules::mark_matching_generations_synthesis_stale(
             &tx,
             &existing.find_text,
@@ -136,6 +138,7 @@ pub async fn delete_tag_rule(
         existing.match_kind,
     )?;
     tx.execute("DELETE FROM tag_rule WHERE id=?1", [id])?;
+    crate::synthesis::invalidate_corpus_cache(&tx, None)?;
     tx.commit()?;
     Ok(TagRuleWriteResult {
         rule: None,
@@ -150,6 +153,7 @@ pub async fn reset_tag_rule_defaults(
     let mut conn = state.db.lock().await;
     let tx = conn.transaction()?;
     let reset_generations = crate::tag_rules::reset_defaults(&tx)?;
+    crate::synthesis::invalidate_corpus_cache(&tx, None)?;
     tx.commit()?;
     Ok(TagRuleWriteResult {
         rule: None,

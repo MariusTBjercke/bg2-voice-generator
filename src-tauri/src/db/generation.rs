@@ -28,13 +28,12 @@ pub struct LineRenderOverrideChange {
     pub candidate_path: Option<String>,
 }
 
-/// Database portion of a clone-settings update. The caller removes only the returned
-/// canonical local outputs after this transaction commits.
+/// Database portion of a clone-settings update. Done clips stay playable; their
+/// settings hash is cleared so Generation/Export report them as voice-changed.
 #[derive(Debug)]
 pub struct CloneSettingsChange {
     pub clone: Clone,
     pub reset_generations: usize,
-    pub output_paths: Vec<(i64, String)>,
 }
 
 /// Deserialize and validate a clone's persisted settings. `#[serde(default)]` on the
@@ -297,30 +296,19 @@ pub fn update_clone_render_settings(
         return Ok(CloneSettingsChange {
             clone: existing,
             reset_generations: 0,
-            output_paths: Vec::new(),
         });
     }
 
-    let output_paths = {
-        let mut stmt = tx.prepare(
-            "SELECT line_id, output_path FROM generation \
-             WHERE clone_id=?1 AND output_path IS NOT NULL ORDER BY line_id",
-        )?;
-        let rows = stmt
-            .query_map([clone_id], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows
-    };
     tx.execute(
         "UPDATE clone SET render_settings_json=?2 WHERE id=?1",
         params![clone_id, settings_json],
     )?;
+    // Soft-invalidate: keep done+path so clips stay playable; clear hash so the
+    // voice_changed CASE treats them as stale until regenerated.
     let reset_generations = tx.execute(
-        "UPDATE generation \
-         SET status='pending', output_path=NULL, resumable_state_json='{}', \
-             render_settings_json=NULL, render_settings_hash=NULL \
-         WHERE clone_id=?1 AND (status!='pending' OR output_path IS NOT NULL \
-             OR render_settings_json IS NOT NULL OR render_settings_hash IS NOT NULL)",
+        "UPDATE generation SET render_settings_hash=NULL \
+         WHERE clone_id=?1 AND status='done' AND output_path IS NOT NULL \
+           AND render_settings_hash IS NOT NULL",
         [clone_id],
     )?;
     let clone = tx.query_row(
@@ -332,7 +320,6 @@ pub fn update_clone_render_settings(
     Ok(CloneSettingsChange {
         clone,
         reset_generations,
-        output_paths,
     })
 }
 
@@ -412,7 +399,7 @@ pub fn clones_for_project(
     // Qualify every column with the `c` alias: joining `speaker` makes bare `id`
     // and `speaker_id` ambiguous. Order matches `clone_from_row`'s index reads.
     let mut stmt = conn.prepare(
-        "SELECT c.id, c.speaker_id, c.primary_sample_id, c.binding_source, c.status, \
+        "SELECT c.id, c.speaker_id, c.primary_sample_id, c.voice_profile_id, c.binding_source, c.status, \
                 c.render_settings_json \
          FROM clone c JOIN speaker s ON s.id = c.speaker_id \
          WHERE s.project_id = ?1 ORDER BY c.speaker_id",
@@ -438,7 +425,7 @@ pub fn bindable_speakers(
              WHERE speaker_id = s.id AND decision = 'approved' \
                AND local_derivative_path IS NOT NULL \
              ORDER BY id DESC LIMIT 1 ) \
-         WHERE s.project_id = ?1 ORDER BY s.id",
+         WHERE s.project_id = ?1 AND s.excluded = 0 ORDER BY s.id",
     )?;
     let rows = stmt
         .query_map(params![project_id], |r| {
@@ -468,7 +455,7 @@ pub fn fallback_donor_pool(
              WHERE speaker_id = s.id AND decision = 'approved' \
                AND local_derivative_path IS NOT NULL \
              ORDER BY id DESC LIMIT 1 ) \
-         WHERE s.project_id = ?1 ORDER BY s.id",
+         WHERE s.project_id = ?1 AND s.excluded = 0 ORDER BY s.id",
     )?;
     let rows = stmt
         .query_map(params![project_id], |r| {
@@ -495,6 +482,7 @@ pub fn unvoiced_speakers(
     let mut stmt = conn.prepare(
         "SELECT s.id, s.sex, s.race, s.class, s.creature_category FROM speaker s \
          WHERE s.project_id = ?1 \
+           AND s.excluded = 0 \
            AND NOT EXISTS (SELECT 1 FROM clone c WHERE c.speaker_id = s.id) \
            AND NOT EXISTS ( \
                SELECT 1 FROM reference_sample rs \
@@ -525,10 +513,17 @@ pub fn upsert_clone(
     primary_sample_id: i64,
     binding_source: BindingSource,
 ) -> Result<i64, AppError> {
+    let project_id: i64 = conn.query_row(
+        "SELECT project_id FROM speaker WHERE id=?1", [speaker_id], |r| r.get(0),
+    )?;
+    let voice_profile_id = crate::db::voice_profiles::ensure_harvested_profile(
+        conn, project_id, &[primary_sample_id],
+    )?;
     if let Some(existing) = clone_for_speaker(conn, speaker_id)? {
         if existing.primary_sample_id == Some(primary_sample_id)
             && existing.binding_source == binding_source
         {
+            conn.execute("UPDATE clone SET voice_profile_id=?2 WHERE id=?1", params![existing.id,voice_profile_id])?;
             conn.execute(
                 "INSERT OR IGNORE INTO clone_reference(clone_id,sample_id,sort_order) \
                  VALUES(?1,?2,0)",
@@ -538,9 +533,9 @@ pub fn upsert_clone(
         }
         conn.execute("DELETE FROM clone_reference WHERE clone_id=?1", [existing.id])?;
         conn.execute(
-            "UPDATE clone SET primary_sample_id = ?2, binding_source = ?3, status = 'pending' \
+            "UPDATE clone SET primary_sample_id = ?2, binding_source = ?3, status = 'pending', voice_profile_id=?4 \
              WHERE id = ?1",
-            params![existing.id, primary_sample_id, binding_source],
+            params![existing.id, primary_sample_id, binding_source, voice_profile_id],
         )?;
         conn.execute(
             "INSERT INTO clone_reference(clone_id,sample_id,sort_order) VALUES(?1,?2,0)",
@@ -549,9 +544,9 @@ pub fn upsert_clone(
         return Ok(existing.id);
     }
     conn.execute(
-        "INSERT INTO clone (speaker_id, primary_sample_id, binding_source, status) \
-         VALUES (?1, ?2, ?3, 'pending')",
-        params![speaker_id, primary_sample_id, binding_source],
+        "INSERT INTO clone (speaker_id, primary_sample_id, voice_profile_id, binding_source, status) \
+         VALUES (?1, ?2, ?3, ?4, 'pending')",
+        params![speaker_id, primary_sample_id, voice_profile_id, binding_source],
     )?;
     let clone_id = conn.last_insert_rowid();
     conn.execute(
@@ -627,9 +622,12 @@ pub fn completed_generations_for_project(
     let mut stmt = conn.prepare(
         "SELECT g.line_id, g.output_path, \
                 CASE WHEN c.id IS NULL OR c.status != 'ready' \
-                       OR g.reference_sample_id IS NULL \
-                       OR c.primary_sample_id IS NULL \
-                       OR g.reference_sample_id != c.primary_sample_id \
+                       OR g.render_settings_hash IS NULL \
+                       OR (c.voice_profile_id IS NOT NULL AND \
+                           NOT (g.voice_profile_id_snapshot IS c.voice_profile_id)) \
+                       OR (c.voice_profile_id IS NULL AND (g.reference_sample_id IS NULL \
+                           OR c.primary_sample_id IS NULL \
+                           OR g.reference_sample_id != c.primary_sample_id)) \
                      THEN 1 ELSE 0 END AS voice_changed, \
                 CASE WHEN g.synthesis_stale != 0 THEN 1 ELSE 0 END AS text_changed \
          FROM generation g JOIN line l ON l.id = g.line_id \
@@ -757,7 +755,9 @@ pub fn mark_done(
     let render_settings_json = serde_json::to_string(render_settings)?;
     let render_settings_hash = render_settings.fingerprint().map_err(AppError::Other)?;
     conn.execute(
-        "UPDATE generation SET status = 'done', clone_id = ?2, reference_sample_id = ?3, \
+        "UPDATE generation SET status = 'done', clone_id = ?2, \
+             voice_profile_id_snapshot=(SELECT voice_profile_id FROM clone WHERE id=?2), \
+             reference_sample_id = ?3, \
              binding_source_snapshot = ?4, output_path = ?5, resumable_state_json = ?6, \
              render_settings_json = ?7, render_settings_hash = ?8, reference_fingerprint = ?9, \
              synthesis_stale = 0 \
@@ -823,6 +823,7 @@ pub fn is_complete_on_disk(g: &Generation) -> bool {
 pub fn is_current_on_disk(
     generation: &Generation,
     clone_id: i64,
+    voice_profile_id: Option<i64>,
     primary_sample_id: i64,
     render_settings_hash: &str,
     reference_fingerprint: &str,
@@ -830,7 +831,10 @@ pub fn is_current_on_disk(
 ) -> bool {
     is_complete_on_disk(generation)
         && generation.clone_id == Some(clone_id)
-        && generation.reference_sample_id == Some(primary_sample_id)
+        && match voice_profile_id {
+            Some(profile_id) => generation.voice_profile_id_snapshot == Some(profile_id),
+            None => generation.reference_sample_id == Some(primary_sample_id),
+        }
         && generation.render_settings_hash.as_deref() == Some(render_settings_hash)
         && match generation.reference_fingerprint.as_deref() {
             Some(snapshot) => snapshot == reference_fingerprint,
@@ -1119,7 +1123,7 @@ mod tests {
     }
 
     #[test]
-    fn changing_clone_settings_resets_only_its_generations_and_returns_paths() {
+    fn changing_clone_settings_soft_marks_only_its_generations_as_voice_changed() {
         let mut conn = mem_db();
         let (sid_a, line_a) = speaker_with_line(&conn);
         let pid = 1;
@@ -1142,6 +1146,8 @@ mod tests {
             .unwrap();
         let clone_a = upsert_clone(&conn, sid_a, sample_a, BindingSource::Default).unwrap();
         let clone_b = upsert_clone(&conn, sid_b, sample_b, BindingSource::Default).unwrap();
+        set_clone_status(&conn, clone_a, CloneStatus::Ready).unwrap();
+        set_clone_status(&conn, clone_b, CloneStatus::Ready).unwrap();
         for (line, clone, sample, path) in [
             (line_a, clone_a, sample_a, "a.ogg"),
             (line_b, clone_b, sample_b, "b.ogg"),
@@ -1164,7 +1170,6 @@ mod tests {
         let tuned = OmniVoiceRenderSettings { speed: Some(0.9), ..Default::default() };
         let changed = update_clone_render_settings(&mut conn, clone_a, &tuned).unwrap();
         assert_eq!(changed.reset_generations, 1);
-        assert_eq!(changed.output_paths, vec![(line_a, "a.ogg".into())]);
         let a: (String, Option<String>, Option<String>) = conn
             .query_row(
                 "SELECT status,output_path,render_settings_hash FROM generation WHERE line_id=?1",
@@ -1172,7 +1177,9 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert_eq!(a, ("pending".into(), None, None));
+        assert_eq!(a.0, "done");
+        assert_eq!(a.1.as_deref(), Some("a.ogg"));
+        assert!(a.2.is_none(), "settings hash cleared so voice_changed can detect drift");
         let b: (String, Option<String>, Option<String>) = conn
             .query_row(
                 "SELECT status,output_path,render_settings_hash FROM generation WHERE line_id=?1",
@@ -1184,9 +1191,14 @@ mod tests {
         assert_eq!(b.1.as_deref(), Some("b.ogg"));
         assert!(b.2.is_some());
 
+        let rows = completed_generations_for_project(&conn, pid).unwrap();
+        let a_row = rows.iter().find(|(id, _, _, _)| *id == line_a).unwrap();
+        let b_row = rows.iter().find(|(id, _, _, _)| *id == line_b).unwrap();
+        assert!(a_row.2, "tuned clone's clip reports voice_changed");
+        assert!(!b_row.2, "sibling clone stays current");
+
         let unchanged = update_clone_render_settings(&mut conn, clone_a, &tuned).unwrap();
         assert_eq!(unchanged.reset_generations, 0);
-        assert!(unchanged.output_paths.is_empty());
     }
 
     #[test]
@@ -1313,6 +1325,7 @@ mod tests {
             id: 1,
             line_id: 1,
             clone_id: Some(1),
+            voice_profile_id_snapshot: None,
             reference_sample_id: Some(1),
             binding_source_snapshot: Some(BindingSource::Default),
             status: GenerationStatus::Done,
@@ -1339,6 +1352,7 @@ mod tests {
         assert!(is_current_on_disk(
             &legacy_single,
             1,
+            None,
             1,
             &settings_hash,
             "current-reference",
@@ -1347,6 +1361,7 @@ mod tests {
         assert!(!is_current_on_disk(
             &legacy_single,
             1,
+            None,
             1,
             &settings_hash,
             "current-reference",
@@ -1359,6 +1374,7 @@ mod tests {
         assert!(!is_current_on_disk(
             &snapshotted,
             1,
+            None,
             1,
             &settings_hash,
             "current-reference",

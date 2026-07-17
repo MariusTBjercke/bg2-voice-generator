@@ -111,6 +111,49 @@ export type CloneStatus = 'pending' | 'ready' | 'failed';
 /** Mirror of `models::GenerationStatus`. */
 export type GenerationStatus = 'pending' | 'running' | 'done' | 'failed';
 
+export type VoiceProfileOrigin = 'harvested' | 'imported' | 'designed';
+export type VoiceProfileAvailability = 'available' | 'missing_local_audio';
+
+export interface DesignVoiceAttributes {
+  gender: string;
+  age: string;
+  pitch: string;
+  whisper: boolean;
+  accent: string | null;
+}
+
+export interface VoiceProfileReference {
+  id: number;
+  voice_profile_id: number;
+  reference_sample_id: number | null;
+  managed_path: string | null;
+  resolved_audio_path: string | null;
+  source_strref: number | null;
+  source_sound_resref: string | null;
+  transcript: string;
+  sort_order: number;
+  fingerprint: string | null;
+}
+
+export interface VoiceProfile {
+  id: number;
+  project_id: number;
+  display_name: string;
+  origin: VoiceProfileOrigin;
+  harvested_speaker_id: number | null;
+  design: DesignVoiceAttributes | null;
+  availability: VoiceProfileAvailability;
+  reference_fingerprint: string | null;
+  references: VoiceProfileReference[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ImportedVoiceClipInput { path: string; transcript: string; }
+export interface DesignedVoiceCandidate { preview_id: string; output_path: string; seed: number; duration_secs: number; }
+export interface DesignedVoiceCandidatesResult { candidates: DesignedVoiceCandidate[]; quality_warning: string | null; }
+export interface DeleteVoiceProfileResult { affected_speakers: number; affected_pools: number; reset_generations: number; files_deleted: number; }
+
 /** Mirror of `models::OmniVoiceRenderSettings`. */
 export interface OmniVoiceRenderSettings {
   speed: number | null;
@@ -189,6 +232,8 @@ export interface Speaker {
   dialogue_resref: string | null;
   provenance_json: string;
   confidence: number;
+  /** When true, Generate and Export skip this speaker's lines. */
+  excluded: boolean;
 }
 
 /** Mirror of `models::SpeakerVariant`. */
@@ -206,10 +251,24 @@ export interface SpeakerGroup {
   long_name_strref: number | null;
   variant_count: number;
   line_count: number;
+  /** Approved sample rows across CRE variants (same sound may count once per variant). */
   approved_sample_count: number;
+  /** Distinct approved sound resrefs (matches collapsed Harvest/Binding rows). */
+  approved_sound_count: number;
+  /** Total harvested sample rows across variants (any decision). */
+  sample_count: number;
   clone_status: CloneStatus | null;
   binding_source: BindingSource | null;
   variants: SpeakerVariant[];
+  /** True when every variant in the group is excluded from generate/export. */
+  excluded: boolean;
+}
+
+/** Mirror of `models::SetSpeakerGroupExcludedResult`. */
+export interface SetSpeakerGroupExcludedResult {
+  speakers_updated: number;
+  generations_cleared: number;
+  files_deleted: number;
 }
 
 /** Mirror of `models::ReconcileGroupBindingsResult`. */
@@ -234,11 +293,8 @@ export interface SharedStrrefGroup {
 }
 
 /**
- * Mirror of `models::Line`. Also the element type of the
- * `list_blocked_lines({ gameDir }) -> Line[]` and
- * `list_generatable_lines({ gameDir }) -> Line[]` commands (the latter returns
- * `ready` lines whose speaker has a `ready` clone; an unknown/unscanned dir
- * yields an empty list).
+ * Mirror of `models::Line`. Element type of `list_blocked_lines` and other
+ * full-row line reads. Generation listing uses the lighter `GeneratableLine`.
  */
 export interface Line {
   id: number;
@@ -260,6 +316,37 @@ export interface Line {
   status: LineStatus;
 }
 
+/**
+ * Mirror of `models::GeneratableLine` / `list_generatable_lines` rows.
+ * Omits `original_text` to shrink the Generation-screen IPC payload; the stand-in
+ * badge still uses `token_mask`, and synthesis previews cover generation text.
+ */
+export interface GeneratableLine {
+  id: number;
+  project_id: number;
+  strref: number;
+  dlg_resref: string | null;
+  state_index: number | null;
+  text: string;
+  flags: number;
+  existing_sound_resref: string | null;
+  kind: LineKind;
+  is_voiced: boolean;
+  has_tokens: boolean;
+  token_mask: number;
+  shared_group_id: number | null;
+  speaker_id: number | null;
+  attribution_confidence: number;
+  status: LineStatus;
+}
+
+/** Mirror of `models::BlockedLinesPage`. */
+export interface BlockedLinesPage {
+  rows: Line[];
+  total: number;
+  token_total: number;
+}
+
 /** Mirror of `models::ReferenceSample`. */
 export interface ReferenceSample {
   id: number;
@@ -277,6 +364,7 @@ export interface Clone {
   id: number;
   speaker_id: number;
   primary_sample_id: number | null;
+  voice_profile_id: number | null;
   binding_source: BindingSource;
   status: CloneStatus;
   render_settings_json: string;
@@ -323,6 +411,7 @@ export interface Generation {
   id: number;
   line_id: number;
   clone_id: number | null;
+  voice_profile_id_snapshot: number | null;
   reference_sample_id: number | null;
   binding_source_snapshot: BindingSource | null;
   status: GenerationStatus;
@@ -445,6 +534,9 @@ export interface HarvestReport {
   samples_harvested: number;
   decode_failures: number;
   candidates_skipped: number;
+  candidates_already_present: number;
+  gap_fill_candidates: number;
+  gap_fill_samples: number;
   automatic_samples: number;
   manual_only_samples: number;
   conflicting_aliases_skipped: number;
@@ -461,6 +553,8 @@ export interface HarvestPersistCounts {
   unmatched: number;
   decisions_preserved: number;
   clones_invalidated: number;
+  samples_added: number;
+  samples_skipped_existing: number;
 }
 
 /** Mirror of `commands::harvest::HarvestResult`. */
@@ -556,6 +650,7 @@ export interface MetadataBinding {
   race_label: string;
   creature_category_label: string;
   donor_speaker_ids: number[];
+  voice_profile_ids: number[];
 }
 
 /** Mirror of `commands::metadata_binding::EffectiveSpeakerBinding`. */
@@ -567,6 +662,9 @@ export interface EffectiveSpeakerBinding {
   clone_status: CloneStatus | null;
   sample_id: number | null;
   sample_path: string | null;
+  voice_profile_id: number | null;
+  voice_profile_name: string | null;
+  voice_profile_origin: VoiceProfileOrigin | null;
   donor_speaker_id: number | null;
   donor_display_name: string | null;
   inherited: boolean;
@@ -576,6 +674,7 @@ export interface EffectiveSpeakerBinding {
 export interface MetadataAssignment {
   speaker_id: number;
   donor_speaker_id: number;
+  voice_profile_id: number | null;
   matched_sex: boolean;
   matched_creature_category: boolean;
   matched_race: boolean;
@@ -658,6 +757,7 @@ export interface EngineStatus {
   device: string | null;
   cuda_name: string | null;
   fork: boolean | null;
+  voice_design: boolean;
 }
 
 /** Mirror of `commands::generate::BindCloneResult`. */

@@ -100,6 +100,7 @@ mod tests {
         LineJob {
             line_id: id,
             clone_id: 1,
+            voice_profile_id: None,
             reference_sample_id: 1,
             binding_source: crate::models::BindingSource::Default,
             text: text.into(),

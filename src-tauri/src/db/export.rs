@@ -30,9 +30,11 @@ pub fn list_export_candidates(
                 COALESCE(g.binding_source_snapshot, c.binding_source, 'default'), \
                 COALESCE(grp.resolution, 'reuse_same_voice'), \
                 CASE WHEN c.id IS NULL OR c.status != 'ready' \
+                       OR g.render_settings_hash IS NULL \
                        OR g.reference_sample_id IS NULL OR c.primary_sample_id IS NULL \
                        OR g.reference_sample_id != c.primary_sample_id \
-                     THEN 1 ELSE 0 END \
+                     THEN 1 ELSE 0 END, \
+                COALESCE(s.excluded, 0) \
          FROM generation g \
          JOIN line l ON l.id = g.line_id \
          LEFT JOIN speaker s ON s.id = l.speaker_id \
@@ -60,6 +62,7 @@ pub fn list_export_candidates(
             speaker_resref: r.get::<_, String>(11)?.to_ascii_uppercase(),
             binding_source: r.get(12)?,
             voice_changed: r.get::<_, i64>(14)? != 0,
+            speaker_excluded: r.get::<_, i64>(15)? != 0,
             clip_on_disk: output_path
                 .as_deref()
                 .map(|p| std::path::Path::new(p).exists())
@@ -168,8 +171,9 @@ mod tests {
         .unwrap();
         let cid = c.last_insert_rowid();
         c.execute(
-            "INSERT INTO generation (line_id, clone_id, reference_sample_id, binding_source_snapshot, status, output_path) \
-             VALUES (?1,?2,?3,'default','done',?4)",
+            "INSERT INTO generation (line_id, clone_id, reference_sample_id, binding_source_snapshot, \
+             status, output_path, render_settings_hash) \
+             VALUES (?1,?2,?3,'default','done',?4,'fixture-settings-hash')",
             params![lid, cid, sample_id, out],
         )
         .unwrap();
@@ -215,6 +219,22 @@ mod tests {
         assert!(cand.voice_changed);
         assert_eq!(cand.binding_source, "default");
         assert_eq!(cand.audio_source_path, "/ws/x.wav");
+    }
+
+    #[test]
+    fn null_render_settings_hash_marks_export_candidate_voice_changed() {
+        let c = db();
+        done_line(&c, 22570, "/ws/x.wav");
+        c.execute(
+            "UPDATE generation SET render_settings_hash=NULL WHERE output_path='/ws/x.wav'",
+            [],
+        )
+        .unwrap();
+
+        let cand = list_export_candidates(&c, 1).unwrap().pop().unwrap();
+        assert!(cand.voice_changed);
+        assert_eq!(cand.audio_source_path, "/ws/x.wav");
+        assert!(!cand.clip_on_disk);
     }
 
     #[test]

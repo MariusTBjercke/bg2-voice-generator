@@ -29,6 +29,7 @@ use crate::tts::OmniVoiceEngine;
 pub struct LineJob {
     pub line_id: i64,
     pub clone_id: i64,
+    pub voice_profile_id: Option<i64>,
     pub reference_sample_id: i64,
     pub binding_source: BindingSource,
     /// Synthesis transcript (stage directions stripped; DB `line.text` keeps the raw TLK).
@@ -110,6 +111,7 @@ pub async fn generate_line(
             && is_current_on_disk(
                 &generation,
                 job.clone_id,
+                job.voice_profile_id,
                 job.reference_sample_id,
                 &job.render_settings_fingerprint,
                 &job.reference_fingerprint,
@@ -246,6 +248,7 @@ mod tests {
             id: 1,
             line_id: 42,
             clone_id: Some(1),
+            voice_profile_id_snapshot: None,
             reference_sample_id: Some(1),
             binding_source_snapshot: Some(BindingSource::Default),
             status: crate::models::GenerationStatus::Failed,
@@ -267,6 +270,7 @@ mod tests {
         let mut job = LineJob {
             line_id: 1,
             clone_id: 2,
+            voice_profile_id: None,
             reference_sample_id: 3,
             binding_source: BindingSource::Default,
             text: "Hello".into(),

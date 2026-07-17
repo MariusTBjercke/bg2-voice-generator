@@ -8,12 +8,31 @@ use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
 use crate::models::{
-    AutoReviewPlainResult, CorpusAuditFlag, DictionaryAppliedRule, ListSynthesisDecisionsResult,
+    AutoReviewPlainResult, CorpusAuditFlag, DictionaryAppliedRule, DictionaryRule,
+    ListSynthesisDecisionsResult,
     ListSynthesisFlaggedResult, ListSynthesisReviewResult, SynthesisAgentResetResult,
     SynthesisCorpusAuditSummary, SynthesisDecisionKind, SynthesisDecisionRow,
     SynthesisFlaggedRow, SynthesisReviewRow, SynthesisTaggingSummary, SynthesisTextSource,
-    SynthesisWriteResult,
+    SynthesisWriteResult, TagRule,
 };
+
+const SYNTHESIS_CACHE_VERSION: i64 = 1;
+const FLAG_PLAIN_OK: i64 = 1 << 0;
+const FLAG_MAPPED_OK: i64 = 1 << 1;
+const FLAG_STRIPPED_UNKNOWN_CUE: i64 = 1 << 2;
+const FLAG_SPOKEN_STAGE_DIRECTION: i64 = 1 << 3;
+const FLAG_UNTERMINATED_ASTERISK: i64 = 1 << 4;
+const FLAG_PLACEMENT_CANDIDATE: i64 = 1 << 5;
+const FLAG_INTERPRETIVE_CANDIDATE: i64 = 1 << 6;
+const FLAG_TTS_UNFRIENDLY_SPELLING: i64 = 1 << 7;
+const FLAG_NON_SPEAKABLE: i64 = 1 << 8;
+const ATTENTION_MASK: i64 = FLAG_STRIPPED_UNKNOWN_CUE
+    | FLAG_SPOKEN_STAGE_DIRECTION
+    | FLAG_UNTERMINATED_ASTERISK
+    | FLAG_PLACEMENT_CANDIDATE
+    | FLAG_INTERPRETIVE_CANDIDATE
+    | FLAG_TTS_UNFRIENDLY_SPELLING
+    | FLAG_NON_SPEAKABLE;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedSynthesisText {
@@ -37,6 +56,189 @@ pub fn text_hash(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.trim().as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn flag_bit(flag: CorpusAuditFlag) -> i64 {
+    match flag {
+        CorpusAuditFlag::PlainOk => FLAG_PLAIN_OK,
+        CorpusAuditFlag::MappedOk => FLAG_MAPPED_OK,
+        CorpusAuditFlag::StrippedUnknownCue => FLAG_STRIPPED_UNKNOWN_CUE,
+        CorpusAuditFlag::SpokenStageDirection => FLAG_SPOKEN_STAGE_DIRECTION,
+        CorpusAuditFlag::UnterminatedAsterisk => FLAG_UNTERMINATED_ASTERISK,
+        CorpusAuditFlag::PlacementCandidate => FLAG_PLACEMENT_CANDIDATE,
+        CorpusAuditFlag::InterpretiveCandidate => FLAG_INTERPRETIVE_CANDIDATE,
+        CorpusAuditFlag::TtsUnfriendlySpelling => FLAG_TTS_UNFRIENDLY_SPELLING,
+        CorpusAuditFlag::NonSpeakable => FLAG_NON_SPEAKABLE,
+    }
+}
+
+fn flags_mask(flags: &[CorpusAuditFlag]) -> i64 {
+    flags.iter().copied().fold(0, |mask, flag| mask | flag_bit(flag))
+}
+
+fn flags_from_mask(mask: i64) -> Vec<CorpusAuditFlag> {
+    [
+        CorpusAuditFlag::PlainOk,
+        CorpusAuditFlag::MappedOk,
+        CorpusAuditFlag::StrippedUnknownCue,
+        CorpusAuditFlag::SpokenStageDirection,
+        CorpusAuditFlag::UnterminatedAsterisk,
+        CorpusAuditFlag::PlacementCandidate,
+        CorpusAuditFlag::InterpretiveCandidate,
+        CorpusAuditFlag::TtsUnfriendlySpelling,
+        CorpusAuditFlag::NonSpeakable,
+    ]
+    .into_iter()
+    .filter(|flag| mask & flag_bit(*flag) != 0)
+    .collect()
+}
+
+fn mapped_with_rules(
+    line_text: &str,
+    mapper_enabled: bool,
+    dictionary_rules: &[DictionaryRule],
+    tag_rules: &[TagRule],
+) -> (String, Vec<DictionaryAppliedRule>, Vec<crate::models::TagAppliedRule>) {
+    let (dictionary_text, applied_rules) =
+        crate::dictionary::apply_dictionary_rules(line_text, dictionary_rules);
+    let (text, applied_tag_rules) =
+        crate::tag_rules::apply_tag_rules(&dictionary_text, tag_rules, mapper_enabled);
+    (text, applied_rules, applied_tag_rules)
+}
+
+/// Derived cache invalidation is intentionally cheap and transaction-friendly.
+/// Callers that modify the corpus or machine-wide mapping rules use this in the
+/// same transaction as their durable change.
+pub fn invalidate_corpus_cache(
+    conn: &Connection,
+    project_id: Option<i64>,
+) -> Result<(), AppError> {
+    match project_id {
+        Some(id) => {
+            conn.execute("DELETE FROM synthesis_corpus_cache_state WHERE project_id=?1", [id])?;
+            conn.execute("DELETE FROM synthesis_corpus_cache WHERE project_id=?1", [id])?;
+        }
+        None => {
+            conn.execute("DELETE FROM synthesis_corpus_cache_state", [])?;
+            conn.execute("DELETE FROM synthesis_corpus_cache", [])?;
+        }
+    }
+    Ok(())
+}
+
+pub fn corpus_cache_ready(conn: &Connection, project_id: i64) -> Result<bool, AppError> {
+    Ok(conn
+        .query_row(
+            "SELECT cache_version FROM synthesis_corpus_cache_state WHERE project_id=?1",
+            [project_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+        == Some(SYNTHESIS_CACHE_VERSION))
+}
+
+/// Ensure the project's unique-string projection and audit classification exist.
+/// Rules are loaded once, then applied in memory to the complete corpus; the old
+/// implementation re-read both rule tables two or three times per string.
+pub fn ensure_corpus_cache(
+    conn: &Connection,
+    project_id: i64,
+    mapper_enabled: bool,
+) -> Result<usize, AppError> {
+    let current: Option<i64> = conn
+        .query_row(
+            "SELECT cache_version FROM synthesis_corpus_cache_state WHERE project_id=?1",
+            [project_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if current == Some(SYNTHESIS_CACHE_VERSION) {
+        return Ok(0);
+    }
+
+    let started = std::time::Instant::now();
+
+    let dictionary_rules = crate::dictionary::load_enabled_rules(conn)?;
+    let tag_rules = crate::tag_rules::load_enabled_rules(conn)?;
+    let cue_map = crate::tag_rules::stage_cue_tag_map(&tag_rules);
+    let mut stmt = conn.prepare(
+        "SELECT min(id), min(strref), trim(text), count(*) \
+         FROM line WHERE project_id=?1 AND trim(text)<>'' \
+         GROUP BY trim(text) ORDER BY min(id)",
+    )?;
+    let source_rows = stmt
+        .query_map([project_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    let mut rows = Vec::with_capacity(source_rows.len());
+    for (line_id, strref, source_text, shared_count) in source_rows {
+        let mapped_text = mapped_with_rules(
+            &source_text,
+            mapper_enabled,
+            &dictionary_rules,
+            &tag_rules,
+        )
+        .0;
+        let flags = crate::synthesis_corpus_audit::audit_source_and_mapped_text_with_cues(
+            &source_text,
+            &mapped_text,
+            mapper_enabled,
+            Some(&cue_map),
+        );
+        rows.push((
+            text_hash(&source_text),
+            source_text,
+            mapped_text,
+            line_id,
+            strref,
+            shared_count,
+            flags_mask(&flags),
+        ));
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM synthesis_corpus_cache WHERE project_id=?1", [project_id])?;
+    {
+        let mut insert = tx.prepare(
+            "INSERT INTO synthesis_corpus_cache \
+             (project_id,text_hash,source_text,mapped_text,first_line_id,first_strref,shared_count,audit_mask) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        )?;
+        for (hash, source, mapped, line_id, strref, shared_count, audit_mask) in &rows {
+            insert.execute(params![
+                project_id,
+                hash,
+                source,
+                mapped,
+                line_id,
+                strref,
+                shared_count,
+                audit_mask
+            ])?;
+        }
+    }
+    tx.execute(
+        "INSERT INTO synthesis_corpus_cache_state(project_id,cache_version,rebuilt_at) \
+         VALUES(?1,?2,?3) ON CONFLICT(project_id) DO UPDATE SET \
+         cache_version=excluded.cache_version,rebuilt_at=excluded.rebuilt_at",
+        params![project_id, SYNTHESIS_CACHE_VERSION, Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
+    log::info!(
+        "rebuilt synthesis corpus cache: project_id={}, rows={}, elapsed_ms={}",
+        project_id,
+        rows.len(),
+        started.elapsed().as_millis()
+    );
+    Ok(rows.len())
 }
 
 fn stored_override(conn: &Connection, source_text: &str) -> Result<Option<String>, AppError> {
@@ -100,30 +302,8 @@ pub fn mapped_synthesis_text(
     AppError,
 > {
     let rules = crate::dictionary::load_enabled_rules(conn)?;
-    let (dictionary_text, applied_rules) =
-        crate::dictionary::apply_dictionary_rules(line_text, &rules);
     let tag_rules = crate::tag_rules::load_enabled_rules(conn)?;
-    let (text, applied_tag_rules) =
-        crate::tag_rules::apply_tag_rules(&dictionary_text, &tag_rules, mapper_enabled);
-    Ok((text, applied_rules, applied_tag_rules))
-}
-
-fn audit_flags_for_mapped(
-    conn: &Connection,
-    source: &str,
-    mapped: &str,
-    mapper_enabled: bool,
-) -> Result<Vec<CorpusAuditFlag>, AppError> {
-    let tag_rules = crate::tag_rules::load_enabled_rules(conn)?;
-    let cue_map = crate::tag_rules::stage_cue_tag_map(&tag_rules);
-    Ok(
-        crate::synthesis_corpus_audit::audit_source_and_mapped_text_with_cues(
-            source,
-            mapped,
-            mapper_enabled,
-            Some(&cue_map),
-        ),
-    )
+    Ok(mapped_with_rules(line_text, mapper_enabled, &rules, &tag_rules))
 }
 
 fn line_text(conn: &Connection, line_id: i64) -> Result<String, AppError> {
@@ -273,6 +453,55 @@ pub fn tagging_summary(
     project_id: Option<i64>,
     mapper_enabled: bool,
 ) -> Result<SynthesisTaggingSummary, AppError> {
+    if let Some(project_id) = project_id {
+        ensure_corpus_cache(conn, project_id, mapper_enabled)?;
+        let mut stmt = conn.prepare(
+            "SELECT c.text_hash,c.mapped_text,o.synthesis_text,\
+                    CASE WHEN r.text_hash IS NULL THEN 0 ELSE 1 END \
+             FROM synthesis_corpus_cache c \
+             LEFT JOIN synthesis_text_override o ON o.text_hash=c.text_hash \
+             LEFT JOIN synthesis_text_reviewed r ON r.text_hash=c.text_hash \
+             WHERE c.project_id=?1",
+        )?;
+        let rows = stmt
+            .query_map([project_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, i64>(3)? != 0,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut overridden = 0;
+        let mut reviewed = 0;
+        let mut suspicious = 0;
+        for (hash, mapped, synthesis, is_reviewed) in &rows {
+            if let Some(synthesis) = synthesis {
+                overridden += 1;
+                if crate::synthesis_validation::audit_override_row(
+                    0,
+                    hash,
+                    mapped,
+                    synthesis,
+                )
+                .is_some()
+                {
+                    suspicious += 1;
+                }
+            } else if *is_reviewed {
+                reviewed += 1;
+            }
+        }
+        return Ok(SynthesisTaggingSummary {
+            unique_strings: rows.len(),
+            overridden,
+            reviewed,
+            remaining: rows.len().saturating_sub(overridden + reviewed),
+            suspicious,
+        });
+    }
+
     let texts = project_texts(conn, project_id)?;
     let overrides = hash_set(conn, "synthesis_text_override")?;
     let reviewed_hashes = hash_set(conn, "synthesis_text_reviewed")?;
@@ -424,6 +653,7 @@ struct DecisionQueryRow {
     source_text: String,
     synthesis_text: Option<String>,
     shared_line_count: usize,
+    mapped_text: Option<String>,
 }
 
 fn list_override_rows(
@@ -432,22 +662,37 @@ fn list_override_rows(
     after: i64,
     limit: usize,
 ) -> Result<Vec<DecisionQueryRow>, AppError> {
+    if !corpus_cache_ready(conn, project_id)? {
+        let mut stmt = conn.prepare(
+            "WITH project_strings AS (
+               SELECT trim(text) AS source_text,min(id) AS line_id,
+                      min(strref) AS strref,count(*) AS shared_count
+               FROM line WHERE project_id=?1 AND trim(text)<>'' GROUP BY trim(text)
+             )
+             SELECT ps.line_id,ps.strref,s.source_text,o.synthesis_text,ps.shared_count
+             FROM synthesis_text_override o
+             JOIN synthesis_text_string s ON s.text_hash=o.text_hash
+             JOIN project_strings ps ON ps.source_text=s.source_text
+             WHERE ps.line_id>?2 ORDER BY ps.line_id LIMIT ?3",
+        )?;
+        return Ok(stmt
+            .query_map(params![project_id, after, limit as i64], |r| {
+                Ok(DecisionQueryRow {
+                    line_id: r.get(0)?, strref: r.get(1)?, source_text: r.get(2)?,
+                    synthesis_text: Some(r.get(3)?),
+                    shared_line_count: r.get::<_, i64>(4)? as usize,
+                    mapped_text: None,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?);
+    }
     let mut stmt = conn.prepare(
-        "WITH project_strings AS (
-           SELECT trim(text) AS source_text,
-                  min(id) AS line_id,
-                  min(strref) AS strref,
-                  count(*) AS shared_count
-           FROM line
-           WHERE project_id = ?1 AND trim(text) <> ''
-           GROUP BY trim(text)
-         )
-         SELECT ps.line_id, ps.strref, s.source_text, o.synthesis_text, ps.shared_count
+        "SELECT c.first_line_id,c.first_strref,c.source_text,o.synthesis_text,
+                c.shared_count,c.mapped_text
          FROM synthesis_text_override o
-         JOIN synthesis_text_string s ON s.text_hash = o.text_hash
-         JOIN project_strings ps ON ps.source_text = s.source_text
-         WHERE ps.line_id > ?2
-         ORDER BY ps.line_id
+         JOIN synthesis_corpus_cache c ON c.text_hash=o.text_hash AND c.project_id=?1
+         WHERE c.first_line_id > ?2
+         ORDER BY c.first_line_id
          LIMIT ?3",
     )?;
     let rows = stmt
@@ -458,6 +703,7 @@ fn list_override_rows(
                 source_text: r.get(2)?,
                 synthesis_text: Some(r.get(3)?),
                 shared_line_count: r.get::<_, i64>(4)? as usize,
+                mapped_text: Some(r.get(5)?),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -470,23 +716,38 @@ fn list_reviewed_rows(
     after: i64,
     limit: usize,
 ) -> Result<Vec<DecisionQueryRow>, AppError> {
+    if !corpus_cache_ready(conn, project_id)? {
+        let mut stmt = conn.prepare(
+            "WITH project_strings AS (
+               SELECT trim(text) AS source_text,min(id) AS line_id,
+                      min(strref) AS strref,count(*) AS shared_count
+               FROM line WHERE project_id=?1 AND trim(text)<>'' GROUP BY trim(text)
+             )
+             SELECT ps.line_id,ps.strref,s.source_text,ps.shared_count
+             FROM synthesis_text_reviewed r
+             JOIN synthesis_text_string s ON s.text_hash=r.text_hash
+             JOIN project_strings ps ON ps.source_text=s.source_text
+             WHERE r.text_hash NOT IN (SELECT text_hash FROM synthesis_text_override)
+               AND ps.line_id>?2 ORDER BY ps.line_id LIMIT ?3",
+        )?;
+        return Ok(stmt
+            .query_map(params![project_id, after, limit as i64], |r| {
+                Ok(DecisionQueryRow {
+                    line_id: r.get(0)?, strref: r.get(1)?, source_text: r.get(2)?,
+                    synthesis_text: None,
+                    shared_line_count: r.get::<_, i64>(3)? as usize,
+                    mapped_text: None,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?);
+    }
     let mut stmt = conn.prepare(
-        "WITH project_strings AS (
-           SELECT trim(text) AS source_text,
-                  min(id) AS line_id,
-                  min(strref) AS strref,
-                  count(*) AS shared_count
-           FROM line
-           WHERE project_id = ?1 AND trim(text) <> ''
-           GROUP BY trim(text)
-         )
-         SELECT ps.line_id, ps.strref, s.source_text, ps.shared_count
+        "SELECT c.first_line_id,c.first_strref,c.source_text,c.shared_count,c.mapped_text
          FROM synthesis_text_reviewed r
-         JOIN synthesis_text_string s ON s.text_hash = r.text_hash
-         JOIN project_strings ps ON ps.source_text = s.source_text
+         JOIN synthesis_corpus_cache c ON c.text_hash=r.text_hash AND c.project_id=?1
          WHERE r.text_hash NOT IN (SELECT text_hash FROM synthesis_text_override)
-           AND ps.line_id > ?2
-         ORDER BY ps.line_id
+           AND c.first_line_id > ?2
+         ORDER BY c.first_line_id
          LIMIT ?3",
     )?;
     let rows = stmt
@@ -497,6 +758,7 @@ fn list_reviewed_rows(
                 source_text: r.get(2)?,
                 synthesis_text: None,
                 shared_line_count: r.get::<_, i64>(3)? as usize,
+                mapped_text: Some(r.get(4)?),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -509,7 +771,10 @@ fn row_to_decision(
     mapper_enabled: bool,
 ) -> Result<SynthesisDecisionRow, AppError> {
     let synthesis_text = row.synthesis_text.clone();
-    let mapped_text = mapped_synthesis_text(conn, &row.source_text, mapper_enabled)?.0;
+    let mapped_text = match row.mapped_text {
+        Some(mapped) => mapped,
+        None => mapped_synthesis_text(conn, &row.source_text, mapper_enabled)?.0,
+    };
     let audit_reason = synthesis_text.as_deref().and_then(|text| {
         crate::synthesis_validation::audit_override_row(
             row.line_id,
@@ -832,13 +1097,30 @@ pub fn corpus_audit_summary(
     project_id: i64,
     mapper_enabled: bool,
 ) -> Result<SynthesisCorpusAuditSummary, AppError> {
-    let stale_reviews_cleared =
-        reconcile_stale_reviews(conn, project_id, mapper_enabled)?;
-    let texts = project_texts(conn, Some(project_id))?;
+    ensure_corpus_cache(conn, project_id, mapper_enabled)?;
+    let stale_reviews_cleared = reconcile_stale_reviews(conn, project_id, mapper_enabled)?;
+    let mut summary = corpus_audit_summary_readonly(conn, project_id)?;
+    summary.stale_reviews_cleared = stale_reviews_cleared;
+    Ok(summary)
+}
+
+pub fn corpus_audit_summary_readonly(
+    conn: &Connection,
+    project_id: i64,
+) -> Result<SynthesisCorpusAuditSummary, AppError> {
     let overrides = hash_set(conn, "synthesis_text_override")?;
     let reviewed = hash_set(conn, "synthesis_text_reviewed")?;
+    let mut stmt = conn.prepare(
+        "SELECT text_hash,audit_mask FROM synthesis_corpus_cache \
+         WHERE project_id=?1",
+    )?;
+    let rows = stmt
+        .query_map([project_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut summary = SynthesisCorpusAuditSummary {
-        unique_strings: texts.len(),
+        unique_strings: rows.len(),
         plain_ok: 0,
         mapped_ok: 0,
         stripped_unknown_cue: 0,
@@ -849,11 +1131,10 @@ pub fn corpus_audit_summary(
         tts_unfriendly_spelling: 0,
         non_speakable: 0,
         flagged_undecided: 0,
-        stale_reviews_cleared,
+        stale_reviews_cleared: 0,
     };
-    for text in texts {
-        let mapped = mapped_synthesis_text(conn, &text, mapper_enabled)?.0;
-        let flags = audit_flags_for_mapped(conn, &text, &mapped, mapper_enabled)?;
+    for (hash, mask) in rows {
+        let flags = flags_from_mask(mask);
         for flag in &flags {
             match flag {
                 CorpusAuditFlag::PlainOk => summary.plain_ok += 1,
@@ -869,8 +1150,7 @@ pub fn corpus_audit_summary(
                 CorpusAuditFlag::NonSpeakable => summary.non_speakable += 1,
             }
         }
-        if crate::synthesis_corpus_audit::needs_agent_attention(&flags)
-            && is_undecided_hash(&text_hash(&text), &overrides, &reviewed)
+        if mask & ATTENTION_MASK != 0 && is_undecided_hash(&hash, &overrides, &reviewed)
         {
             summary.flagged_undecided += 1;
         }
@@ -883,31 +1163,22 @@ pub fn reconcile_stale_reviews(
     project_id: i64,
     mapper_enabled: bool,
 ) -> Result<usize, AppError> {
+    ensure_corpus_cache(conn, project_id, mapper_enabled)?;
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT r.text_hash,s.source_text \
+        "SELECT DISTINCT r.text_hash \
          FROM synthesis_text_reviewed r \
-         JOIN synthesis_text_string s ON s.text_hash=r.text_hash \
-         JOIN line l ON trim(l.text)=s.source_text \
+         JOIN synthesis_corpus_cache c ON c.text_hash=r.text_hash \
          LEFT JOIN synthesis_text_override o ON o.text_hash=r.text_hash \
-         WHERE l.project_id=?1 AND o.text_hash IS NULL",
+         WHERE c.project_id=?1 AND o.text_hash IS NULL \
+           AND (c.audit_mask & ?2) != 0",
     )?;
     let rows = stmt
-        .query_map([project_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
+        .query_map(params![project_id, ATTENTION_MASK], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
-    let mut stale = Vec::new();
-    for (hash, text) in rows {
-        let mapped = mapped_synthesis_text(conn, &text, mapper_enabled)?.0;
-        let flags = audit_flags_for_mapped(conn, &text, &mapped, mapper_enabled)?;
-        if crate::synthesis_corpus_audit::needs_agent_attention(&flags) {
-            stale.push(hash);
-        }
-    }
     let tx = conn.unchecked_transaction()?;
     let mut cleared = 0;
-    for hash in stale {
+    for hash in rows {
         cleared += tx.execute(
             "DELETE FROM synthesis_text_reviewed WHERE text_hash=?1",
             [hash],
@@ -917,12 +1188,42 @@ pub fn reconcile_stale_reviews(
     Ok(cleared)
 }
 
+fn uncached_project_rows(
+    conn: &Connection,
+    project_id: i64,
+    after: i64,
+) -> Result<Vec<(i64, i64, String, usize)>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT min(id),min(strref),trim(text),count(*) FROM line \
+         WHERE project_id=?1 AND trim(text)<>'' GROUP BY trim(text) \
+         HAVING min(id)>?2 ORDER BY min(id)",
+    )?;
+    let rows = stmt
+        .query_map(params![project_id, after], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? as usize))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn map_and_audit_uncached(
+    source_text: &str,
+    dictionary_rules: &[DictionaryRule],
+    tag_rules: &[TagRule],
+    cue_map: &std::collections::HashMap<String, String>,
+) -> (String, Vec<CorpusAuditFlag>) {
+    let mapped = mapped_with_rules(source_text, true, dictionary_rules, tag_rules).0;
+    let flags = crate::synthesis_corpus_audit::audit_source_and_mapped_text_with_cues(
+        source_text, &mapped, true, Some(cue_map));
+    (mapped, flags)
+}
+
 pub fn list_flagged(
     conn: &Connection,
     project_id: i64,
     after: i64,
     limit: usize,
-    mapper_enabled: bool,
+    _mapper_enabled: bool,
     undecided_only: bool,
     query: Option<&str>,
     flag: Option<&str>,
@@ -932,6 +1233,26 @@ pub fn list_flagged(
     let flag = parse_flag_filter(flag)?;
     let overrides = hash_set(conn, "synthesis_text_override")?;
     let reviewed = hash_set(conn, "synthesis_text_reviewed")?;
+    if !corpus_cache_ready(conn, project_id)? {
+        let dictionary_rules = crate::dictionary::load_enabled_rules(conn)?;
+        let tag_rules = crate::tag_rules::load_enabled_rules(conn)?;
+        let cue_map = crate::tag_rules::stage_cue_tag_map(&tag_rules);
+        let mut rows = Vec::new();
+        let mut last_scanned = after;
+        for (line_id, strref, source_text, shared_count) in uncached_project_rows(conn, project_id, after)? {
+            last_scanned = line_id;
+            let hash = text_hash(&source_text);
+            if undecided_only && !is_undecided_hash(&hash, &overrides, &reviewed) { continue; }
+            let (mapped_text, flags) = map_and_audit_uncached(&source_text, &dictionary_rules, &tag_rules, &cue_map);
+            if !crate::synthesis_corpus_audit::needs_agent_attention(&flags)
+                || !flags_match_filter(&flags, flag) { continue; }
+            if query.as_ref().is_some_and(|q| !text_fields_match(&[&source_text, &mapped_text], q)) { continue; }
+            rows.push(SynthesisFlaggedRow { line_id, strref, source_text, mapped_text, flags, shared_line_count: shared_count });
+            if rows.len() >= limit { break; }
+        }
+        let next_after = (rows.len() >= limit && last_scanned > after).then_some(last_scanned);
+        return Ok(ListSynthesisFlaggedResult { rows, next_after });
+    }
     let mut rows = Vec::new();
     let mut cursor = after;
     let mut last_scanned = after;
@@ -948,14 +1269,8 @@ pub fn list_flagged(
             if undecided_only && !is_undecided_hash(&hash, &overrides, &reviewed) {
                 continue;
             }
-            let mapped_text =
-                mapped_synthesis_text(conn, &entry.source_text, mapper_enabled)?.0;
-            let flags = audit_flags_for_mapped(
-                conn,
-                &entry.source_text,
-                &mapped_text,
-                mapper_enabled,
-            )?;
+            let mapped_text = entry.mapped_text;
+            let flags = flags_from_mask(entry.audit_mask);
             if !crate::synthesis_corpus_audit::needs_agent_attention(&flags) {
                 continue;
             }
@@ -997,7 +1312,7 @@ pub fn list_remaining(
     project_id: i64,
     after: i64,
     limit: usize,
-    mapper_enabled: bool,
+    _mapper_enabled: bool,
     query: Option<&str>,
     flag: Option<&str>,
 ) -> Result<ListSynthesisReviewResult, AppError> {
@@ -1006,6 +1321,24 @@ pub fn list_remaining(
     let flag = parse_flag_filter(flag)?;
     let overrides = hash_set(conn, "synthesis_text_override")?;
     let reviewed = hash_set(conn, "synthesis_text_reviewed")?;
+    if !corpus_cache_ready(conn, project_id)? {
+        let dictionary_rules = crate::dictionary::load_enabled_rules(conn)?;
+        let tag_rules = crate::tag_rules::load_enabled_rules(conn)?;
+        let cue_map = crate::tag_rules::stage_cue_tag_map(&tag_rules);
+        let mut rows = Vec::new();
+        let mut last_scanned = after;
+        for (line_id, strref, source_text, shared_count) in uncached_project_rows(conn, project_id, after)? {
+            last_scanned = line_id;
+            if !is_undecided_hash(&text_hash(&source_text), &overrides, &reviewed) { continue; }
+            let (mapped_text, flags) = map_and_audit_uncached(&source_text, &dictionary_rules, &tag_rules, &cue_map);
+            if !flags_match_filter(&flags, flag) { continue; }
+            if query.as_ref().is_some_and(|q| !text_fields_match(&[&source_text, &mapped_text], q)) { continue; }
+            rows.push(SynthesisReviewRow { line_id, strref, source_text, mapped_text, flags, shared_line_count: shared_count });
+            if rows.len() >= limit { break; }
+        }
+        let next_after = (rows.len() >= limit && last_scanned > after).then_some(last_scanned);
+        return Ok(ListSynthesisReviewResult { rows, next_after });
+    }
     let mut rows = Vec::new();
     let mut cursor = after;
     let mut last_scanned = after;
@@ -1026,14 +1359,8 @@ pub fn list_remaining(
             ) {
                 continue;
             }
-            let mapped_text =
-                mapped_synthesis_text(conn, &entry.source_text, mapper_enabled)?.0;
-            let flags = audit_flags_for_mapped(
-                conn,
-                &entry.source_text,
-                &mapped_text,
-                mapper_enabled,
-            )?;
+            let mapped_text = entry.mapped_text;
+            let flags = flags_from_mask(entry.audit_mask);
             if !flags_match_filter(&flags, flag) {
                 continue;
             }
@@ -1073,6 +1400,8 @@ struct ProjectStringRow {
     strref: i64,
     source_text: String,
     shared_count: usize,
+    mapped_text: String,
+    audit_mask: i64,
 }
 
 fn project_string_batch(
@@ -1081,10 +1410,32 @@ fn project_string_batch(
     after: i64,
     limit: usize,
 ) -> Result<Vec<ProjectStringRow>, AppError> {
+    if !corpus_cache_ready(conn, project_id)? {
+        let dictionary_rules = crate::dictionary::load_enabled_rules(conn)?;
+        let tag_rules = crate::tag_rules::load_enabled_rules(conn)?;
+        let cue_map = crate::tag_rules::stage_cue_tag_map(&tag_rules);
+        let mut stmt = conn.prepare(
+            "SELECT min(id),min(strref),trim(text),count(*) FROM line \
+             WHERE project_id=?1 AND trim(text)<>'' GROUP BY trim(text) \
+             HAVING min(id)>?2 ORDER BY min(id) LIMIT ?3",
+        )?;
+        let source_rows = stmt
+            .query_map(params![project_id, after, limit as i64], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        return Ok(source_rows.into_iter().map(|(line_id, strref, source_text, shared_count)| {
+            let mapped_text = mapped_with_rules(&source_text, true, &dictionary_rules, &tag_rules).0;
+            let flags = crate::synthesis_corpus_audit::audit_source_and_mapped_text_with_cues(
+                &source_text, &mapped_text, true, Some(&cue_map));
+            ProjectStringRow { line_id, strref, source_text, shared_count: shared_count as usize,
+                mapped_text, audit_mask: flags_mask(&flags) }
+        }).collect());
+    }
     let mut stmt = conn.prepare(
-        "SELECT min(id), min(strref), trim(text), count(*) \
-         FROM line WHERE project_id=?1 AND trim(text)<>'' \
-         GROUP BY trim(text) HAVING min(id)>?2 ORDER BY min(id) LIMIT ?3",
+        "SELECT first_line_id,first_strref,source_text,shared_count,mapped_text,audit_mask \
+         FROM synthesis_corpus_cache WHERE project_id=?1 AND first_line_id>?2 \
+         ORDER BY first_line_id LIMIT ?3",
     )?;
     let rows = stmt
         .query_map(params![project_id, after, limit as i64], |r| {
@@ -1093,6 +1444,8 @@ fn project_string_batch(
                 strref: r.get(1)?,
                 source_text: r.get(2)?,
                 shared_count: r.get::<_, i64>(3)? as usize,
+                mapped_text: r.get(4)?,
+                audit_mask: r.get(5)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1104,20 +1457,26 @@ pub fn auto_review_plain(
     project_id: i64,
     mapper_enabled: bool,
 ) -> Result<AutoReviewPlainResult, AppError> {
-    let texts = project_texts(conn, Some(project_id))?;
+    ensure_corpus_cache(conn, project_id, mapper_enabled)?;
+    let mut stmt = conn.prepare(
+        "SELECT text_hash,source_text FROM synthesis_corpus_cache \
+         WHERE project_id=?1 AND audit_mask=?2",
+    )?;
+    let texts = stmt
+        .query_map(params![project_id, FLAG_PLAIN_OK], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
     let overrides = hash_set(conn, "synthesis_text_override")?;
     let reviewed = hash_set(conn, "synthesis_text_reviewed")?;
     let mut hashes = Vec::new();
-    for text in texts {
-        let hash = text_hash(&text);
+    for (hash, text) in texts {
         if !is_undecided_hash(&hash, &overrides, &reviewed) {
             continue;
         }
-        let mapped = mapped_synthesis_text(conn, &text, mapper_enabled)?.0;
-        if audit_flags_for_mapped(conn, &text, &mapped, mapper_enabled)? == [CorpusAuditFlag::PlainOk] {
-            ensure_string(conn, &text)?;
-            hashes.push(hash);
-        }
+        ensure_string(conn, &text)?;
+        hashes.push(hash);
     }
     let tx = conn.unchecked_transaction()?;
     let mut reviewed_count = 0usize;
@@ -1158,6 +1517,35 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn corpus_cache_rebuilds_after_explicit_invalidation() {
+        let conn = db();
+        assert!(!corpus_cache_ready(&conn, 1).unwrap());
+        assert!(ensure_corpus_cache(&conn, 1, true).unwrap() > 0);
+        assert!(corpus_cache_ready(&conn, 1).unwrap());
+        let before: String = conn
+            .query_row(
+                "SELECT source_text FROM synthesis_corpus_cache WHERE project_id=1 AND first_line_id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, "Hello *sniff* there.");
+
+        conn.execute("UPDATE line SET text='Changed dialogue.' WHERE id=1", [])
+            .unwrap();
+        invalidate_corpus_cache(&conn, Some(1)).unwrap();
+        ensure_corpus_cache(&conn, 1, true).unwrap();
+        let after: String = conn
+            .query_row(
+                "SELECT source_text FROM synthesis_corpus_cache WHERE project_id=1 AND first_line_id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, "Changed dialogue.");
     }
 
     fn db_with_lines() -> Connection {

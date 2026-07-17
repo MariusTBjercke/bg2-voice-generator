@@ -16,17 +16,38 @@ use tauri::{AppHandle, State};
 use crate::audio::ffmpeg;
 use crate::commands::progress::{ProgressEmitter, OP_HARVEST, OP_SPEECH_VERIFY};
 use crate::db::harvest::{
-    auto_approve_best, auto_approve_manual_gaps, persist, set_decision, AutoApproveCounts, HarvestPersistCounts,
-    ResetDecisionsCounts,
+    auto_approve_best, auto_approve_manual_gaps, existing_sample_sound_keys,
+    gap_fill_eligible_speakers, gap_fill_voiced_lines, persist_additive, set_decision,
+    AutoApproveCounts, HarvestPersistCounts, ResetDecisionsCounts,
 };
 use crate::db::queries::{
     reference_sample_from_row, speaker_from_row, REFERENCE_SAMPLE_COLUMNS, SPEAKER_COLUMNS,
 };
 use crate::error::AppError;
-use crate::models::{ReferenceSample, SampleDecision, Speaker, SpeakerGroup};
+use crate::models::{
+    ReferenceSample, SampleDecision, SetSpeakerGroupExcludedResult, Speaker, SpeakerGroup,
+};
 use crate::commands::settings::read_setting;
-use crate::voices::harvest::{harvest, resolve_harvest_parallelism, HarvestReport, KEY_HARVEST_PARALLELISM};
+use crate::audio::candidates::VoicedLine;
+use crate::voices::harvest::{
+    harvest, resolve_harvest_parallelism, GapFillSpeakerInput, HarvestReport,
+    KEY_HARVEST_PARALLELISM,
+};
 use crate::AppState;
+
+async fn run_db_read<T, F>(state: &AppState, work: F) -> Result<T, AppError>
+where
+    T: Send + 'static,
+    F: FnOnce(&rusqlite::Connection) -> Result<T, AppError> + Send + 'static,
+{
+    let path = state.db_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = crate::db::open_read_db(&path)?;
+        work(&conn)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("database read task failed: {e}")))?
+}
 
 /// The combined result of a harvest run: what was decoded/scored and what was
 /// written to the DB.
@@ -41,8 +62,11 @@ pub struct HarvestResult {
 ///
 /// Emits indeterminate progress on `operation://progress` (a live candidate count -
 /// the total is unknown until selection) and honors `cancel_operation("harvest")`.
-/// A cancelled run persists the samples decoded before the stop (harvest is
-/// idempotent, so keeping the partial work is safe).
+/// A cancelled run persists the samples decoded before the stop. Re-harvest is
+/// **additive**: existing samples, approvals, clones, and demographic donors are
+/// kept; only newly discovered sound resrefs are decoded and inserted. Speakers
+/// with Ready lines and few automatic samples also receive an Attribution gap-fill
+/// pass (uniquely attributed official VO, capped).
 #[tauri::command]
 pub async fn harvest_references(
     app: AppHandle,
@@ -54,16 +78,49 @@ pub async fn harvest_references(
 
     // Resolve the project + workspace under a SHORT lock, then release it so the
     // long decode loop below runs WITHOUT the DB lock (health polling stays live).
-    let (project_id, workspace, parallelism) = {
+    let (project_id, workspace, parallelism, existing_keys, gap_fill) = {
         let conn = state.db.lock().await;
         let project_id = ensure_project(&conn, &game_dir, locale.as_deref())?;
         let parallelism = resolve_harvest_parallelism(
             read_setting(&conn, KEY_HARVEST_PARALLELISM)?.as_deref(),
         );
+        let existing_keys = existing_sample_sound_keys(&conn, project_id)?;
+        let eligible = gap_fill_eligible_speakers(&conn, project_id)?;
+        let speaker_ids: Vec<i64> = eligible.iter().map(|s| s.speaker_id).collect();
+        let voiced = gap_fill_voiced_lines(&conn, project_id, &speaker_ids)?;
+        let mut lines_by_cre: std::collections::HashMap<String, Vec<VoicedLine>> =
+            std::collections::HashMap::new();
+        for line in voiced {
+            lines_by_cre
+                .entry(line.cre_resref.clone())
+                .or_default()
+                .push(VoicedLine {
+                    strref: line.strref,
+                    sound_resref: line.sound_resref,
+                    source_text: line.source_text,
+                    attribution_confidence: line.attribution_confidence,
+                });
+        }
+        let gap_fill: Vec<GapFillSpeakerInput> = eligible
+            .into_iter()
+            .filter_map(|s| {
+                let lines = lines_by_cre.remove(&s.cre_resref)?;
+                if lines.is_empty() {
+                    return None;
+                }
+                Some(GapFillSpeakerInput {
+                    cre_resref: s.cre_resref,
+                    identity_key: s.identity_key,
+                    lines,
+                })
+            })
+            .collect();
         (
             project_id,
             workspace_dir(&state.db_path, project_id),
             parallelism,
+            existing_keys,
+            gap_fill,
         )
     };
 
@@ -84,6 +141,8 @@ pub async fn harvest_references(
                 ffmpeg_bin.as_deref(),
                 &workspace,
                 parallelism,
+                &existing_keys,
+                &gap_fill,
                 move |p| {
                     if let Ok(mut e) = emitter.lock() {
                         e.tick(
@@ -113,15 +172,12 @@ pub async fn harvest_references(
         }
     };
 
-    // A re-harvest resets audition decisions to `pending` so the freshly-scored
-    // samples can be re-auditioned (and auto-approve re-run) without first having to
-    // clear every prior approval by hand.
     let mut conn = state.db.lock().await;
-    // Only a completed run with a usable decoder is authoritative. The ffmpeg
-    // resolver may fall back to a bare command name, so an all-decodes-failed run
-    // is treated like a missing decoder and must never erase prior work.
-    let authoritative = harvest_is_authoritative(cancelled, &report);
-    let persisted = persist(&mut conn, project_id, &samples, false, authoritative)?;
+    let mut persisted = persist_additive(&mut conn, project_id, &samples)?;
+    // Candidates skipped before decode (already in DB) count as "already present".
+    persisted.samples_skipped_existing = persisted
+        .samples_skipped_existing
+        .saturating_add(report.candidates_already_present);
     drop(conn);
 
     let phase = if cancelled { "cancelled" } else { "done" };
@@ -129,16 +185,14 @@ pub async fn harvest_references(
         phase,
         report.candidates_seen as u64,
         None,
-        Some(format!("{} samples harvested", report.samples_harvested)),
+        Some(format!(
+            "{} new samples ({} already present, {} gap-fill)",
+            persisted.samples_added,
+            persisted.samples_skipped_existing,
+            report.gap_fill_samples
+        )),
     );
     Ok(HarvestResult { report, persisted })
-}
-
-fn harvest_is_authoritative(cancelled: bool, report: &HarvestReport) -> bool {
-    let decoder_failed_completely = report.candidates_seen > 0
-        && report.samples_harvested == 0
-        && report.decode_failures == report.candidates_seen;
-    !cancelled && !report.ffmpeg_missing && !decoder_failed_completely
 }
 
 /// List the attributed speakers for the project rooted at `game_dir` so the UI
@@ -150,25 +204,14 @@ pub async fn list_speakers(
     state: State<'_, AppState>,
     game_dir: String,
 ) -> Result<Vec<Speaker>, AppError> {
-    use rusqlite::OptionalExtension;
-    let conn = state.db.lock().await;
-    let project_id: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM project WHERE game_root=?1",
-            params![game_dir],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let Some(project_id) = project_id else {
-        return Ok(Vec::new());
-    };
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {SPEAKER_COLUMNS} FROM speaker WHERE project_id=?1 ORDER BY id"
-    ))?;
-    let rows = stmt
-        .query_map(params![project_id], speaker_from_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    run_db_read(&state, move |conn| {
+        use rusqlite::OptionalExtension;
+        let project_id: Option<i64> = conn.query_row("SELECT id FROM project WHERE game_root=?1", params![game_dir], |r| r.get(0)).optional()?;
+        let Some(project_id) = project_id else { return Ok(Vec::new()); };
+        let mut stmt = conn.prepare(&format!("SELECT {SPEAKER_COLUMNS} FROM speaker WHERE project_id=?1 ORDER BY id"))?;
+        let rows = stmt.query_map(params![project_id], speaker_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }).await
 }
 
 /// List user-facing speaker identity groups for the project at `game_dir`.
@@ -177,7 +220,54 @@ pub async fn list_speaker_groups(
     state: State<'_, AppState>,
     game_dir: String,
 ) -> Result<Vec<SpeakerGroup>, AppError> {
+    run_db_read(&state, move |conn| {
+        use rusqlite::OptionalExtension;
+        let project_id: Option<i64> = conn.query_row("SELECT id FROM project WHERE game_root=?1", params![game_dir], |r| r.get(0)).optional()?;
+        project_id.map(|id| crate::db::speaker_groups::list_speaker_groups(conn, id)).transpose().map(|v| v.unwrap_or_default())
+    }).await
+}
+
+/// Count generation rows for every line attributed to an identity group.
+#[tauri::command]
+pub async fn count_speaker_group_generations(
+    state: State<'_, AppState>,
+    game_dir: String,
+    identity_key: String,
+) -> Result<i64, AppError> {
+    run_db_read(&state, move |conn| {
+        use rusqlite::OptionalExtension;
+        let project_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM project WHERE game_root=?1",
+                params![game_dir],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(project_id) = project_id else {
+            return Ok(0);
+        };
+        crate::db::speaker_groups::count_speaker_group_generations(conn, project_id, &identity_key)
+    })
+    .await
+}
+
+/// Exclude (or re-include) every speaker in an identity group from Generate/Export.
+///
+/// When `excluded` is true and `clear_generations` is true, also deletes generation
+/// rows and project-local `<workspace>/generated/<line_id>.ogg` files for that group
+/// (same path safety as `remove_generations`). Re-include ignores `clear_generations`.
+#[tauri::command]
+pub async fn set_speaker_group_excluded(
+    state: State<'_, AppState>,
+    game_dir: String,
+    identity_key: String,
+    excluded: Option<bool>,
+    clear_generations: Option<bool>,
+) -> Result<SetSpeakerGroupExcludedResult, AppError> {
     use rusqlite::OptionalExtension;
+    // Same Option<bool> IPC shape as wipe_downstream / force / reshuffle.
+    let excluded = excluded.unwrap_or(false);
+    let clear_generations = clear_generations.unwrap_or(false);
     let conn = state.db.lock().await;
     let project_id: Option<i64> = conn
         .query_row(
@@ -187,9 +277,61 @@ pub async fn list_speaker_groups(
         )
         .optional()?;
     let Some(project_id) = project_id else {
-        return Ok(Vec::new());
+        return Ok(SetSpeakerGroupExcludedResult::default());
     };
-    crate::db::speaker_groups::list_speaker_groups(&conn, project_id)
+
+    let speakers_updated = crate::db::speaker_groups::set_speakers_excluded(
+        &conn,
+        project_id,
+        &identity_key,
+        excluded,
+    )?;
+
+    let mut result = SetSpeakerGroupExcludedResult {
+        speakers_updated,
+        generations_cleared: 0,
+        files_deleted: 0,
+    };
+
+    if excluded && clear_generations {
+        let line_ids = crate::db::speaker_groups::generation_line_ids_for_group(
+            &conn,
+            project_id,
+            &identity_key,
+        )?;
+        let generated_dir = workspace_dir(&state.db_path, project_id).join("generated");
+        for line_id in line_ids {
+            let output_path: Option<String> = conn
+                .query_row(
+                    "SELECT g.output_path FROM generation g JOIN line l ON l.id=g.line_id \
+                     WHERE g.line_id=?1 AND l.project_id=?2",
+                    params![line_id, project_id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            let removed = conn.execute(
+                "DELETE FROM generation WHERE line_id=?1 AND line_id IN \
+                 (SELECT id FROM line WHERE project_id=?2)",
+                params![line_id, project_id],
+            )?;
+            if removed == 0 {
+                continue;
+            }
+            result.generations_cleared += removed as usize;
+            let expected = generated_dir.join(format!("{line_id}.ogg"));
+            match output_path.map(PathBuf::from) {
+                Some(path) if path == expected && path.exists() => {
+                    if std::fs::remove_file(&path).is_ok() {
+                        result.files_deleted += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 /// List a speaker variant's harvested reference samples.
@@ -266,13 +408,15 @@ pub type AutoApproveResult = AutoApproveCounts;
 /// Auto-approve the best (highest-`overall`) reference sample for each **character
 /// identity group** in the project rooted at `game_dir`. Pass `speaker_id` to narrow
 /// to the group containing that variant. One clip wins across all CRE variants.
-/// project is resolved WITHOUT creating one (mirror `list_speakers`); an unknown dir
-/// yields a zero result. All updates happen in one transaction (see `db::harvest`).
+/// When `only_unapproved` is true, groups that already have an approved sample are
+/// skipped (existing decisions are preserved). When false, prior decisions in each
+/// touched group are reset to one winner. An unknown dir yields a zero result.
 #[tauri::command]
 pub async fn auto_approve_best_samples(
     state: State<'_, AppState>,
     game_dir: String,
     speaker_id: Option<i64>,
+    only_unapproved: Option<bool>,
 ) -> Result<AutoApproveResult, AppError> {
     use rusqlite::OptionalExtension;
     let mut conn = state.db.lock().await;
@@ -286,7 +430,12 @@ pub async fn auto_approve_best_samples(
     let Some(project_id) = project_id else {
         return Ok(AutoApproveResult::default());
     };
-    auto_approve_best(&mut conn, project_id, speaker_id)
+    auto_approve_best(
+        &mut conn,
+        project_id,
+        speaker_id,
+        only_unapproved.unwrap_or(false),
+    )
 }
 
 /// Opt-in fallback that fills exact-speaker gaps from pending manual-only clips.
@@ -597,6 +746,14 @@ mod tests {
 
     #[test]
     fn authoritative_harvest_requires_a_completed_usable_decode_run() {
+        // Kept for the replace/persist path semantics; Harvest UI uses additive persist.
+        fn harvest_is_authoritative(cancelled: bool, report: &HarvestReport) -> bool {
+            let decoder_failed_completely = report.candidates_seen > 0
+                && report.samples_harvested == 0
+                && report.decode_failures == report.candidates_seen;
+            !cancelled && !report.ffmpeg_missing && !decoder_failed_completely
+        }
+
         let complete = HarvestReport {
             candidates_seen: 2,
             samples_harvested: 1,

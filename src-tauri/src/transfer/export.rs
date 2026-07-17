@@ -48,6 +48,9 @@ pub(crate) struct TransferBundle {
     /// Reference-sample REVIEW DECISIONS + provenance/scores metadata. NO audio path.
     #[serde(default)]
     pub sample_decisions: Vec<BundleSampleDecision>,
+    /// Reusable voice metadata only. Managed WAV paths and bytes are never serialized.
+    #[serde(default)]
+    pub voice_profiles: Vec<BundleVoiceProfile>,
     /// Clone bindings (tier + which sample was primary), keyed by speaker cre_resref.
     #[serde(default)]
     pub clones: Vec<BundleClone>,
@@ -91,6 +94,9 @@ pub(crate) struct BundleSpeaker {
     pub dialogue_resref: Option<String>,
     pub provenance_json: String,
     pub confidence: f64,
+    /// Omitted in older bundles; defaults to not excluded.
+    #[serde(default)]
+    pub excluded: bool,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -162,6 +168,33 @@ pub(crate) struct BundleClone {
     /// Ordered natural-key metadata only. No sample ids or local derivative paths.
     #[serde(default)]
     pub references: Vec<BundleCloneReference>,
+    #[serde(default)]
+    pub voice_profile_key: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BundleVoiceProfile {
+    pub key: String,
+    pub display_name: String,
+    pub origin: String,
+    #[serde(default)]
+    pub harvested_speaker_cre_resref: Option<String>,
+    #[serde(default)]
+    pub design_spec_json: Option<String>,
+    #[serde(default)]
+    pub references: Vec<BundleVoiceProfileReference>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BundleVoiceProfileReference {
+    #[serde(default)]
+    pub sample_speaker_cre_resref: Option<String>,
+    #[serde(default)]
+    pub source_strref: Option<i64>,
+    #[serde(default)]
+    pub source_sound_resref: Option<String>,
+    pub transcript: String,
+    pub sort_order: i64,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -181,6 +214,8 @@ pub(crate) struct BundleMetadataBinding {
     pub creature_category: i64,
     #[serde(default)]
     pub donor_cre_resrefs: Vec<String>,
+    #[serde(default)]
+    pub voice_profile_keys: Vec<String>,
 }
 
 /// Gather the project's transferable state from the DB. PURE-ish (read-only): no audio
@@ -228,6 +263,7 @@ pub(crate) fn gather_bundle(
     let shared_groups = gather_shared_groups(conn, project_id)?;
     let lines = gather_lines(conn, project_id)?;
     let sample_decisions = gather_sample_decisions(conn, project_id)?;
+    let voice_profiles = gather_voice_profiles(conn, project_id)?;
     let clones = gather_clones(conn, project_id)?;
     let metadata_bindings = gather_metadata_bindings(conn, project_id)?;
 
@@ -240,15 +276,42 @@ pub(crate) fn gather_bundle(
         shared_groups,
         lines,
         sample_decisions,
+        voice_profiles,
         clones,
         metadata_bindings,
     })
 }
 
+fn gather_voice_profiles(conn: &Connection, project_id: i64) -> Result<Vec<BundleVoiceProfile>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT vp.id,vp.display_name,vp.origin,s.cre_resref,vp.design_spec_json \
+         FROM voice_profile vp LEFT JOIN speaker s ON s.id=vp.harvested_speaker_id \
+         WHERE vp.project_id=?1 ORDER BY vp.id",
+    )?;
+    let rows = stmt.query_map([project_id], |r| Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut out = Vec::new();
+    for (id,display_name,origin,harvested_speaker_cre_resref,design_spec_json) in rows {
+        let mut refs = conn.prepare(
+            "SELECT owner.cre_resref,rs.source_strref,rs.source_sound_resref,vpr.transcript,vpr.sort_order \
+             FROM voice_profile_reference vpr \
+             LEFT JOIN reference_sample rs ON rs.id=vpr.reference_sample_id \
+             LEFT JOIN speaker owner ON owner.id=rs.speaker_id \
+             WHERE vpr.voice_profile_id=?1 ORDER BY vpr.sort_order,vpr.id",
+        )?;
+        let references = refs.query_map([id], |r| Ok(BundleVoiceProfileReference {
+            sample_speaker_cre_resref:r.get(0)?,source_strref:r.get(1)?,source_sound_resref:r.get(2)?,
+            transcript:r.get(3)?,sort_order:r.get(4)?,
+        }))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        out.push(BundleVoiceProfile { key:format!("profile-{id}"),display_name,origin,harvested_speaker_cre_resref,design_spec_json,references });
+    }
+    Ok(out)
+}
+
 fn gather_speakers(conn: &Connection, project_id: i64) -> Result<Vec<BundleSpeaker>, AppError> {
     let mut stmt = conn.prepare(
         "SELECT cre_resref, display_name, long_name_strref, sex, race, class, kit, alignment, \
-                creature_category, dialogue_resref, provenance_json, confidence \
+                creature_category, dialogue_resref, provenance_json, confidence, excluded \
          FROM speaker WHERE project_id = ?1 ORDER BY cre_resref",
     )?;
     let rows = stmt
@@ -266,6 +329,7 @@ fn gather_speakers(conn: &Connection, project_id: i64) -> Result<Vec<BundleSpeak
                 dialogue_resref: r.get(9)?,
                 provenance_json: r.get(10)?,
                 confidence: r.get(11)?,
+                excluded: r.get::<_, i64>(12)? != 0,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -407,7 +471,7 @@ fn gather_sample_decisions(
 /// re-harvests and rebinds locally.
 fn gather_clones(conn: &Connection, project_id: i64) -> Result<Vec<BundleClone>, AppError> {
     let mut stmt = conn.prepare(
-        "SELECT s.cre_resref, c.binding_source, c.status, c.render_settings_json \
+        "SELECT s.cre_resref, c.binding_source, c.status, c.render_settings_json, c.voice_profile_id \
          FROM clone c \
          JOIN speaker s ON s.id = c.speaker_id \
          WHERE s.project_id = ?1 ORDER BY s.cre_resref",
@@ -429,6 +493,7 @@ fn gather_clones(conn: &Connection, project_id: i64) -> Result<Vec<BundleClone>,
                 status: r.get(2)?,
                 render_settings,
                 references: Vec::new(),
+                voice_profile_key: r.get::<_,Option<i64>>(4)?.map(|id| format!("profile-{id}")),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -492,7 +557,20 @@ fn gather_metadata_bindings(
             race,
             creature_category,
             donor_cre_resrefs: cre.into_iter().collect(),
+            voice_profile_keys: Vec::new(),
         });
+    }
+    for binding in &mut out {
+        let mut profiles = conn.prepare(
+            "SELECT mbp.voice_profile_id FROM metadata_binding mb \
+             JOIN metadata_binding_profile mbp ON mbp.binding_id=mb.id \
+             WHERE mb.project_id=?1 AND mb.sex=?2 AND mb.race=?3 AND mb.creature_category=?4 \
+             ORDER BY mbp.sort_order,mbp.voice_profile_id",
+        )?;
+        binding.voice_profile_keys = profiles.query_map(
+            rusqlite::params![project_id,binding.sex,binding.race,binding.creature_category],
+            |r| r.get::<_,i64>(0),
+        )?.map(|row| row.map(|id| format!("profile-{id}"))).collect::<rusqlite::Result<_>>()?;
     }
     Ok(out)
 }

@@ -150,6 +150,7 @@ pub async fn generate_batch(
                         && is_current_on_disk(
                             &generation,
                             job.clone_id,
+                            job.voice_profile_id,
                             job.reference_sample_id,
                             &job.render_settings_fingerprint,
                             &job.reference_fingerprint,

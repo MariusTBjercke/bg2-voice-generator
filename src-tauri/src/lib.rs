@@ -94,6 +94,7 @@ pub fn run() {
             let db_path = data_dir.join(db::DB_FILE_NAME);
             log::info!("Database ready at {}", db_path.display());
             commands::agent::refresh_all_agent_workspaces(&conn, &db_path);
+            commands::voice_profiles::cleanup_abandoned_design_previews(&conn, &db_path);
 
             let http = reqwest::Client::new();
             let omnivoice = Arc::new(OmniVoiceEngine::new(&tools, http.clone()));
@@ -150,10 +151,13 @@ pub fn run() {
             commands::attribution::scan_attribution,
             commands::attribution::get_attribution_counts,
             commands::attribution::list_blocked_lines,
+            commands::attribution::list_blocked_lines_page,
             commands::attribution::reapply_token_standins,
             commands::harvest::harvest_references,
             commands::harvest::list_speakers,
             commands::harvest::list_speaker_groups,
+            commands::harvest::count_speaker_group_generations,
+            commands::harvest::set_speaker_group_excluded,
             commands::harvest::list_group_reference_samples,
             commands::harvest::list_reference_samples,
             commands::harvest::set_sample_decision,
@@ -200,6 +204,16 @@ pub fn run() {
             commands::metadata_binding::clear_all_metadata_pools,
             commands::metadata_binding::clear_speaker_clones,
             commands::metadata_binding::apply_metadata_bindings,
+            commands::voice_profiles::list_voice_profiles,
+            commands::voice_profiles::select_voice_reference_files,
+            commands::voice_profiles::create_imported_voice_profile,
+            commands::voice_profiles::generate_designed_voice_candidates,
+            commands::voice_profiles::save_designed_voice_profile,
+            commands::voice_profiles::rename_voice_profile,
+            commands::voice_profiles::delete_voice_profile,
+            commands::voice_profiles::bind_speaker_voice_profile,
+            commands::metadata_binding::add_metadata_profile,
+            commands::metadata_binding::remove_metadata_profile,
             commands::export::build_export,
             commands::transfer::export_project,
             commands::transfer::import_project,

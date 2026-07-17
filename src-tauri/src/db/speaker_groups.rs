@@ -3,7 +3,7 @@
 //! The UI may collect same-name CRE rows for review, but voice decisions only cross
 //! variants when Attribution recorded stronger companion/side-dialogue evidence.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -140,8 +140,49 @@ pub fn identity_key_for_speaker(conn: &Connection, speaker_id: i64) -> Result<St
     Ok(format!("ungrouped:{exists}"))
 }
 
+/// UI display-group key for one speaker (same long-name strref merges variants).
+pub fn display_identity_key_for_speaker(
+    conn: &Connection,
+    speaker_id: i64,
+) -> Result<String, AppError> {
+    let (id, long_name_strref): (i64, Option<i64>) = conn.query_row(
+        "SELECT id, long_name_strref FROM speaker WHERE id=?1",
+        params![speaker_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(identity_key(long_name_strref, id))
+}
+
 /// List every user-facing speaker group for a project.
 pub fn list_speaker_groups(conn: &Connection, project_id: i64) -> Result<Vec<SpeakerGroup>, AppError> {
+    let mut sounds_by_speaker: HashMap<i64, HashSet<String>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT rs.speaker_id, rs.id, rs.source_sound_resref \
+             FROM reference_sample rs \
+             JOIN speaker s ON s.id = rs.speaker_id \
+             WHERE s.project_id=?1 AND rs.decision='approved'",
+        )?;
+        let rows = stmt.query_map(params![project_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (speaker_id, sample_id, sound) = row?;
+            let key = match sound.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()) {
+                Some(s) => s.to_ascii_lowercase(),
+                None => format!("unknown:{sample_id}"),
+            };
+            sounds_by_speaker
+                .entry(speaker_id)
+                .or_default()
+                .insert(key);
+        }
+    }
+
     let mut stmt = conn.prepare(
         "WITH line_counts AS ( \
              SELECT speaker_id, COUNT(*) AS line_count FROM line \
@@ -149,19 +190,25 @@ pub fn list_speaker_groups(conn: &Connection, project_id: i64) -> Result<Vec<Spe
          ), sample_counts AS ( \
              SELECT speaker_id, COUNT(*) AS approved_count FROM reference_sample \
              WHERE decision='approved' GROUP BY speaker_id \
+         ), all_sample_counts AS ( \
+             SELECT speaker_id, COUNT(*) AS sample_count FROM reference_sample \
+             GROUP BY speaker_id \
          ), speaker_rows AS ( \
              SELECT s.id, s.cre_resref, s.display_name, s.long_name_strref, \
                     COALESCE(lc.line_count, 0) AS line_count, \
                     COALESCE(sc.approved_count, 0) AS approved_count, \
-                    c.binding_source, c.status AS clone_status \
+                    COALESCE(ac.sample_count, 0) AS sample_count, \
+                    c.binding_source, c.status AS clone_status, \
+                    s.excluded \
              FROM speaker s \
              LEFT JOIN line_counts lc ON lc.speaker_id = s.id \
              LEFT JOIN sample_counts sc ON sc.speaker_id = s.id \
+             LEFT JOIN all_sample_counts ac ON ac.speaker_id = s.id \
              LEFT JOIN clone c ON c.speaker_id = s.id \
              WHERE s.project_id=?1 \
          ) \
          SELECT id, cre_resref, display_name, long_name_strref, line_count, approved_count, \
-                binding_source, clone_status \
+                sample_count, binding_source, clone_status, excluded \
          FROM speaker_rows ORDER BY id",
     )?;
     let rows: Vec<(
@@ -171,8 +218,10 @@ pub fn list_speaker_groups(conn: &Connection, project_id: i64) -> Result<Vec<Spe
         Option<i64>,
         i64,
         i64,
+        i64,
         Option<BindingSource>,
         Option<CloneStatus>,
+        bool,
     )> = stmt
         .query_map(params![project_id], |r| {
             Ok((
@@ -182,14 +231,17 @@ pub fn list_speaker_groups(conn: &Connection, project_id: i64) -> Result<Vec<Spe
                 r.get(3)?,
                 r.get(4)?,
                 r.get(5)?,
-                r.get::<_, Option<BindingSource>>(6)?,
-                r.get::<_, Option<CloneStatus>>(7)?,
+                r.get(6)?,
+                r.get::<_, Option<BindingSource>>(7)?,
+                r.get::<_, Option<CloneStatus>>(8)?,
+                r.get::<_, i64>(9)? != 0,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let mut buckets: BTreeMap<String, SpeakerGroup> = BTreeMap::new();
-    for (id, cre, display, strref, line_count, approved, binding, clone_status) in rows {
+    let mut sounds_by_group: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+    for (id, cre, display, strref, line_count, approved, sample_count, binding, clone_status, excluded) in rows {
         let group_display = display
             .clone()
             .filter(|n| !n.trim().is_empty())
@@ -199,15 +251,19 @@ pub fn list_speaker_groups(conn: &Connection, project_id: i64) -> Result<Vec<Spe
         }
         let key = identity_key(strref, id);
         let entry = buckets.entry(key.clone()).or_insert_with(|| SpeakerGroup {
-            identity_key: key,
+            identity_key: key.clone(),
             display_name: group_display.clone(),
             long_name_strref: strref,
             variant_count: 0,
             line_count: 0,
             approved_sample_count: 0,
+            approved_sound_count: 0,
+            sample_count: 0,
             clone_status: None,
             binding_source: None,
             variants: Vec::new(),
+            // AND-rollup: start true, flip false if any member is not excluded.
+            excluded: true,
         });
         if entry.display_name == cre || entry.display_name.is_empty() {
             if let Some(ref name) = display {
@@ -219,13 +275,28 @@ pub fn list_speaker_groups(conn: &Connection, project_id: i64) -> Result<Vec<Spe
         entry.variant_count += 1;
         entry.line_count += line_count;
         entry.approved_sample_count += approved;
+        entry.sample_count += sample_count;
+        entry.excluded = entry.excluded && excluded;
         entry.variants.push(SpeakerVariant {
             speaker_id: id,
             cre_resref: cre,
             line_count,
             approved_sample_count: approved,
         });
+        if let Some(sounds) = sounds_by_speaker.get(&id) {
+            sounds_by_group
+                .entry(key.clone())
+                .or_default()
+                .extend(sounds.iter().cloned());
+        }
         rollup_clone(entry, binding, clone_status);
+    }
+
+    for (key, group) in buckets.iter_mut() {
+        group.approved_sound_count = sounds_by_group
+            .get(key)
+            .map(|s| s.len() as i64)
+            .unwrap_or(0);
     }
 
     let mut groups: Vec<SpeakerGroup> = buckets.into_values().collect();
@@ -236,6 +307,70 @@ pub fn list_speaker_groups(conn: &Connection, project_id: i64) -> Result<Vec<Spe
             .then_with(|| a.identity_key.cmp(&b.identity_key))
     });
     Ok(groups)
+}
+
+/// Count generation rows for every line attributed to speakers in an identity group.
+pub fn count_speaker_group_generations(
+    conn: &Connection,
+    project_id: i64,
+    identity_key: &str,
+) -> Result<i64, AppError> {
+    let ids = speaker_ids_in_group(conn, project_id, identity_key)?;
+    let mut total = 0i64;
+    for sid in ids {
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM generation g \
+             JOIN line l ON l.id = g.line_id \
+             WHERE l.project_id=?1 AND l.speaker_id=?2",
+            params![project_id, sid],
+            |r| r.get(0),
+        )?;
+        total += n;
+    }
+    Ok(total)
+}
+
+/// Line ids that currently have a generation row for speakers in an identity group.
+pub fn generation_line_ids_for_group(
+    conn: &Connection,
+    project_id: i64,
+    identity_key: &str,
+) -> Result<Vec<i64>, AppError> {
+    let ids = speaker_ids_in_group(conn, project_id, identity_key)?;
+    let mut out = Vec::new();
+    for sid in ids {
+        let mut stmt = conn.prepare(
+            "SELECT g.line_id FROM generation g \
+             JOIN line l ON l.id = g.line_id \
+             WHERE l.project_id=?1 AND l.speaker_id=?2 \
+             ORDER BY g.line_id",
+        )?;
+        for row in stmt.query_map(params![project_id, sid], |r| r.get(0))? {
+            out.push(row?);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
+/// Set `excluded` on every speaker in an identity group. Does not touch generations.
+pub fn set_speakers_excluded(
+    conn: &Connection,
+    project_id: i64,
+    identity_key: &str,
+    excluded: bool,
+) -> Result<usize, AppError> {
+    let ids = speaker_ids_in_group(conn, project_id, identity_key)?;
+    let flag = if excluded { 1i64 } else { 0 };
+    let mut updated = 0usize;
+    for id in ids {
+        updated += conn.execute(
+            "UPDATE speaker SET excluded=?2 WHERE id=?1 AND project_id=?3",
+            params![id, flag, project_id],
+        )? as usize;
+    }
+    Ok(updated)
 }
 
 fn rollup_clone(
@@ -290,6 +425,7 @@ fn propagate_clone_to_members(
         }
         if let Some(existing) = crate::db::generation::clone_for_speaker(conn, *sid)? {
             if existing.primary_sample_id == Some(primary_sample_id)
+                && existing.voice_profile_id == source_clone.voice_profile_id
                 && existing.binding_source == binding_source
                 && existing.status == clone_status
             {
@@ -303,15 +439,31 @@ fn propagate_clone_to_members(
                     continue;
                 }
             }
+            // Generation resolves voice_profile_id ahead of primary_sample_id, so
+            // siblings must inherit the profile or they keep synthesizing the old voice.
             conn.execute(
-                "UPDATE clone SET primary_sample_id=?2, binding_source=?3, status=?4 WHERE id=?1",
-                params![existing.id, primary_sample_id, binding_source, clone_status],
+                "UPDATE clone SET primary_sample_id=?2, voice_profile_id=?3, binding_source=?4, \
+                 status=?5 WHERE id=?1",
+                params![
+                    existing.id,
+                    primary_sample_id,
+                    source_clone.voice_profile_id,
+                    binding_source,
+                    clone_status
+                ],
             )?;
         } else {
             conn.execute(
-                "INSERT INTO clone (speaker_id, primary_sample_id, binding_source, status, \
-                     render_settings_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![sid, primary_sample_id, binding_source, clone_status, source_clone.render_settings_json],
+                "INSERT INTO clone (speaker_id, primary_sample_id, voice_profile_id, binding_source, \
+                     status, render_settings_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    sid,
+                    primary_sample_id,
+                    source_clone.voice_profile_id,
+                    binding_source,
+                    clone_status,
+                    source_clone.render_settings_json
+                ],
             )?;
         }
         let target_clone = crate::db::generation::clone_for_speaker(conn, *sid)?
@@ -537,7 +689,74 @@ mod tests {
         assert_eq!(jaheira.variant_count, 2);
         assert_eq!(jaheira.long_name_strref, Some(100));
         assert_eq!(jaheira.approved_sample_count, 2);
+        // Distinct null resrefs fall back to unknown:{sample_id} → two sounds.
+        assert_eq!(jaheira.approved_sound_count, 2);
+        assert_eq!(jaheira.sample_count, 2);
         assert!(jaheira.variants.iter().all(|v| v.approved_sample_count == 1));
+        assert!(!jaheira.excluded);
+    }
+
+    #[test]
+    fn list_groups_counts_distinct_approved_sounds_across_variants() {
+        let conn = mem_db();
+        let pid = insert_project(&conn);
+        let first = insert_speaker(&conn, pid, "aerie7", Some(42), Some("Aerie"));
+        let second = insert_speaker(&conn, pid, "aerie9", Some(42), Some("Aerie"));
+        for speaker_id in [first, second] {
+            conn.execute(
+                "INSERT INTO reference_sample (speaker_id, source_sound_resref, decision) \
+                 VALUES (?1, 'aerie35', 'approved')",
+                params![speaker_id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO reference_sample (speaker_id, source_sound_resref, decision) \
+             VALUES (?1, 'aerie36', 'approved')",
+            params![first],
+        )
+        .unwrap();
+        let groups = list_speaker_groups(&conn, pid).unwrap();
+        let aerie = groups.iter().find(|g| g.display_name == "Aerie").unwrap();
+        assert_eq!(aerie.approved_sample_count, 3);
+        assert_eq!(aerie.approved_sound_count, 2);
+        assert_eq!(aerie.sample_count, 3);
+    }
+
+    #[test]
+    fn set_speakers_excluded_updates_all_variants_and_rollup() {
+        let conn = mem_db();
+        let pid = insert_project(&conn);
+        let s1 = insert_speaker(&conn, pid, "bear1", Some(200), Some("Grizzly Bear"));
+        let s2 = insert_speaker(&conn, pid, "bear2", Some(200), Some("Grizzly Bear"));
+        assert_eq!(set_speakers_excluded(&conn, pid, "200", true).unwrap(), 2);
+        let groups = list_speaker_groups(&conn, pid).unwrap();
+        let bear = groups.iter().find(|g| g.identity_key == "200").unwrap();
+        assert!(bear.excluded);
+        for sid in [s1, s2] {
+            let excluded: i64 = conn
+                .query_row("SELECT excluded FROM speaker WHERE id=?1", params![sid], |r| r.get(0))
+                .unwrap();
+            assert_eq!(excluded, 1);
+        }
+        assert_eq!(count_speaker_group_generations(&conn, pid, "200").unwrap(), 0);
+
+        conn.execute(
+            "INSERT INTO line (project_id, strref, text, speaker_id, status) VALUES (?1, 1, 'Roar.', ?2, 'ready')",
+            params![pid, s1],
+        )
+        .unwrap();
+        let line_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO generation (line_id, status, output_path) VALUES (?1, 'done', 'x.ogg')",
+            params![line_id],
+        )
+        .unwrap();
+        assert_eq!(count_speaker_group_generations(&conn, pid, "200").unwrap(), 1);
+        assert_eq!(
+            generation_line_ids_for_group(&conn, pid, "200").unwrap(),
+            vec![line_id]
+        );
     }
 
     #[test]
@@ -572,6 +791,65 @@ mod tests {
         assert_eq!(sibling.primary_sample_id, Some(sample_id));
         assert_eq!(sibling.binding_source, BindingSource::Override);
         assert_eq!(sibling.status, CloneStatus::Ready);
+    }
+
+    #[test]
+    fn propagate_syncs_voice_profile_when_primary_already_matches() {
+        let conn = mem_db();
+        let pid = insert_project(&conn);
+        let s1 = insert_speaker(&conn, pid, "kalah", Some(15065), Some("Kalah"));
+        let s2 = insert_speaker(&conn, pid, "kalah2", Some(15065), Some("Kalah"));
+        conn.execute(
+            "INSERT INTO reference_sample (speaker_id, decision, local_derivative_path) \
+             VALUES (?1, 'approved', 'kalah05.wav')",
+            params![s1],
+        )
+        .unwrap();
+        let sample_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO voice_profile (project_id, display_name, origin, availability, created_at, updated_at) \
+             VALUES (?1, 'new', 'harvested', 'available', 'now', 'now')",
+            params![pid],
+        )
+        .unwrap();
+        let new_profile = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO voice_profile (project_id, display_name, origin, availability, created_at, updated_at) \
+             VALUES (?1, 'old', 'harvested', 'available', 'now', 'now')",
+            params![pid],
+        )
+        .unwrap();
+        let old_profile = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO clone (speaker_id, primary_sample_id, voice_profile_id, binding_source, status) \
+             VALUES (?1, ?2, ?3, 'override', 'ready')",
+            params![s1, sample_id, new_profile],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO clone (speaker_id, primary_sample_id, voice_profile_id, binding_source, status) \
+             VALUES (?1, ?2, ?3, 'override', 'ready')",
+            params![s2, sample_id, old_profile],
+        )
+        .unwrap();
+
+        let n = propagate_clone_to_identity_key(
+            &conn,
+            pid,
+            "15065",
+            s1,
+            sample_id,
+            BindingSource::Override,
+            CloneStatus::Ready,
+        )
+        .unwrap();
+        assert_eq!(n, 1);
+        let sibling = crate::db::generation::clone_for_speaker(&conn, s2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sibling.primary_sample_id, Some(sample_id));
+        assert_eq!(sibling.voice_profile_id, Some(new_profile));
     }
 
     #[test]

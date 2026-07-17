@@ -72,6 +72,7 @@ pub async fn upsert_dictionary_rule(
     let find_refs: Vec<&str> = stale_finds.iter().map(String::as_str).collect();
     let reset_generations =
         crate::dictionary::mark_matching_generations_synthesis_stale_many(&tx, &find_refs)?;
+    crate::synthesis::invalidate_corpus_cache(&tx, None)?;
     tx.commit()?;
     Ok(DictionaryWriteResult {
         rule: crate::dictionary::rule_by_id(&conn, rule_id)?,
@@ -96,6 +97,7 @@ pub async fn set_dictionary_rule_enabled(
     let reset_generations = if changed == 0 {
         0
     } else {
+        crate::synthesis::invalidate_corpus_cache(&tx, None)?;
         crate::dictionary::mark_matching_generations_synthesis_stale(&tx, &existing.find_text)?
     };
     tx.commit()?;
@@ -122,6 +124,7 @@ pub async fn delete_dictionary_rule(
     let reset_generations =
         crate::dictionary::mark_matching_generations_synthesis_stale(&tx, &existing.find_text)?;
     tx.execute("DELETE FROM dictionary_rule WHERE id=?1", [id])?;
+    crate::synthesis::invalidate_corpus_cache(&tx, None)?;
     tx.commit()?;
     Ok(DictionaryWriteResult {
         rule: None,
@@ -150,6 +153,7 @@ pub async fn reset_dictionary_defaults(
         .collect();
     let reset_generations =
         crate::dictionary::mark_matching_generations_synthesis_stale_many(&tx, &finds)?;
+    crate::synthesis::invalidate_corpus_cache(&tx, None)?;
     tx.commit()?;
     Ok(DictionaryWriteResult {
         rule: None,

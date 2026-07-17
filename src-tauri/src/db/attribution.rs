@@ -20,7 +20,9 @@ use crate::export::resref::is_pack_generated_resref;
 use crate::extractor::attribution::{
     AttributedLine, AttributedSpeaker, LineKind, SharedResolution, SharedStrrefGroup,
 };
-use crate::extractor::companion::{interdia_banter_dlg_resrefs, interdia_companion_prefixes};
+use crate::extractor::companion::{
+    interdia_banter_dlg_resrefs, interdia_companion_prefixes, pdialog_dlg_resrefs,
+};
 use crate::extractor::resource::GameResources;
 use crate::extractor::spoken_text::has_speakable_dialogue;
 use crate::extractor::token_resolve::{self, TokenReplacements};
@@ -55,6 +57,7 @@ pub struct CompanionLineTotals {
 pub fn classify_companion_line_totals(
     per_dlg_counts: &[(String, usize)],
     banter_dlgs: &HashSet<String>,
+    pdialog_dlgs: &HashSet<String>,
     prefixes: &HashSet<String>,
     excluded_dlgs: &HashSet<String>,
 ) -> CompanionLineTotals {
@@ -65,8 +68,9 @@ pub fn classify_companion_line_totals(
             out.banter_dlgs += 1;
             continue;
         }
-        let is_side = prefixes.iter().any(|p| dlg.starts_with(p)) && !excluded_dlgs.contains(dlg);
-        if is_side {
+        if pdialog_dlgs.contains(dlg)
+            || (prefixes.iter().any(|p| dlg.starts_with(p)) && !excluded_dlgs.contains(dlg))
+        {
             out.side_lines += count;
             out.side_dlgs += 1;
         }
@@ -85,6 +89,7 @@ pub fn companion_line_totals(
         Err(_) => return Ok(CompanionLineTotals::default()),
     };
     let banter_dlgs = interdia_banter_dlg_resrefs(&res)?;
+    let pdialog_dlgs = pdialog_dlg_resrefs(&res)?;
     let prefixes = interdia_companion_prefixes(&res)?;
 
     let mut main_dlgs: HashSet<String> = HashSet::new();
@@ -98,6 +103,7 @@ pub fn companion_line_totals(
 
     let mut excluded_dlgs = main_dlgs;
     excluded_dlgs.extend(banter_dlgs.iter().cloned());
+    excluded_dlgs.extend(pdialog_dlgs.iter().cloned());
 
     let mut stmt = conn.prepare(
         "SELECT lower(dlg_resref), count(*) FROM line \
@@ -113,6 +119,7 @@ pub fn companion_line_totals(
     Ok(classify_companion_line_totals(
         &per_dlg,
         &banter_dlgs,
+        &pdialog_dlgs,
         &prefixes,
         &excluded_dlgs,
     ))
@@ -173,6 +180,12 @@ fn persist_wipe(
     groups: &[SharedStrrefGroup],
 ) -> Result<AttributionCounts, AppError> {
     let tx = conn.transaction()?;
+    // Custom/imported and frozen designed profiles are project library assets, not
+    // attribution output. Harvested profiles are rebuilt from the fresh scan.
+    tx.execute(
+        "DELETE FROM voice_profile WHERE project_id=?1 AND origin='harvested'",
+        params![project_id],
+    )?;
     tx.execute(
         "DELETE FROM metadata_binding WHERE project_id = ?1",
         params![project_id],
@@ -188,6 +201,7 @@ fn persist_wipe(
         "DELETE FROM speaker WHERE project_id = ?1",
         params![project_id],
     )?;
+    crate::synthesis::invalidate_corpus_cache(&tx, Some(project_id))?;
     tx.commit()?;
     write_attribution(conn, project_id, speakers, lines, groups)
 }
@@ -217,6 +231,7 @@ fn persist_merge(
     for gid in old_group_ids {
         tx.execute("DELETE FROM shared_strref_group WHERE id = ?1", params![gid])?;
     }
+    crate::synthesis::invalidate_corpus_cache(&tx, Some(project_id))?;
     tx.commit()?;
 
     let counts = write_attribution(conn, project_id, speakers, lines, groups)?;
@@ -547,6 +562,9 @@ pub fn reapply_token_standins(
         }
     }
 
+    if updated > 0 {
+        crate::synthesis::invalidate_corpus_cache(&tx, Some(project_id))?;
+    }
     tx.commit()?;
     Ok(ReapplyTokenResult {
         updated,
@@ -583,23 +601,28 @@ mod tests {
     #[test]
     fn classify_companion_line_totals_splits_banter_and_side_dlgs() {
         let banter = HashSet::from(["bjaheir".to_string(), "bjahei25".to_string()]);
-        let prefixes = HashSet::from(["jahei".to_string()]);
+        let pdialog = HashSet::from(["yoshp".to_string(), "yoshj".to_string()]);
+        let prefixes = HashSet::from(["jahei".to_string(), "yosh".to_string()]);
         let excluded = HashSet::from([
             "jaheira".to_string(),
             "bjaheir".to_string(),
             "bjahei25".to_string(),
+            "yoshp".to_string(),
+            "yoshj".to_string(),
         ]);
         let per_dlg = vec![
             ("bjaheir".into(), 12),
             ("jaheira".into(), 40),
             ("jaheiraj".into(), 3),
+            ("yoshp".into(), 7),
             ("xzar".into(), 5),
         ];
-        let totals = classify_companion_line_totals(&per_dlg, &banter, &prefixes, &excluded);
+        let totals =
+            classify_companion_line_totals(&per_dlg, &banter, &pdialog, &prefixes, &excluded);
         assert_eq!(totals.banter_lines, 12);
         assert_eq!(totals.banter_dlgs, 1);
-        assert_eq!(totals.side_lines, 3);
-        assert_eq!(totals.side_dlgs, 1);
+        assert_eq!(totals.side_lines, 10);
+        assert_eq!(totals.side_dlgs, 2);
     }
 
     fn speaker(cre: &str) -> AttributedSpeaker {
@@ -697,6 +720,29 @@ mod tests {
             .query_row("SELECT status FROM line WHERE project_id=?1", params![pid], |r| r.get(0))
             .unwrap();
         assert_eq!(status, LineStatus::Skipped);
+    }
+
+    #[test]
+    fn merge_rescan_preserves_speaker_excluded_flag() {
+        let mut conn = mem_db();
+        let pid = project(&conn);
+        let speakers = vec![speaker("xzar")];
+        let lines = vec![line(10, LineKind::State, Some("xzar"), false, false, None)];
+        persist(&mut conn, pid, &speakers, &lines, &[], PersistMode::Merge).unwrap();
+        conn.execute(
+            "UPDATE speaker SET excluded=1 WHERE project_id=?1 AND cre_resref='xzar'",
+            params![pid],
+        )
+        .unwrap();
+        persist(&mut conn, pid, &speakers, &lines, &[], PersistMode::Merge).unwrap();
+        let excluded: i64 = conn
+            .query_row(
+                "SELECT excluded FROM speaker WHERE project_id=?1 AND cre_resref='xzar'",
+                params![pid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(excluded, 1);
     }
 
     #[test]

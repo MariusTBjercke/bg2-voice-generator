@@ -13,25 +13,33 @@ use crate::models::{
 use crate::omnivoice_tags::{is_supported_inline_tag, normalize_cue_token};
 use crate::tag_rule_defaults::{DEFAULT_SPOKEN_WORD_TAG_RULES, DEFAULT_STAGE_CUE_TAG_RULES};
 
-pub fn ensure_default_rules(conn: &Connection) -> Result<(), AppError> {
+pub fn ensure_default_rules(conn: &Connection) -> Result<usize, AppError> {
     let now = Utc::now().to_rfc3339();
+    let mut inserted: Vec<(String, TagMatchKind)> = Vec::new();
     for (find_text, tag) in DEFAULT_STAGE_CUE_TAG_RULES {
-        conn.execute(
+        let n = conn.execute(
             "INSERT OR IGNORE INTO tag_rule \
              (find_text,tag,match_kind,enabled,is_default,updated_at) \
              VALUES(?1,?2,'stage_cue',1,1,?3)",
             params![find_text, tag, now],
         )?;
+        if n > 0 {
+            inserted.push(((*find_text).to_owned(), TagMatchKind::StageCue));
+        }
     }
     for (find_text, tag) in DEFAULT_SPOKEN_WORD_TAG_RULES {
-        conn.execute(
+        let n = conn.execute(
             "INSERT OR IGNORE INTO tag_rule \
              (find_text,tag,match_kind,enabled,is_default,updated_at) \
              VALUES(?1,?2,'whole_word',1,1,?3)",
             params![find_text, tag, now],
         )?;
+        if n > 0 {
+            inserted.push(((*find_text).to_owned(), TagMatchKind::WholeWord));
+        }
     }
-    Ok(())
+    // Soft-invalidate clips whose transcript would change under newly shipped defaults.
+    mark_matching_generations_synthesis_stale_many(conn, &inserted)
 }
 
 pub fn list_rules(conn: &Connection) -> Result<Vec<TagRule>, AppError> {
@@ -395,11 +403,57 @@ mod tests {
                 >= DEFAULT_STAGE_CUE_TAG_RULES.len() + DEFAULT_SPOKEN_WORD_TAG_RULES.len()
         );
         assert!(rules.iter().any(|r| r.find_text == "grumble" && r.is_default));
+        assert!(rules.iter().any(|r| r.find_text == "grin" && r.tag == "[laughter]" && r.is_default));
         assert!(rules.iter().any(|r| {
             r.find_text == "Bah"
                 && r.tag == "[dissatisfaction-hnn]"
                 && r.match_kind == TagMatchKind::WholeWord
                 && r.is_default
         }));
+    }
+
+    #[test]
+    fn ensure_defaults_marks_matching_done_clips_text_changed() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::run_migrations(&mut conn).unwrap();
+        // Seed every default except grin, then add a done clip that uses *grin*.
+        let now = "2026-01-01T00:00:00Z";
+        for (find_text, tag) in DEFAULT_STAGE_CUE_TAG_RULES {
+            if *find_text == "grin" || *find_text == "grins" || *find_text == "grinning" {
+                continue;
+            }
+            conn.execute(
+                "INSERT INTO tag_rule(find_text,tag,match_kind,enabled,is_default,updated_at) \
+                 VALUES(?1,?2,'stage_cue',1,1,?3)",
+                params![find_text, tag, now],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO project(game_root,edition,active_language,generator_version,created_at) \
+             VALUES('C:\\BG2EE','BG2EE','en_US','0.1.0',?1)",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO line(project_id,strref,text,status) VALUES(1,1,'Amusing. *grin*','ready')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO generation(line_id,status,output_path,synthesis_stale) \
+             VALUES(1,'done','/ws/1.ogg',0)",
+            [],
+        )
+        .unwrap();
+
+        let marked = ensure_default_rules(&conn).unwrap();
+        assert!(marked >= 1, "new grin defaults should soft-invalidate matching clips");
+        let stale: i64 = conn
+            .query_row("SELECT synthesis_stale FROM generation WHERE line_id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stale, 1);
+        // Second ensure is a no-op for already-present defaults.
+        assert_eq!(ensure_default_rules(&conn).unwrap(), 0);
     }
 }

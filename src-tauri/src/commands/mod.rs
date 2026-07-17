@@ -20,3 +20,4 @@ pub mod startup;
 pub mod synthesis;
 pub mod tag_rules;
 pub mod transfer;
+pub mod voice_profiles;

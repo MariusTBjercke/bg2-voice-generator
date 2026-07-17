@@ -108,6 +108,92 @@ pub enum GenerationStatus {
     Failed,
 }
 
+/// Where a reusable project voice originated. This is independent of clone
+/// binding precedence (`default` / `override` / `generic`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceProfileOrigin {
+    Harvested,
+    Imported,
+    Designed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceProfileAvailability {
+    Available,
+    MissingLocalAudio,
+}
+
+/// Structured, allow-listed voice-design controls supported by OmniVoice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesignVoiceAttributes {
+    pub gender: String,
+    pub age: String,
+    pub pitch: String,
+    pub whisper: bool,
+    pub accent: Option<String>,
+}
+
+/// One ordered reference in a reusable voice profile.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VoiceProfileReference {
+    pub id: i64,
+    pub voice_profile_id: i64,
+    pub reference_sample_id: Option<i64>,
+    pub managed_path: Option<String>,
+    pub resolved_audio_path: Option<String>,
+    pub source_strref: Option<i64>,
+    pub source_sound_resref: Option<String>,
+    pub transcript: String,
+    pub sort_order: i64,
+    pub fingerprint: Option<String>,
+}
+
+/// Project-scoped reusable voice, including its ordered local references.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VoiceProfile {
+    pub id: i64,
+    pub project_id: i64,
+    pub display_name: String,
+    pub origin: VoiceProfileOrigin,
+    pub harvested_speaker_id: Option<i64>,
+    pub design: Option<DesignVoiceAttributes>,
+    pub availability: VoiceProfileAvailability,
+    pub reference_fingerprint: Option<String>,
+    pub references: Vec<VoiceProfileReference>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportedVoiceClipInput {
+    pub path: String,
+    pub transcript: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DesignedVoiceCandidate {
+    pub preview_id: String,
+    pub output_path: String,
+    pub seed: i64,
+    pub duration_secs: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DesignedVoiceCandidatesResult {
+    pub candidates: Vec<DesignedVoiceCandidate>,
+    pub quality_warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteVoiceProfileResult {
+    pub affected_speakers: usize,
+    pub affected_pools: usize,
+    pub reset_generations: usize,
+    pub files_deleted: usize,
+}
+
 /// Resolved OmniVoice 0.1.5 render controls. These defaults preserve BG2's
 /// existing balanced render: model-estimated pacing and 32 diffusion steps.
 ///
@@ -665,6 +751,8 @@ enum_sql!(BindingSource);
 enum_sql!(CloneStatus);
 enum_sql!(GenerationStatus);
 enum_sql!(RenderCandidateStatus);
+enum_sql!(VoiceProfileOrigin);
+enum_sql!(VoiceProfileAvailability);
 
 
 // --- Domain row structs (item-05) ----------------------------------------------
@@ -715,6 +803,8 @@ pub struct Speaker {
     pub dialogue_resref: Option<String>,
     pub provenance_json: String,
     pub confidence: f64,
+    /// When true, Generate and Export skip this speaker's lines.
+    pub excluded: bool,
 }
 
 /// One CRE variant within a named (or singleton) speaker identity group.
@@ -734,10 +824,26 @@ pub struct SpeakerGroup {
     pub long_name_strref: Option<i64>,
     pub variant_count: i64,
     pub line_count: i64,
+    /// Approved `reference_sample` rows across every CRE variant (may count the
+    /// same sound once per variant).
     pub approved_sample_count: i64,
+    /// Distinct approved sound resrefs in the group (matches collapsed Harvest rows).
+    pub approved_sound_count: i64,
+    /// Total harvested `reference_sample` rows across variants (any decision).
+    pub sample_count: i64,
     pub clone_status: Option<CloneStatus>,
     pub binding_source: Option<BindingSource>,
     pub variants: Vec<SpeakerVariant>,
+    /// True when every variant in the group is excluded from generate/export.
+    pub excluded: bool,
+}
+
+/// Result of `set_speaker_group_excluded`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetSpeakerGroupExcludedResult {
+    pub speakers_updated: usize,
+    pub generations_cleared: usize,
+    pub files_deleted: usize,
 }
 
 /// Result of reconciling per-variant clones onto identity groups.
@@ -788,6 +894,36 @@ pub struct Line {
     pub status: LineStatus,
 }
 
+/// Slim `list_generatable_lines` row — same as [`Line`] without `original_text`
+/// so the Generation screen IPC payload stays smaller at full-project scale.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeneratableLine {
+    pub id: i64,
+    pub project_id: i64,
+    pub strref: i64,
+    pub dlg_resref: Option<String>,
+    pub state_index: Option<i64>,
+    pub text: String,
+    pub flags: i64,
+    pub existing_sound_resref: Option<String>,
+    pub kind: LineKind,
+    pub is_voiced: bool,
+    pub has_tokens: bool,
+    pub token_mask: i64,
+    pub shared_group_id: Option<i64>,
+    pub speaker_id: Option<i64>,
+    pub attribution_confidence: f64,
+    pub status: LineStatus,
+}
+
+/// Server-paged blocked-line result for the Attribution screen.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlockedLinesPage {
+    pub rows: Vec<Line>,
+    pub total: usize,
+    pub token_total: usize,
+}
+
 /// A harvested reference clip candidate (`reference_sample`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReferenceSample {
@@ -807,6 +943,8 @@ pub struct Clone {
     pub id: i64,
     pub speaker_id: i64,
     pub primary_sample_id: Option<i64>,
+    /// Authoritative reusable voice. Legacy rows may leave this null until migrated.
+    pub voice_profile_id: Option<i64>,
     pub binding_source: BindingSource,
     pub status: CloneStatus,
     /// Fully populated settings JSON; old rows deserialize through application defaults.
@@ -845,7 +983,8 @@ pub struct BindingPreview {
     pub settings_fingerprint: String,
 }
 
-/// Result of explicitly saving one clone's ordered reference set.
+/// Result of explicitly saving one clone's ordered reference set. Done clips stay
+/// playable; `reset_generations` counts those marked voice-changed. File counts stay 0.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CloneReferencesUpdate {
     pub clone: Clone,
@@ -855,7 +994,8 @@ pub struct CloneReferencesUpdate {
     pub files_missing: usize,
 }
 
-/// Result of saving clone render settings and invalidating only its prior renders.
+/// Result of saving clone render settings. Done clips stay playable and are
+/// counted in `reset_generations` when marked voice-changed; file counts stay 0.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CloneRenderSettingsUpdate {
     pub clone: Clone,
@@ -870,6 +1010,8 @@ pub struct Generation {
     pub id: i64,
     pub line_id: i64,
     pub clone_id: Option<i64>,
+    /// Profile that produced the completed clip, snapshotted against later rebinds.
+    pub voice_profile_id_snapshot: Option<i64>,
     /// Reference sample that actually produced the current completed clip.
     pub reference_sample_id: Option<i64>,
     /// Binding tier at render time; export must not borrow a later binding's tier.
@@ -1005,6 +1147,8 @@ mod contract_tests {
         assert_eq!(token(&BindingSource::Generic), "generic");
         assert_eq!(token(&CloneStatus::Failed), "failed");
         assert_eq!(token(&GenerationStatus::Running), "running");
+        assert_eq!(token(&VoiceProfileOrigin::Designed), "designed");
+        assert_eq!(token(&VoiceProfileAvailability::MissingLocalAudio), "missing_local_audio");
         assert_eq!(token(&RenderCandidateStatus::Done), "done");
         assert_eq!(token(&AgentRenderPreset::Inherit), "inherit");
         assert_eq!(token(&AgentRenderPreset::AutoPace), "auto_pace");
@@ -1108,6 +1252,18 @@ mod contract_tests {
             }),
         );
         expect(
+            vec!["gender","age","pitch","whisper","accent"],
+            keys(&DesignVoiceAttributes { gender:"female".into(), age:"young adult".into(), pitch:"high pitch".into(), whisper:false, accent:None }),
+        );
+        expect(
+            vec!["id","voice_profile_id","reference_sample_id","managed_path","resolved_audio_path","source_strref","source_sound_resref","transcript","sort_order","fingerprint"],
+            keys(&VoiceProfileReference { id:0,voice_profile_id:0,reference_sample_id:None,managed_path:None,resolved_audio_path:None,source_strref:None,source_sound_resref:None,transcript:String::new(),sort_order:0,fingerprint:None }),
+        );
+        expect(
+            vec!["id","project_id","display_name","origin","harvested_speaker_id","design","availability","reference_fingerprint","references","created_at","updated_at"],
+            keys(&VoiceProfile { id:0,project_id:0,display_name:String::new(),origin:VoiceProfileOrigin::Imported,harvested_speaker_id:None,design:None,availability:VoiceProfileAvailability::Available,reference_fingerprint:None,references:vec![],created_at:String::new(),updated_at:String::new() }),
+        );
+        expect(
             vec!["clone_id", "sample_id", "sort_order"],
             keys(&CloneReference {
                 clone_id: 0,
@@ -1164,6 +1320,7 @@ mod contract_tests {
                     id: 0,
                     speaker_id: 0,
                     primary_sample_id: None,
+                    voice_profile_id: None,
                     binding_source: BindingSource::Default,
                     status: CloneStatus::Pending,
                     render_settings_json: String::new(),
@@ -1230,6 +1387,7 @@ mod contract_tests {
                 "dialogue_resref",
                 "provenance_json",
                 "confidence",
+                "excluded",
             ],
             keys(&Speaker {
                 id: 0,
@@ -1246,6 +1404,7 @@ mod contract_tests {
                 dialogue_resref: None,
                 provenance_json: String::new(),
                 confidence: 0.0,
+                excluded: false,
             }),
         );
         expect(
@@ -1270,9 +1429,12 @@ mod contract_tests {
                 "variant_count",
                 "line_count",
                 "approved_sample_count",
+                "approved_sound_count",
+                "sample_count",
                 "clone_status",
                 "binding_source",
                 "variants",
+                "excluded",
             ],
             keys(&SpeakerGroup {
                 identity_key: String::new(),
@@ -1281,9 +1443,24 @@ mod contract_tests {
                 variant_count: 0,
                 line_count: 0,
                 approved_sample_count: 0,
+                approved_sound_count: 0,
+                sample_count: 0,
                 clone_status: None,
                 binding_source: None,
                 variants: vec![],
+                excluded: false,
+            }),
+        );
+        expect(
+            vec![
+                "speakers_updated",
+                "generations_cleared",
+                "files_deleted",
+            ],
+            keys(&SetSpeakerGroupExcludedResult {
+                speakers_updated: 0,
+                generations_cleared: 0,
+                files_deleted: 0,
             }),
         );
         expect(
@@ -1345,6 +1522,52 @@ mod contract_tests {
         expect(
             vec![
                 "id",
+                "project_id",
+                "strref",
+                "dlg_resref",
+                "state_index",
+                "text",
+                "flags",
+                "existing_sound_resref",
+                "kind",
+                "is_voiced",
+                "has_tokens",
+                "token_mask",
+                "shared_group_id",
+                "speaker_id",
+                "attribution_confidence",
+                "status",
+            ],
+            keys(&GeneratableLine {
+                id: 0,
+                project_id: 0,
+                strref: 0,
+                dlg_resref: None,
+                state_index: None,
+                text: String::new(),
+                flags: 0,
+                existing_sound_resref: None,
+                kind: LineKind::default(),
+                is_voiced: false,
+                has_tokens: false,
+                token_mask: 0,
+                shared_group_id: None,
+                speaker_id: None,
+                attribution_confidence: 0.0,
+                status: LineStatus::default(),
+            }),
+        );
+        expect(
+            vec!["rows", "total", "token_total"],
+            keys(&BlockedLinesPage {
+                rows: Vec::new(),
+                total: 0,
+                token_total: 0,
+            }),
+        );
+        expect(
+            vec![
+                "id",
                 "speaker_id",
                 "source_strref",
                 "source_sound_resref",
@@ -1369,6 +1592,7 @@ mod contract_tests {
                 "id",
                 "speaker_id",
                 "primary_sample_id",
+                "voice_profile_id",
                 "binding_source",
                 "status",
                 "render_settings_json",
@@ -1377,6 +1601,7 @@ mod contract_tests {
                 id: 0,
                 speaker_id: 0,
                 primary_sample_id: None,
+                voice_profile_id: None,
                 binding_source: BindingSource::default(),
                 status: CloneStatus::default(),
                 render_settings_json: String::new(),
@@ -1394,6 +1619,7 @@ mod contract_tests {
                     id: 0,
                     speaker_id: 0,
                     primary_sample_id: None,
+                    voice_profile_id: None,
                     binding_source: BindingSource::default(),
                     status: CloneStatus::default(),
                     render_settings_json: String::new(),
@@ -1408,6 +1634,7 @@ mod contract_tests {
                 "id",
                 "line_id",
                 "clone_id",
+                "voice_profile_id_snapshot",
                 "reference_sample_id",
                 "binding_source_snapshot",
                 "status",
@@ -1423,6 +1650,7 @@ mod contract_tests {
                 id: 0,
                 line_id: 0,
                 clone_id: None,
+                voice_profile_id_snapshot: None,
                 reference_sample_id: None,
                 binding_source_snapshot: None,
                 status: GenerationStatus::default(),
@@ -1611,6 +1839,9 @@ mod contract_tests {
                 "samples_harvested",
                 "decode_failures",
                 "candidates_skipped",
+                "candidates_already_present",
+                "gap_fill_candidates",
+                "gap_fill_samples",
                 "automatic_samples",
                 "manual_only_samples",
                 "conflicting_aliases_skipped",
@@ -1639,7 +1870,15 @@ mod contract_tests {
             }),
         );
         expect(
-            vec!["samples", "speakers", "unmatched", "decisions_preserved", "clones_invalidated"],
+            vec![
+                "samples",
+                "speakers",
+                "unmatched",
+                "decisions_preserved",
+                "clones_invalidated",
+                "samples_added",
+                "samples_skipped_existing",
+            ],
             keys(&crate::db::harvest::HarvestPersistCounts::default()),
         );
         expect(
@@ -1693,6 +1932,7 @@ mod contract_tests {
             vec![
                 "speaker_id",
                 "donor_speaker_id",
+                "voice_profile_id",
                 "matched_sex",
                 "matched_creature_category",
                 "matched_race",
@@ -1702,6 +1942,7 @@ mod contract_tests {
             keys(&crate::commands::metadata_binding::MetadataAssignment {
                 speaker_id: 0,
                 donor_speaker_id: 0,
+                voice_profile_id: None,
                 matched_sex: false,
                 matched_creature_category: false,
                 matched_race: false,
@@ -1770,6 +2011,9 @@ mod contract_tests {
                 "clone_status",
                 "sample_id",
                 "sample_path",
+                "voice_profile_id",
+                "voice_profile_name",
+                "voice_profile_origin",
                 "donor_speaker_id",
                 "donor_display_name",
                 "inherited",
@@ -1785,6 +2029,7 @@ mod contract_tests {
                 "race_label",
                 "creature_category_label",
                 "donor_speaker_ids",
+                "voice_profile_ids",
             ],
             keys(&crate::commands::metadata_binding::MetadataBinding {
                 sex: 0,
@@ -1794,6 +2039,7 @@ mod contract_tests {
                 race_label: String::new(),
                 creature_category_label: String::new(),
                 donor_speaker_ids: vec![],
+                voice_profile_ids: vec![],
             }),
         );
         expect(
@@ -1838,6 +2084,7 @@ mod contract_tests {
                 "device",
                 "cuda_name",
                 "fork",
+                "voice_design",
             ],
             keys(&crate::tts::engine::EngineStatus {
                 running: false,
@@ -1850,6 +2097,7 @@ mod contract_tests {
                 device: None,
                 cuda_name: None,
                 fork: None,
+                voice_design: false,
             }),
         );
         expect(
@@ -1859,6 +2107,7 @@ mod contract_tests {
                     id: 0,
                     speaker_id: 0,
                     primary_sample_id: None,
+                    voice_profile_id: None,
                     binding_source: crate::models::BindingSource::Default,
                     status: crate::models::CloneStatus::Ready,
                     render_settings_json: String::new(),

@@ -5,6 +5,7 @@
   "permissions": [
     "core:default",
     "dialog:default",
+    "dialog:allow-confirm",
     "fs:default",
     "opener:default",
     "log:default"

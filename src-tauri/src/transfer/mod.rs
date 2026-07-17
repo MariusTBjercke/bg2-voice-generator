@@ -25,7 +25,7 @@ pub(crate) const TRANSFER_KIND: &str = "bg2-voice-generator-transfer";
 
 /// The bundle format version. Bump when `project.json`'s shape changes; import refuses
 /// a bundle NEWER than it understands (forward-incompatible), tolerates older ones.
-pub(crate) const TRANSFER_VERSION: i64 = 3;
+pub(crate) const TRANSFER_VERSION: i64 = 4;
 
 /// The single project payload entry inside the archive.
 pub(crate) const PROJECT_ENTRY: &str = "project.json";

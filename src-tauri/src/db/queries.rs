@@ -43,7 +43,8 @@ pub fn install_fingerprint_from_row(r: &Row<'_>) -> rusqlite::Result<InstallFing
 }
 
 pub const SPEAKER_COLUMNS: &str = "id, project_id, cre_resref, display_name, long_name_strref, \
-    sex, race, class, kit, alignment, creature_category, dialogue_resref, provenance_json, confidence";
+    sex, race, class, kit, alignment, creature_category, dialogue_resref, provenance_json, \
+    confidence, excluded";
 
 pub fn speaker_from_row(r: &Row<'_>) -> rusqlite::Result<Speaker> {
     Ok(Speaker {
@@ -61,6 +62,7 @@ pub fn speaker_from_row(r: &Row<'_>) -> rusqlite::Result<Speaker> {
         dialogue_resref: r.get(11)?,
         provenance_json: r.get(12)?,
         confidence: r.get(13)?,
+        excluded: r.get::<_, i64>(14)? != 0,
     })
 }
 
@@ -88,6 +90,11 @@ pub const LINE_COLUMNS: &str = "id, project_id, strref, dlg_resref, state_index,
     original_text, flags, existing_sound_resref, kind, is_voiced, has_tokens, token_mask, \
     shared_group_id, speaker_id, attribution_confidence, status";
 
+/// List payload for `list_generatable_lines` — skips `original_text`.
+pub const GENERATABLE_LINE_COLUMNS: &str = "id, project_id, strref, dlg_resref, state_index, text, \
+    flags, existing_sound_resref, kind, is_voiced, has_tokens, token_mask, \
+    shared_group_id, speaker_id, attribution_confidence, status";
+
 pub fn line_from_row(r: &Row<'_>) -> rusqlite::Result<Line> {
     Ok(Line {
         id: r.get(0)?,
@@ -110,6 +117,27 @@ pub fn line_from_row(r: &Row<'_>) -> rusqlite::Result<Line> {
     })
 }
 
+pub fn generatable_line_from_row(r: &Row<'_>) -> rusqlite::Result<crate::models::GeneratableLine> {
+    Ok(crate::models::GeneratableLine {
+        id: r.get(0)?,
+        project_id: r.get(1)?,
+        strref: r.get(2)?,
+        dlg_resref: r.get(3)?,
+        state_index: r.get(4)?,
+        text: r.get(5)?,
+        flags: r.get(6)?,
+        existing_sound_resref: r.get(7)?,
+        kind: r.get(8)?,
+        is_voiced: r.get::<_, i64>(9)? != 0,
+        has_tokens: r.get::<_, i64>(10)? != 0,
+        token_mask: r.get(11)?,
+        shared_group_id: r.get(12)?,
+        speaker_id: r.get(13)?,
+        attribution_confidence: r.get(14)?,
+        status: r.get(15)?,
+    })
+}
+
 pub const REFERENCE_SAMPLE_COLUMNS: &str = "id, speaker_id, source_strref, source_sound_resref, \
     provenance_json, scores_json, decision, local_derivative_path";
 
@@ -127,37 +155,39 @@ pub fn reference_sample_from_row(r: &Row<'_>) -> rusqlite::Result<ReferenceSampl
 }
 
 pub const CLONE_COLUMNS: &str =
-    "id, speaker_id, primary_sample_id, binding_source, status, render_settings_json";
+    "id, speaker_id, primary_sample_id, voice_profile_id, binding_source, status, render_settings_json";
 
 pub fn clone_from_row(r: &Row<'_>) -> rusqlite::Result<Clone> {
     Ok(Clone {
         id: r.get(0)?,
         speaker_id: r.get(1)?,
         primary_sample_id: r.get(2)?,
-        binding_source: r.get(3)?,
-        status: r.get(4)?,
-        render_settings_json: r.get(5)?,
+        voice_profile_id: r.get(3)?,
+        binding_source: r.get(4)?,
+        status: r.get(5)?,
+        render_settings_json: r.get(6)?,
     })
 }
 
 pub const GENERATION_COLUMNS: &str =
-    "id, line_id, clone_id, reference_sample_id, binding_source_snapshot, status, output_path, attempts, resumable_state_json, render_settings_json, render_settings_hash, reference_fingerprint, diagnostics_json";
+    "id, line_id, clone_id, voice_profile_id_snapshot, reference_sample_id, binding_source_snapshot, status, output_path, attempts, resumable_state_json, render_settings_json, render_settings_hash, reference_fingerprint, diagnostics_json";
 
 pub fn generation_from_row(r: &Row<'_>) -> rusqlite::Result<Generation> {
     Ok(Generation {
         id: r.get(0)?,
         line_id: r.get(1)?,
         clone_id: r.get(2)?,
-        reference_sample_id: r.get(3)?,
-        binding_source_snapshot: r.get(4)?,
-        status: r.get(5)?,
-        output_path: r.get(6)?,
-        attempts: r.get(7)?,
-        resumable_state_json: r.get(8)?,
-        render_settings_json: r.get(9)?,
-        render_settings_hash: r.get(10)?,
-        reference_fingerprint: r.get(11)?,
-        diagnostics_json: r.get(12)?,
+        voice_profile_id_snapshot: r.get(3)?,
+        reference_sample_id: r.get(4)?,
+        binding_source_snapshot: r.get(5)?,
+        status: r.get(6)?,
+        output_path: r.get(7)?,
+        attempts: r.get(8)?,
+        resumable_state_json: r.get(9)?,
+        render_settings_json: r.get(10)?,
+        render_settings_hash: r.get(11)?,
+        reference_fingerprint: r.get(12)?,
+        diagnostics_json: r.get(13)?,
     })
 }
 

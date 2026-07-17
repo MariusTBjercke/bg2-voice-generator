@@ -40,6 +40,8 @@ pub struct Candidate {
     pub shared_group_id: Option<i64>,
     /// `true` iff this strref's shared group resolved to `defer_diff_voice`.
     pub shared_deferred: bool,
+    /// Speaker was marked excluded from generate/export in Binding.
+    pub speaker_excluded: bool,
     pub speaker_resref: String,
     pub binding_source: String,
     /// The clip was rendered from a different reference than the current binding.
@@ -96,6 +98,9 @@ fn defer_reason(c: &Candidate, fp: &PackFingerprintInputs) -> Option<&'static st
     }
     if c.speaker_id.is_none() {
         return Some("line has no uniquely attributed speaker");
+    }
+    if c.speaker_excluded {
+        return Some("speaker excluded from pack");
     }
     if c.shared_deferred {
         return Some("shared strref with a different/unknown voice (deferred)");
@@ -195,12 +200,23 @@ mod tests {
             speaker_id: Some(1),
             shared_group_id: None,
             shared_deferred: false,
+            speaker_excluded: false,
             speaker_resref: "XZAR".into(),
             binding_source: "default".into(),
             voice_changed: false,
             audio_source_path: "/ws/1.wav".into(),
             clip_on_disk: true,
         }
+    }
+
+    #[test]
+    fn excluded_speaker_is_deferred() {
+        let mut c = base(1, 22570);
+        c.speaker_excluded = true;
+        let plan = assemble("P", &fp(), &HashSet::new(), &[c]).unwrap();
+        assert!(plan.lines.is_empty());
+        assert_eq!(plan.deferred.len(), 1);
+        assert_eq!(plan.deferred[0].reason, "speaker excluded from pack");
     }
 
     #[test]
