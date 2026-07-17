@@ -46,8 +46,11 @@ fn assert_generated_ogg(src: &Path) -> Result<(), AppError> {
 }
 
 /// Write the pack under `out_dir`. `generator_version`/`export_version` stamp the
-/// manifest + tp2. Returns the built pack (root dir + manifest). Overwrites a prior
-/// pack of the same name (re-export is idempotent from the caller's perspective).
+/// manifest + tp2. Returns the built pack (root dir + manifest).
+///
+/// Re-export replaces any prior pack of the same name in full (removes the folder
+/// first) so stale audio / metadata from a previous smaller or different set cannot
+/// linger and get zipped into the new pack.
 ///
 /// When `on_progress` is set it is called once per staged audio line as
 /// `(index_1based, line_total, resref)`.
@@ -60,6 +63,11 @@ pub fn write_pack(
     mut on_progress: Option<&mut dyn FnMut(usize, usize, &str)>,
 ) -> Result<BuiltPack, AppError> {
     let pack_dir = out_dir.join(&plan.pack_name);
+    // Wipe first so a re-export with fewer/different lines cannot leave orphan WAVs
+    // (zip walks the whole pack folder).
+    if pack_dir.exists() {
+        std::fs::remove_dir_all(&pack_dir)?;
+    }
     let audio_dir = pack_dir.join("audio");
     let tra_dir = pack_dir.join("tra").join(&plan.fingerprint.language);
     std::fs::create_dir_all(&audio_dir)?;
@@ -176,5 +184,24 @@ mod tests {
         assert!(err
             .to_string()
             .contains("not generated ogg_vorbis_q6_22050_mono"));
+    }
+
+    #[test]
+    fn reexport_removes_stale_audio_from_prior_pack() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("gen.ogg");
+        std::fs::write(&src, tiny_ogg()).unwrap();
+        let out = dir.path().join("exports");
+
+        // First export with one line.
+        let built = write_pack(&plan_with(&src), &out, "0.1.0", "1", "now", None).unwrap();
+        let stale = built.pack_dir.join("audio/STALE001.wav");
+        std::fs::write(&stale, b"orphan").unwrap();
+        assert!(stale.exists());
+
+        // Re-export the same plan: orphan must be gone; current line remains.
+        let rebuilt = write_pack(&plan_with(&src), &out, "0.1.0", "1", "later", None).unwrap();
+        assert!(!rebuilt.pack_dir.join("audio/STALE001.wav").exists());
+        assert!(rebuilt.pack_dir.join("audio/Z0H6A00.wav").exists());
     }
 }

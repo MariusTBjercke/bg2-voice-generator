@@ -47,6 +47,17 @@
     samplesForSpeakerFromCache,
     formatApprovedSummary,
   } from "$lib/speakers/groups";
+  import {
+    groupHasGenderMismatch,
+    groupSexToken,
+    groupVoiceSexMatch,
+    sexTokenLabel,
+    type SexToken,
+  } from "$lib/speakers/sex";
+  import {
+    groupDemographicVoiceMatch,
+    groupHasDemographicMismatch,
+  } from "$lib/speakers/demographics";
   import { bestApprovedSampleForBinding, groupSamplesBySoundResref, formatSoundSampleOptionLabel, pickSampleIdForSoundGroup } from "$lib/speakers/samples";
   import { invalidateSpeakerGroups, loadSpeakerGroups } from "$lib/stores/speakerGroups";
   import { progress } from "$lib/stores/progress";
@@ -146,6 +157,10 @@
   let audio = $state<HTMLAudioElement | null>(null);
   let playingId = $state<number | null>(null);
   let audioError = $state<Record<number, string>>({});
+  // Sequential audition of the filtered character list's effective voices.
+  let playlistActive = $state(false);
+  let playlistQueue = $state<EffectiveSpeakerBinding[]>([]);
+  let playlistIndex = $state(0);
   // Speaker ids that currently have at least one generatable (ready) line, from the
   // existing list_generatable_lines command. Lets us flag a speaker that has a ready
   // clone but no lines to generate (e.g. Xzar/512-style speakers), so a bound voice
@@ -807,6 +822,7 @@
   // Play/pause an approved sample's derivative in-app (mirrors Harvest: one shared
   // <audio>, so starting a clip stops any other; failures surface on the row).
   async function togglePlay(sample: ReferenceSample) {
+    stopPlaylist();
     if (!sample.local_derivative_path) return;
     if (!audio) {
       audioError = {
@@ -831,6 +847,7 @@
   }
 
   async function toggleEffective(binding: EffectiveSpeakerBinding) {
+    stopPlaylist();
     if (!binding.sample_path || binding.sample_id === null) return;
     if (!audio) {
       audioError = {
@@ -857,6 +874,84 @@
     }
   }
 
+  function stopPlaylist() {
+    playlistActive = false;
+    playlistQueue = [];
+    playlistIndex = 0;
+  }
+
+  async function playBindingClip(binding: EffectiveSpeakerBinding): Promise<boolean> {
+    if (!binding.sample_path || binding.sample_id === null || !audio) return false;
+    audioError = { ...audioError, [binding.sample_id]: "" };
+    try {
+      audio.src = assetUrl(binding.sample_path);
+      await audio.play();
+      playingId = binding.sample_id;
+      return true;
+    } catch (e) {
+      playingId = null;
+      audioError = {
+        ...audioError,
+        [binding.sample_id]: `Could not play: ${String(e)}`,
+      };
+      return false;
+    }
+  }
+
+  async function advancePlaylist() {
+    if (!playlistActive) {
+      playingId = null;
+      return;
+    }
+    let next = playlistIndex + 1;
+    while (next < playlistQueue.length) {
+      playlistIndex = next;
+      const ok = await playBindingClip(playlistQueue[next]);
+      if (ok) return;
+      next += 1;
+    }
+    stopPlaylist();
+    playingId = null;
+  }
+
+  function onAudioEnded() {
+    if (playlistActive) {
+      void advancePlaylist();
+      return;
+    }
+    playingId = null;
+  }
+
+  function onAudioPause() {
+    if (!playlistActive) playingId = null;
+  }
+
+  /** Queue every playable effective voice in the current filtered character list. */
+  async function playFilteredEffectiveVoices() {
+    if (!audio) return;
+    const queue = filteredIdentityGroups
+      .map((g) => {
+        const rep = repSpeakerForGroup(g);
+        return rep ? effectiveBySpeaker[rep.id] : undefined;
+      })
+      .filter(
+        (b): b is EffectiveSpeakerBinding =>
+          !!b && b.sample_path !== null && b.sample_id !== null,
+      );
+    if (queue.length === 0) return;
+    if (playlistActive) {
+      audio.pause();
+      stopPlaylist();
+      playingId = null;
+      return;
+    }
+    playlistQueue = queue;
+    playlistIndex = 0;
+    playlistActive = true;
+    const ok = await playBindingClip(queue[0]);
+    if (!ok) await advancePlaylist();
+  }
+
   // The clone-status token for a speaker's facet + note logic: a fallback (generic)
   // clone is distinct from a real bound one; no clone reads as "unbound".
   function cloneStatusOf(s: Speaker): string {
@@ -872,17 +967,41 @@
     return !!c && c.status === "ready" && !speakersWithLines.has(s.id);
   }
 
-  // Speaker search + a clone-status facet, so the (potentially large) cast is
-  // navigable and a user can isolate e.g. every unbound or fallback speaker.
+  // Speaker search + clone-status / sex / voice-gender facets, so the (potentially
+  // large) cast is navigable and gender mismatches are easy to isolate.
   const STATUS_FACET = "status";
-  let filterValues = $state<FilterValues>({ search: "", facets: { [STATUS_FACET]: "all" } });
+  const SEX_FACET = "sex";
+  const VOICE_MATCH_FACET = "voice_match";
+  const DEMO_MATCH_FACET = "demo_match";
+  const SEX_OPTIONS: SexToken[] = ["male", "female", "other"];
+  const speakersById = $derived(Object.fromEntries(speakers.map((s) => [s.id, s])));
+  const profilesById = $derived(Object.fromEntries(voiceProfiles.map((p) => [p.id, p])));
+  const defaultIdentityFacets = {
+    [SEX_FACET]: "all",
+    [STATUS_FACET]: "all",
+    [VOICE_MATCH_FACET]: "all",
+    [DEMO_MATCH_FACET]: "all",
+  };
+  let filterValues = $state<FilterValues>({ search: "", facets: { ...defaultIdentityFacets } });
   // Guards the filter write-back so the initial default never clobbers a saved filter
   // before hydration restores it (same pattern as Harvest/Attribution/Generation).
   let filtersHydrated = $state(false);
-  const identityFilterConfig: FilterConfig<SpeakerGroup> = {
+
+  function effectiveForGroup(g: SpeakerGroup): EffectiveSpeakerBinding | undefined {
+    const rep = repSpeakerForGroup(g);
+    return rep ? effectiveBySpeaker[rep.id] : undefined;
+  }
+
+  const identityFilterConfig = $derived.by((): FilterConfig<SpeakerGroup> => ({
     textPlaceholder: "character name or resref…",
     text: (g) => [g.display_name, ...g.variants.map((v) => v.cre_resref)],
     facets: [
+      {
+        key: SEX_FACET,
+        label: "Sex",
+        value: (g) => groupSexToken(g, speakersById) ?? "",
+        options: SEX_OPTIONS.map((value) => ({ value, label: sexTokenLabel(value) })),
+      },
       {
         key: STATUS_FACET,
         label: "Effective voice",
@@ -907,8 +1026,49 @@
           { value: "excluded", label: "excluded from pack" },
         ],
       },
+      {
+        key: VOICE_MATCH_FACET,
+        label: "Voice gender",
+        value: () => null,
+        options: [
+          {
+            value: "mismatch",
+            label: "gender mismatch",
+            predicate: (g) =>
+              !g.excluded &&
+              groupHasGenderMismatch(g, effectiveForGroup(g), speakersById, profilesById),
+          },
+          {
+            value: "match",
+            label: "gender matches",
+            predicate: (g) =>
+              groupVoiceSexMatch(g, effectiveForGroup(g), speakersById, profilesById) === "match",
+          },
+        ],
+      },
+      {
+        key: DEMO_MATCH_FACET,
+        label: "Demographics",
+        value: () => null,
+        options: [
+          {
+            value: "mismatch",
+            label: "race/type mismatch",
+            predicate: (g) =>
+              !g.excluded &&
+              groupHasDemographicMismatch(g, effectiveForGroup(g), speakersById, profilesById),
+          },
+          {
+            value: "match",
+            label: "race/type matches",
+            predicate: (g) =>
+              groupDemographicVoiceMatch(g, effectiveForGroup(g), speakersById, profilesById) ===
+              "match",
+          },
+        ],
+      },
     ],
-  };
+  }));
   // The library has its own install-scoped filter state; it must not overwrite
   // the character-list search/facet state below.
   $effect(() => {
@@ -939,7 +1099,12 @@
     void dir;
     ensureFiltersGameDir(dir);
     const saved = getSavedFilter(get(filterCache), "binding");
-    if (saved) filterValues = { search: saved.search, facets: { ...saved.facets } };
+    if (saved) {
+      filterValues = {
+        search: saved.search,
+        facets: { ...defaultIdentityFacets, ...saved.facets },
+      };
+    }
     filtersHydrated = true;
   });
   $effect(() => {
@@ -949,6 +1114,19 @@
   });
   const filteredIdentityGroups = $derived(
     filterItems(identityGroups, identityFilterConfig, filterValues),
+  );
+  const genderMismatchGroups = $derived(
+    identityGroups.filter(
+      (g) =>
+        !g.excluded &&
+        groupHasGenderMismatch(g, effectiveForGroup(g), speakersById, profilesById),
+    ),
+  );
+  const playableFilteredCount = $derived(
+    filteredIdentityGroups.filter((g) => {
+      const effective = effectiveForGroup(g);
+      return !!effective?.sample_path && effective.sample_id !== null;
+    }).length,
   );
   const pagedIdentityGroups = $derived(
     filteredIdentityGroups.slice(
@@ -968,6 +1146,19 @@
     void JSON.stringify(filterValues.facets);
     speakerPage = 0;
   });
+
+  function showGenderMismatches() {
+    filterValues = {
+      search: "",
+      facets: {
+        ...filterValues.facets,
+        [SEX_FACET]: "all",
+        [STATUS_FACET]: "all",
+        [VOICE_MATCH_FACET]: "mismatch",
+      },
+    };
+    charactersListOpen = true;
+  }
 
   const cloneTone = { ready: "success", failed: "danger", pending: "info" } as const;
 
@@ -2221,7 +2412,40 @@
         {#if identityGroups.length === 0}
           <p class="hint">No speakers yet. Run a scan on Attribution, then harvest.</p>
         {:else}
-          <SearchFilterBar config={identityFilterConfig} items={identityGroups} bind:values={filterValues} />
+          {#if genderMismatchGroups.length > 0}
+            <p class="mismatch-note" role="status">
+              {genderMismatchGroups.length} gender mismatch{genderMismatchGroups.length === 1
+                ? ""
+                : "es"}.
+              <button type="button" class="linkish" onclick={showGenderMismatches}
+                >Show mismatches</button
+              >
+            </p>
+          {/if}
+          <SearchFilterBar
+            compact
+            config={identityFilterConfig}
+            items={identityGroups}
+            bind:values={filterValues}
+            shown={filteredIdentityGroups.length}
+            total={identityGroups.length}
+            label="characters"
+          >
+            <Button
+              variant="ghost"
+              onclick={() => void playFilteredEffectiveVoices()}
+              disabled={playableFilteredCount === 0}
+            >
+              {playlistActive
+                ? "Stop playlist"
+                : `Play filtered voices (${playableFilteredCount})`}
+            </Button>
+            {#if playlistActive}
+              <span class="sub"
+                >Playing {playlistIndex + 1} of {playlistQueue.length}</span
+              >
+            {/if}
+          </SearchFilterBar>
           {#if filteredIdentityGroups.length === 0}
             <p class="hint">No characters match the current filter.</p>
           {:else}
@@ -2230,6 +2454,12 @@
                 {@const repId =
                   representativeVariant(g).speaker_id}
                 {@const effective = repId !== undefined ? effectiveBySpeaker[repId] : undefined}
+                {@const genderMismatch =
+                  !g.excluded &&
+                  groupHasGenderMismatch(g, effective, speakersById, profilesById)}
+                {@const demoMismatch =
+                  !g.excluded &&
+                  groupHasDemographicMismatch(g, effective, speakersById, profilesById)}
                 <li>
                   <div
                     class="speaker"
@@ -2247,6 +2477,16 @@
                         <span class="sub">Voice: {effective.voice_profile_name ?? effective.donor_display_name ?? g.display_name}</span>
                       {:else}
                         <StatusBadge tone="warn">Unbound</StatusBadge>
+                      {/if}
+                      {#if genderMismatch}
+                        <StatusBadge tone="warn">gender mismatch</StatusBadge>
+                      {/if}
+                      {#if demoMismatch}
+                        <StatusBadge
+                          tone="info"
+                          title="Bound voice donor differs in race or creature type"
+                          >demo mismatch</StatusBadge
+                        >
                       {/if}
                       {#if !g.excluded && groupReadyButNoLines(g)}
                         <StatusBadge tone="warn">no lines</StatusBadge>
@@ -2309,6 +2549,16 @@
               {:else}
                 <StatusBadge tone={cloneTone[clone.status]}>Clone {clone.status}</StatusBadge>
               {/if}
+              {#if groupHasGenderMismatch(selected, effective, speakersById, profilesById)}
+                <StatusBadge tone="warn">gender mismatch</StatusBadge>
+              {/if}
+              {#if groupHasDemographicMismatch(selected, effective, speakersById, profilesById)}
+                <StatusBadge
+                  tone="info"
+                  title="Bound voice donor differs in race or creature type"
+                  >demo mismatch</StatusBadge
+                >
+              {/if}
               {#if selectedRepSpeaker && groupReadyButNoLines(selected)}
                 <StatusBadge tone="warn">No lines to generate</StatusBadge>
               {/if}
@@ -2327,6 +2577,16 @@
                   {effective.inherited ? "Demographic default" : "Personal override"}
                   · {effective.voice_profile_name ?? effective.donor_display_name ?? "Unknown voice"}
                 </p>
+                {#if groupHasGenderMismatch(selected, effective, speakersById, profilesById)}
+                  <p class="bind-warning">
+                    Voice gender does not match this character's CRE sex.
+                  </p>
+                {/if}
+                {#if groupHasDemographicMismatch(selected, effective, speakersById, profilesById)}
+                  <p class="demo-hint">
+                    Donor race or creature type differs from this character.
+                  </p>
+                {/if}
               {:else}
                 <p>Unbound — apply a demographic default or choose a personal sample.</p>
               {/if}
@@ -2720,9 +2980,12 @@
   <!-- One shared player: starting a clip stops any other; state syncs back here. -->
   <audio
     bind:this={audio}
-    onended={() => (playingId = null)}
-    onpause={() => (playingId = null)}
-    onerror={() => (playingId = null)}
+    onended={onAudioEnded}
+    onpause={onAudioPause}
+    onerror={() => {
+      stopPlaylist();
+      playingId = null;
+    }}
     hidden
   ></audio>
 </Section>
@@ -2737,6 +3000,11 @@
     color: #e6c84a;
     font-size: 0.9rem;
     margin: 0 0 var(--space-md);
+  }
+  .demo-hint {
+    margin: var(--space-1) 0 0;
+    color: var(--text-muted);
+    font-size: 0.85rem;
   }
 
   .bulk {
@@ -3295,6 +3563,34 @@
     padding: var(--space-3) var(--space-4);
     color: var(--warn);
     margin: var(--space-3) 0 0;
+  }
+  .mismatch-note {
+    margin: 0 0 var(--space-3);
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border));
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--warn) 8%, var(--panel-2));
+    color: var(--warn);
+    font-size: 0.85rem;
+    line-height: 1.35;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--space-2);
+  }
+  .mismatch-note .linkish {
+    display: inline;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  .mismatch-note .linkish:hover {
+    opacity: 0.85;
   }
   .effective-voice {
     display: flex;

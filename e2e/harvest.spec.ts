@@ -7,6 +7,14 @@ test.describe("Harvest manual-only fallback", () => {
     await goTo(page, "Harvest");
   });
 
+  test("filters characters by sex", async ({ page }) => {
+    await expect(page.getByLabel("Sex", { exact: true })).toBeVisible();
+    await page.getByLabel("Sex", { exact: true }).selectOption("male");
+    await expect(page.getByRole("button", { name: /Xzar/ })).toBeVisible();
+    await page.getByLabel("Sex", { exact: true }).selectOption("female");
+    await expect(page.getByText("No characters match your search.")).toBeVisible();
+  });
+
   test("fills uncovered exact-character voices without changing the safe action", async ({ page }) => {
     const fallback = page.getByRole("button", { name: "Fill gaps with manual-only" });
     await expect(fallback).toBeVisible();

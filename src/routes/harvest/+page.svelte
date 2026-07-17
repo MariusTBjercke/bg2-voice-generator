@@ -32,6 +32,7 @@
     type SoundSampleGroup,
   } from "$lib/speakers/samples";
   import { formatApprovedSummary, groupSummary } from "$lib/speakers/groups";
+  import { groupSexToken, sexTokenLabel, type SexToken } from "$lib/speakers/sex";
   import {
     identityHref,
     pathWithoutIdentity,
@@ -55,6 +56,7 @@
     SampleDecision,
     SampleProvenance,
     SampleScore,
+    Speaker,
     SpeakerGroup,
     VerifySpeechResult,
   } from "$lib/types";
@@ -86,8 +88,9 @@
   let settingsError = $state<string | null>(null);
 
   let harvesting = $state(false);
-  // Speakers are enumerated fresh per install; they are cheap to reload and not
-  // part of the persisted cache.
+  // Speakers / identity groups are enumerated fresh per install; they are cheap
+  // to reload and not part of the persisted cache.
+  let speakers = $state<Speaker[]>([]);
   let groups = $state<SpeakerGroup[]>([]);
   let selected = $state<SpeakerGroup | null>(null);
   let selectedKey = $state<string | null>(null);
@@ -204,12 +207,21 @@
     ),
   );
 
-  // Character search + sample-status facet for working through the cast.
+  // Character search + sample-status / sex facets for working through the cast.
   const REVIEW_FACET = "review";
-  const filterConfig: FilterConfig<SpeakerGroup> = {
+  const SEX_FACET = "sex";
+  const SEX_OPTIONS: SexToken[] = ["male", "female", "other"];
+  const speakersById = $derived(Object.fromEntries(speakers.map((s) => [s.id, s])));
+  const filterConfig = $derived.by((): FilterConfig<SpeakerGroup> => ({
     textPlaceholder: "character name or cre resref…",
     text: (g) => [g.display_name, ...g.variants.map((v) => v.cre_resref)],
     facets: [
+      {
+        key: SEX_FACET,
+        label: "Sex",
+        value: (g) => groupSexToken(g, speakersById) ?? "",
+        options: SEX_OPTIONS.map((value) => ({ value, label: sexTokenLabel(value) })),
+      },
       {
         key: REVIEW_FACET,
         label: "Sample status",
@@ -238,8 +250,11 @@
         ],
       },
     ],
-  };
-  let filterValues = $state<FilterValues>({ search: "", facets: { [REVIEW_FACET]: "all" } });
+  }));
+  let filterValues = $state<FilterValues>({
+    search: "",
+    facets: { [SEX_FACET]: "all", [REVIEW_FACET]: "all" },
+  });
   let filtersHydrated = $state(false);
   const filteredGroups = $derived(filterItems(groups, filterConfig, filterValues));
   const pagedGroups = $derived(
@@ -257,7 +272,7 @@
     if (saved) {
       filterValues = {
         search: saved.search,
-        facets: { [REVIEW_FACET]: "all", ...saved.facets },
+        facets: { [SEX_FACET]: "all", [REVIEW_FACET]: "all", ...saved.facets },
       };
     }
     filtersHydrated = true;
@@ -302,7 +317,12 @@
 
   async function loadGroups() {
     if (!dir) return;
-    groups = await loadSpeakerGroups(dir, true);
+    const [speakerList, identityGroups] = await Promise.all([
+      invoke<Speaker[]>("list_speakers", { gameDir: dir }),
+      loadSpeakerGroups(dir, true),
+    ]);
+    speakers = speakerList;
+    groups = identityGroups;
   }
 
   async function runHarvest() {
@@ -845,6 +865,7 @@
           <p class="hint">No characters yet. Run a scan on Attribution, then harvest.</p>
         {:else}
           <SearchFilterBar
+            compact
             config={filterConfig}
             items={groups}
             bind:values={filterValues}

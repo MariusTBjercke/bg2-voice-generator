@@ -6,6 +6,7 @@
   // a result count + a Clear button. It owns NO data and performs NO IO — the
   // screen still runs `filterItems` over its own `$derived` (ADR 0003). This
   // replaces the per-page filter markup so screens configure instead of fork.
+  import type { Snippet } from "svelte";
   import Button from "$lib/components/Button.svelte";
   import {
     facetOptions,
@@ -26,6 +27,12 @@
     total?: number;
     /** Noun for the count summary. */
     label?: string;
+    /**
+     * Denser framed layout for narrow character sidebars: search on top,
+     * facets in a responsive grid, optional trailing actions via children.
+     */
+    compact?: boolean;
+    children?: Snippet;
   };
 
   let {
@@ -35,6 +42,8 @@
     shown,
     total,
     label = "items",
+    compact = false,
+    children,
   }: Props = $props();
 
   const facets = $derived(config.facets ?? []);
@@ -46,7 +55,7 @@
   }
 </script>
 
-<div class="bar">
+<div class="bar" class:compact>
   <label class="field search">
     <span class="field-label">Search</span>
     <input
@@ -56,17 +65,21 @@
     />
   </label>
 
-  {#each facets as facet (facet.key)}
-    <label class="field">
-      <span class="field-label">{facet.label}</span>
-      <select bind:value={values.facets[facet.key]}>
-        <option value={FACET_ALL}>{facet.allLabel ?? "All"}</option>
-        {#each facetOptions(facet, items) as opt (opt.value)}
-          <option value={opt.value}>{opt.label}</option>
-        {/each}
-      </select>
-    </label>
-  {/each}
+  {#if facets.length > 0}
+    <div class="facets">
+      {#each facets as facet (facet.key)}
+        <label class="field">
+          <span class="field-label">{facet.label}</span>
+          <select aria-label={facet.label} bind:value={values.facets[facet.key]}>
+            <option value={FACET_ALL}>{facet.allLabel ?? "All"}</option>
+            {#each facetOptions(facet, items) as opt (opt.value)}
+              <option value={opt.value}>{opt.label}</option>
+            {/each}
+          </select>
+        </label>
+      {/each}
+    </div>
+  {/if}
 
   <div class="tail">
     {#if hasCount}
@@ -78,6 +91,12 @@
       <Button variant="ghost" onclick={clear}>Clear filters</Button>
     {/if}
   </div>
+
+  {#if children}
+    <div class="extra">
+      {@render children()}
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -91,6 +110,9 @@
     gap: var(--space-3);
     flex-wrap: wrap;
     margin-bottom: var(--space-3);
+  }
+  .facets {
+    display: contents;
   }
   .field {
     box-sizing: border-box;
@@ -136,5 +158,55 @@
     font-size: 0.85rem;
     color: var(--text-muted);
     white-space: nowrap;
+  }
+  .extra {
+    flex: 1 1 100%;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2) var(--space-3);
+  }
+
+  /* Narrow character-list chrome: one framed tools block instead of stacked
+     full-width fields that dominate the sticky sidebar. */
+  .bar.compact {
+    display: grid;
+    grid-template-columns: 1fr;
+    align-items: stretch;
+    gap: var(--space-3);
+    margin-bottom: var(--space-3);
+    padding: var(--space-3);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+  .bar.compact .field.search {
+    flex: none;
+    min-width: 0;
+  }
+  .bar.compact .facets {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(7.25rem, 1fr));
+    gap: var(--space-2);
+  }
+  .bar.compact .field select,
+  .bar.compact .field input {
+    background: var(--panel);
+    padding: 0.35rem var(--space-2);
+    font-size: 0.9rem;
+  }
+  .bar.compact .tail {
+    margin-left: 0;
+    justify-content: space-between;
+    gap: var(--space-2);
+    padding-top: var(--space-1);
+    border-top: 1px solid var(--border);
+  }
+  .bar.compact .extra {
+    flex: none;
+    padding-top: 0;
+  }
+  .bar.compact .extra:not(:empty) {
+    padding-top: 0;
   }
 </style>

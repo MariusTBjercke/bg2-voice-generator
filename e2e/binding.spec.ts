@@ -290,6 +290,21 @@ test.describe("Guided voice binding", () => {
     await expect(page.getByPlaceholder("character name or resref…")).toHaveValue("Montaron");
   });
 
+  test("filters characters by sex and exposes a filtered-voice playlist", async ({ page }) => {
+    const characters = page.locator("#characters-list-panel");
+    await expect(characters.getByLabel("Sex", { exact: true })).toBeVisible();
+    await expect(characters.getByLabel("Voice gender", { exact: true })).toBeVisible();
+    await expect(characters.getByLabel("Demographics", { exact: true })).toBeVisible();
+    await expect(characters.getByRole("button", { name: /Play filtered voices/ })).toBeVisible();
+
+    await characters.getByLabel("Sex", { exact: true }).selectOption("male");
+    await expect(characters.getByRole("button", { name: /^Xzar\b/ })).toBeVisible();
+    await expect(characters.getByRole("button", { name: /^Montaron\b/ })).toBeVisible();
+
+    await characters.getByLabel("Sex", { exact: true }).selectOption("female");
+    await expect(characters.getByText("No characters match the current filter.")).toBeVisible();
+  });
+
   test("keeps the desktop speaker column bounded with vertical-only scrolling", async ({ page }) => {
     const layout = page.locator(".layout");
     await expect(layout.getByRole("heading", { name: "Characters (2)" })).toBeVisible();
