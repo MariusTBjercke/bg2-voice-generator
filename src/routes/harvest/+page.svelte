@@ -34,6 +34,7 @@
   import { formatApprovedSummary, groupSummary } from "$lib/speakers/groups";
   import { groupSexToken, sexTokenLabel, type SexToken } from "$lib/speakers/sex";
   import {
+    findGroupByIdentityParam,
     identityHref,
     pathWithoutIdentity,
     readIdentityParam,
@@ -619,7 +620,7 @@
     const gameDir = dir;
     const deepKey = readIdentityParam(page.url);
     if (deepKey && groups.length > 0) {
-      const match = groups.find((g) => g.identity_key === deepKey);
+      const match = findGroupByIdentityParam(groups, deepKey);
       const strip = () =>
         void goto(pathWithoutIdentity(page.url), { replaceState: true, keepFocus: true });
       if (!match) {
@@ -642,7 +643,7 @@
     const savedKey = $results.harvest.selectedIdentityKey
       ?? (gameDir ? getInstallUiPreferences(gameDir).harvestSelectedIdentityKey : null);
     if (!selected && savedKey && groups.length > 0) {
-      const match = groups.find((g) => g.identity_key === savedKey);
+      const match = findGroupByIdentityParam(groups, savedKey);
       if (match) {
         void selectGroup(match);
       } else if (gameDir) {

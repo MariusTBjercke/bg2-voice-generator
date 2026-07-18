@@ -206,6 +206,173 @@ pub fn existing_sample_sound_keys(
     Ok(out)
 }
 
+/// Harvest-shaped identity key: named TLK strref, else `ungrouped:{cre}`.
+fn harvest_identity_key(long_name_strref: Option<i64>, cre_resref: &str) -> String {
+    match long_name_strref {
+        Some(s) => s.to_string(),
+        None => format!("ungrouped:{}", cre_resref.to_ascii_lowercase()),
+    }
+}
+
+/// Project-wide sound ownership used to keep cross-identity clips manual-only.
+pub fn load_sound_ownership_context(
+    conn: &Connection,
+    project_id: i64,
+) -> Result<crate::voices::harvest::SoundOwnershipContext, AppError> {
+    let mut identities_by_sound: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut identities_by_cre_stem: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut cres_by_stem: HashMap<String, HashSet<String>> = HashMap::new();
+
+    {
+        let mut stmt = conn.prepare(
+            "SELECT cre_resref, long_name_strref FROM speaker WHERE project_id = ?1",
+        )?;
+        for row in stmt.query_map(params![project_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
+        })? {
+            let (cre, strref) = row?;
+            let cre_lc = cre.to_ascii_lowercase();
+            let identity = harvest_identity_key(strref, &cre_lc);
+            let stem = crate::voices::harvest::resref_stem(&cre_lc);
+            if stem.len() >= 4 {
+                identities_by_cre_stem
+                    .entry(stem.clone())
+                    .or_default()
+                    .insert(identity);
+                cres_by_stem.entry(stem).or_default().insert(cre_lc);
+            }
+        }
+    }
+
+    let mut bump_sound = |sound: String, identity: String| {
+        let sound = sound.trim().to_ascii_lowercase();
+        if sound.is_empty() {
+            return;
+        }
+        identities_by_sound
+            .entry(sound)
+            .or_default()
+            .insert(identity);
+    };
+
+    {
+        let mut stmt = conn.prepare(
+            "SELECT lower(l.existing_sound_resref), s.cre_resref, s.long_name_strref \
+             FROM line l \
+             JOIN speaker s ON s.id = l.speaker_id \
+             WHERE s.project_id = ?1 \
+               AND l.existing_sound_resref IS NOT NULL \
+               AND trim(l.existing_sound_resref) != ''",
+        )?;
+        for row in stmt.query_map(params![project_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+            ))
+        })? {
+            let (sound, cre, strref) = row?;
+            bump_sound(sound, harvest_identity_key(strref, &cre));
+        }
+    }
+
+    {
+        let mut stmt = conn.prepare(
+            "SELECT lower(rs.source_sound_resref), s.cre_resref, s.long_name_strref \
+             FROM reference_sample rs \
+             JOIN speaker s ON s.id = rs.speaker_id \
+             WHERE s.project_id = ?1 \
+               AND rs.source_sound_resref IS NOT NULL \
+               AND trim(rs.source_sound_resref) != '' \
+               AND rs.provenance_json LIKE '%\"origin\":\"dialogue_state\"%'",
+        )?;
+        for row in stmt.query_map(params![project_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+            ))
+        })? {
+            let (sound, cre, strref) = row?;
+            bump_sound(sound, harvest_identity_key(strref, &cre));
+        }
+    }
+
+    Ok(crate::voices::harvest::SoundOwnershipContext {
+        identities_by_sound,
+        identities_by_cre_stem,
+        cres_by_stem,
+    })
+}
+
+/// Demote automatic samples that are clearly cross-identity (shared sound or foreign
+/// CRE stem) to `manual_only`. Does **not** clear approvals, clones, or bindings.
+pub fn demote_cross_identity_automatic_samples(
+    conn: &Connection,
+    project_id: i64,
+) -> Result<usize, AppError> {
+    let ctx = load_sound_ownership_context(conn, project_id)?;
+    let mut stmt = conn.prepare(
+        "SELECT rs.id, rs.source_sound_resref, rs.provenance_json, s.cre_resref, s.long_name_strref \
+         FROM reference_sample rs \
+         JOIN speaker s ON s.id = rs.speaker_id \
+         WHERE s.project_id = ?1 \
+           AND rs.source_sound_resref IS NOT NULL \
+           AND trim(rs.source_sound_resref) != ''",
+    )?;
+    let rows: Vec<(i64, String, String, String, Option<i64>)> = stmt
+        .query_map(params![project_id], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut updated = 0usize;
+    for (sample_id, sound, provenance, cre, strref) in rows {
+        if !crate::voices::harvest::provenance_is_automatic(&provenance) {
+            continue;
+        }
+        let identity = harvest_identity_key(strref, &cre);
+        let reason = crate::voices::harvest::cross_identity_reason(
+            &sound,
+            &cre,
+            &identity,
+            &ctx,
+        );
+        let Some(shared_count) = reason else {
+            continue;
+        };
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&provenance) else {
+            continue;
+        };
+        let Some(obj) = value.as_object_mut() else {
+            continue;
+        };
+        obj.insert(
+            "eligibility".into(),
+            serde_json::Value::String("manual_only".into()),
+        );
+        obj.insert(
+            "shared_source_count".into(),
+            serde_json::Value::from(shared_count),
+        );
+        let next = value.to_string();
+        let n = conn.execute(
+            "UPDATE reference_sample SET provenance_json = ?2 WHERE id = ?1",
+            params![sample_id, next],
+        )?;
+        if n > 0 {
+            updated += 1;
+        }
+    }
+    Ok(updated)
+}
+
 /// Insert only samples whose `(speaker, source_sound_resref)` is not already present.
 /// Never deletes samples, never resets decisions, never invalidates clones or donors.
 pub fn persist_additive(
@@ -668,6 +835,7 @@ pub fn repair_same_sound_sample_decisions(
         project_id: i64,
         speaker_id: i64,
         long_name_strref: Option<i64>,
+        sex: i64,
         sample_id: i64,
         decision: String,
         scores_json: String,
@@ -676,7 +844,7 @@ pub fn repair_same_sound_sample_decisions(
     }
 
     let mut stmt = conn.prepare(
-        "SELECT s.project_id, s.id, s.long_name_strref, rs.id, rs.decision, \
+        "SELECT s.project_id, s.id, s.long_name_strref, s.sex, rs.id, rs.decision, \
                 rs.scores_json, rs.source_sound_resref, rs.provenance_json \
          FROM reference_sample rs \
          JOIN speaker s ON s.id = rs.speaker_id",
@@ -687,11 +855,12 @@ pub fn repair_same_sound_sample_decisions(
                 project_id: r.get(0)?,
                 speaker_id: r.get(1)?,
                 long_name_strref: r.get(2)?,
-                sample_id: r.get(3)?,
-                decision: r.get(4)?,
-                scores_json: r.get(5)?,
-                source_sound_resref: r.get(6)?,
-                provenance_json: r.get(7)?,
+                sex: r.get(3)?,
+                sample_id: r.get(4)?,
+                decision: r.get(5)?,
+                scores_json: r.get(6)?,
+                source_sound_resref: r.get(7)?,
+                provenance_json: r.get(8)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -701,7 +870,7 @@ pub fn repair_same_sound_sample_decisions(
     for row in &rows {
         let key = (
             row.project_id,
-            crate::db::speaker_groups::identity_key(row.long_name_strref, row.speaker_id),
+            crate::db::speaker_groups::identity_key(row.long_name_strref, row.sex, row.speaker_id),
             sound_resref_for_repair(
                 row.source_sound_resref.as_deref(),
                 &row.provenance_json,
@@ -2071,5 +2240,79 @@ mod tests {
         let counts = repair_same_sound_sample_decisions(&conn).unwrap();
         assert_eq!(counts.samples_updated, 0);
         assert_eq!(decision_of(&conn, pending), "pending");
+    }
+
+    #[test]
+    fn demote_cross_identity_keeps_approvals_and_clones() {
+        let mut conn = mem_db();
+        let pid = project(&conn);
+        let boy = speaker_with_strref(&conn, pid, "boyba1", Some(8822));
+        let jaheira = speaker_with_strref(&conn, pid, "jaheir", Some(7185));
+        conn.execute(
+            "INSERT INTO line (project_id, speaker_id, strref, text, existing_sound_resref, status) \
+             VALUES (?1, ?2, 1, 'Jaheira line', 'jaheir62', 'ready')",
+            params![pid, jaheira],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO line (project_id, speaker_id, strref, text, existing_sound_resref, status) \
+             VALUES (?1, ?2, 2, 'Boy shared', 'jaheir62', 'ready')",
+            params![pid, boy],
+        )
+        .unwrap();
+        let counts = persist(
+            &mut conn,
+            pid,
+            &[sample("boyba1", "jaheir62")],
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(counts.samples, 1);
+        let sample_id: i64 = conn
+            .query_row("SELECT id FROM reference_sample", [], |r| r.get(0))
+            .unwrap();
+        set_decision(&conn, sample_id, "approved").unwrap();
+        let clone_id = crate::db::generation::upsert_clone(
+            &conn,
+            boy,
+            sample_id,
+            crate::models::BindingSource::Default,
+        )
+        .unwrap();
+        crate::db::generation::set_clone_status(
+            &conn,
+            clone_id,
+            crate::models::CloneStatus::Ready,
+        )
+        .unwrap();
+
+        let demoted = demote_cross_identity_automatic_samples(&conn, pid).unwrap();
+        assert_eq!(demoted, 1);
+        let provenance: String = conn
+            .query_row(
+                "SELECT provenance_json FROM reference_sample WHERE id=?1",
+                params![sample_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(provenance.contains("manual_only"));
+        let decision: String = conn
+            .query_row(
+                "SELECT decision FROM reference_sample WHERE id=?1",
+                params![sample_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(decision, "approved");
+        let (status, primary): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT status, primary_sample_id FROM clone WHERE id=?1",
+                params![clone_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "ready");
+        assert_eq!(primary, Some(sample_id));
     }
 }

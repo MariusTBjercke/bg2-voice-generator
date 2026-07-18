@@ -54,6 +54,73 @@ pub struct SampleProvenance {
 fn default_automatic_eligibility() -> String { "automatic".into() }
 fn default_shared_source_count() -> usize { 1 }
 
+/// Strip trailing digits from a resref for stem matching (`jaheir62` → `jaheir`).
+pub fn resref_stem(resref: &str) -> String {
+    resref
+        .trim_end_matches(|c: char| c.is_ascii_digit())
+        .to_ascii_lowercase()
+}
+
+/// Project-wide ownership facts used to keep another character's VO manual-only.
+#[derive(Debug, Clone, Default)]
+pub struct SoundOwnershipContext {
+    /// lowercase sound → harvest identity keys known to use it
+    pub identities_by_sound: HashMap<String, HashSet<String>>,
+    /// CRE stem → harvest identity keys that have a CRE with that stem
+    pub identities_by_cre_stem: HashMap<String, HashSet<String>>,
+    /// CRE stem → lowercase CRE resrefs with that stem
+    pub cres_by_stem: HashMap<String, HashSet<String>>,
+}
+
+/// When `sound` should not be automatic for `speaker_identity`/`speaker_cre`, returns
+/// the shared-source count to record (≥ 2). `None` means automatic is fine.
+pub fn cross_identity_reason(
+    sound: &str,
+    speaker_cre: &str,
+    speaker_identity: &str,
+    ctx: &SoundOwnershipContext,
+) -> Option<usize> {
+    let sound = sound.trim().to_ascii_lowercase();
+    if sound.is_empty() {
+        return None;
+    }
+    let speaker_cre = speaker_cre.to_ascii_lowercase();
+    let mut owners = ctx
+        .identities_by_sound
+        .get(&sound)
+        .cloned()
+        .unwrap_or_default();
+    owners.insert(speaker_identity.to_string());
+    if owners.len() > 1 {
+        return Some(owners.len());
+    }
+
+    let sound_stem = resref_stem(&sound);
+    if sound_stem.len() < 4 {
+        return None;
+    }
+    let speaker_stem = resref_stem(&speaker_cre);
+    let self_matches_stem = speaker_stem == sound_stem
+        || (speaker_stem.len() >= 4 && sound.starts_with(&speaker_stem));
+    if self_matches_stem {
+        return None;
+    }
+    let foreign_cres = ctx.cres_by_stem.get(&sound_stem);
+    let has_foreign_cre = foreign_cres.is_some_and(|cres| {
+        cres.iter()
+            .any(|cre| cre != &speaker_cre && resref_stem(cre) == sound_stem)
+    });
+    let foreign_identities = ctx
+        .identities_by_cre_stem
+        .get(&sound_stem)
+        .map(|ids| ids.iter().filter(|id| *id != speaker_identity).count())
+        .unwrap_or(0);
+    if has_foreign_cre || foreign_identities > 0 {
+        return Some((foreign_identities + 1).max(2));
+    }
+    None
+}
+
 /// Older rows predate eligibility metadata and came from the former automatic
 /// pipeline. Treat a missing token as automatic; explicit manual-only always wins.
 pub fn provenance_is_automatic(raw: &str) -> bool {
@@ -157,7 +224,9 @@ pub fn resolve_harvest_parallelism(setting: Option<&str>) -> usize {
 ///
 /// `existing_sample_keys` maps lowercase `cre_resref` → lowercase sound resrefs
 /// already persisted for that speaker; matching candidates are skipped (additive
-/// re-harvest). `gap_fill` adds Attribution-voiced candidates for thin speakers
+/// re-harvest). `ownership` carries project-wide sound/CRE-stem facts so another
+/// character's VO stays manual-only even when that peer is not in this decode batch.
+/// `gap_fill` adds Attribution-voiced candidates for thin speakers
 /// (Ready lines, few automatic samples). `parallelism` is the number of concurrent
 /// decode workers (from [`resolve_harvest_parallelism`]). `on_progress` is called
 /// once per completed candidate with the running counters. `should_cancel` is polled
@@ -170,6 +239,7 @@ pub fn harvest(
     workspace: &Path,
     parallelism: usize,
     existing_sample_keys: &HashMap<String, HashSet<String>>,
+    ownership: &SoundOwnershipContext,
     gap_fill: &[GapFillSpeakerInput],
     on_progress: impl Fn(HarvestProgress) + Send + Sync + 'static,
     should_cancel: impl Fn() -> bool + Send + Sync + 'static,
@@ -186,12 +256,13 @@ pub fn harvest(
     };
 
     report.conflicting_aliases_skipped = sources.iter().map(|s| s.unsafe_metadata_skipped).sum();
-    let (mut jobs, skipped, already_present) = build_jobs(&sources, existing_sample_keys);
+    let (mut jobs, skipped, already_present) =
+        build_jobs(&sources, existing_sample_keys, ownership);
     report.candidates_skipped = skipped;
     report.candidates_already_present = already_present;
 
     let (gap_jobs, gap_candidates, gap_already) =
-        build_gap_fill_jobs(gap_fill, existing_sample_keys, &jobs);
+        build_gap_fill_jobs(gap_fill, existing_sample_keys, &jobs, ownership);
     report.gap_fill_candidates = gap_candidates;
     report.candidates_already_present += gap_already;
     jobs.extend(gap_jobs);
@@ -228,10 +299,41 @@ pub fn harvest(
     Ok((samples, report))
 }
 
+/// Merge batch-local sound→identity facts into a copy of the project ownership map.
+fn ownership_with_batch(
+    base: &SoundOwnershipContext,
+    batch_identities_by_sound: HashMap<String, HashSet<String>>,
+) -> SoundOwnershipContext {
+    let mut merged = base.clone();
+    for (sound, ids) in batch_identities_by_sound {
+        merged
+            .identities_by_sound
+            .entry(sound)
+            .or_default()
+            .extend(ids);
+    }
+    merged
+}
+
+fn apply_cross_identity_eligibility(
+    cand: &mut candidates::Candidate,
+    cre_resref: &str,
+    identity_key: &str,
+    ownership: &SoundOwnershipContext,
+) {
+    if let Some(shared) =
+        cross_identity_reason(&cand.sound_resref, cre_resref, identity_key, ownership)
+    {
+        cand.shared_source_count = shared;
+        cand.eligibility = CandidateEligibility::ManualOnly;
+    }
+}
+
 /// Flatten per-speaker candidate selection into independent decode jobs.
 fn build_jobs(
     sources: &[extractor::SpeakerSources],
     existing_sample_keys: &HashMap<String, HashSet<String>>,
+    ownership: &SoundOwnershipContext,
 ) -> (Vec<HarvestJob>, usize, usize) {
     struct SelectedSpeaker {
         cre_resref: String,
@@ -285,18 +387,16 @@ fn build_jobs(
 
     // Reuse across identities is ambiguous, but the clip is still useful for
     // deliberate audition. Retain it as manual-only instead of destroying coverage.
-    let mut identities_by_sound: std::collections::HashMap<
-        String,
-        std::collections::HashSet<String>,
-    > = std::collections::HashMap::new();
+    let mut batch_by_sound: HashMap<String, HashSet<String>> = HashMap::new();
     for speaker in &selected_speakers {
         for cand in &speaker.candidates {
-            identities_by_sound
+            batch_by_sound
                 .entry(cand.sound_resref.clone())
                 .or_default()
                 .insert(speaker.identity_key.clone());
         }
     }
+    let ownership = ownership_with_batch(ownership, batch_by_sound);
 
     let mut jobs = Vec::new();
     let mut already_present = 0usize;
@@ -308,10 +408,12 @@ fn build_jobs(
                 already_present += 1;
                 continue;
             }
-            cand.shared_source_count = identities_by_sound.get(&cand.sound_resref).map_or(1, |ids| ids.len());
-            if cand.shared_source_count > 1 {
-                cand.eligibility = CandidateEligibility::ManualOnly;
-            }
+            apply_cross_identity_eligibility(
+                &mut cand,
+                &speaker.cre_resref,
+                &speaker.identity_key,
+                &ownership,
+            );
             jobs.push(HarvestJob {
                 cre_resref: speaker.cre_resref.clone(),
                 cand,
@@ -326,22 +428,23 @@ fn build_gap_fill_jobs(
     gap_fill: &[GapFillSpeakerInput],
     existing_sample_keys: &HashMap<String, HashSet<String>>,
     live_jobs: &[HarvestJob],
+    ownership: &SoundOwnershipContext,
 ) -> (Vec<HarvestJob>, usize, usize) {
     let mut live_sounds_by_cre: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut identities_by_sound: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut batch_by_sound: HashMap<String, HashSet<String>> = HashMap::new();
     for job in live_jobs {
         let cre_lc = job.cre_resref.to_ascii_lowercase();
         live_sounds_by_cre
             .entry(cre_lc.clone())
             .or_default()
             .insert(job.cand.sound_resref.clone());
-        identities_by_sound
+        batch_by_sound
             .entry(job.cand.sound_resref.clone())
             .or_default()
             .insert(format!("live:{cre_lc}"));
     }
 
-    let mut selected: Vec<(String, candidates::Candidate)> = Vec::new();
+    let mut selected: Vec<(String, String, candidates::Candidate)> = Vec::new();
     let mut already_present = 0usize;
     for speaker in gap_fill {
         let cre_lc = speaker.cre_resref.to_ascii_lowercase();
@@ -365,22 +468,22 @@ fn build_gap_fill_jobs(
             }
         }
         for cand in candidates::select_gap_fill(&speaker.lines, &already) {
-            identities_by_sound
+            batch_by_sound
                 .entry(cand.sound_resref.clone())
                 .or_default()
                 .insert(speaker.identity_key.clone());
-            selected.push((speaker.cre_resref.clone(), cand));
+            selected.push((
+                speaker.cre_resref.clone(),
+                speaker.identity_key.clone(),
+                cand,
+            ));
         }
     }
+    let ownership = ownership_with_batch(ownership, batch_by_sound);
 
     let mut jobs = Vec::new();
-    for (cre_resref, mut cand) in selected {
-        cand.shared_source_count = identities_by_sound
-            .get(&cand.sound_resref)
-            .map_or(1, |ids| ids.len());
-        if cand.shared_source_count > 1 {
-            cand.eligibility = CandidateEligibility::ManualOnly;
-        }
+    for (cre_resref, identity_key, mut cand) in selected {
+        apply_cross_identity_eligibility(&mut cand, &cre_resref, &identity_key, &ownership);
         jobs.push(HarvestJob { cre_resref, cand });
     }
     let candidates = jobs.len();
@@ -567,7 +670,7 @@ mod tests {
             speaker_source("first", "100", "shared01"),
             speaker_source("second", "200", "shared01"),
         ];
-        let (jobs, skipped, already) = build_jobs(&sources, &HashMap::new());
+        let (jobs, skipped, already) = build_jobs(&sources, &HashMap::new(), &SoundOwnershipContext::default());
         assert_eq!(jobs.len(), 2);
         assert_eq!(skipped, 0);
         assert_eq!(already, 0);
@@ -581,7 +684,7 @@ mod tests {
             speaker_source("first1", "100", "shared01"),
             speaker_source("first2", "100", "shared01"),
         ];
-        let (jobs, skipped, already) = build_jobs(&sources, &HashMap::new());
+        let (jobs, skipped, already) = build_jobs(&sources, &HashMap::new(), &SoundOwnershipContext::default());
         assert_eq!(jobs.len(), 2);
         assert_eq!(skipped, 0);
         assert_eq!(already, 0);
@@ -591,7 +694,8 @@ mod tests {
     fn metadata_conflict_count_is_included_in_policy_skips() {
         let mut source = speaker_source("first", "100", "clean01");
         source.unsafe_metadata_skipped = 3;
-        let (jobs, skipped, already) = build_jobs(&[source], &HashMap::new());
+        let (jobs, skipped, already) =
+            build_jobs(&[source], &HashMap::new(), &SoundOwnershipContext::default());
         assert_eq!(jobs.len(), 1);
         assert_eq!(skipped, 3);
         assert_eq!(already, 0);
@@ -605,7 +709,8 @@ mod tests {
             "first".into(),
             HashSet::from(["have01".into()]),
         );
-        let (jobs, _skipped, already) = build_jobs(&sources, &existing);
+        let (jobs, _skipped, already) =
+            build_jobs(&sources, &existing, &SoundOwnershipContext::default());
         assert!(jobs.is_empty());
         assert_eq!(already, 1);
     }
@@ -624,11 +729,66 @@ mod tests {
             slots: Vec::new(),
             unsafe_metadata_skipped: 0,
         }];
-        let (jobs, skipped, already) = build_jobs(&sources, &HashMap::new());
+        let (jobs, skipped, already) =
+            build_jobs(&sources, &HashMap::new(), &SoundOwnershipContext::default());
         assert_eq!(jobs.len(), 1);
         assert_eq!(skipped, 0);
         assert_eq!(already, 0);
         assert_eq!(jobs[0].cand.origin, CandidateOrigin::CompanionDialogue);
+    }
+
+    #[test]
+    fn foreign_cre_stem_in_project_ownership_is_manual_only() {
+        let sources = vec![speaker_source("boyba1", "8822", "jaheir62")];
+        let mut ownership = SoundOwnershipContext::default();
+        ownership
+            .cres_by_stem
+            .entry("jaheir".into())
+            .or_default()
+            .insert("jaheir".into());
+        ownership
+            .identities_by_cre_stem
+            .entry("jaheir".into())
+            .or_default()
+            .insert("7185".into());
+        let (jobs, _, _) = build_jobs(&sources, &HashMap::new(), &ownership);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].cand.eligibility, CandidateEligibility::ManualOnly);
+        assert!(jobs[0].cand.shared_source_count >= 2);
+    }
+
+    #[test]
+    fn project_shared_sound_ownership_is_manual_only_even_alone_in_batch() {
+        let sources = vec![speaker_source("boyba1", "8822", "jaheir62")];
+        let mut ownership = SoundOwnershipContext::default();
+        ownership
+            .identities_by_sound
+            .entry("jaheir62".into())
+            .or_default()
+            .insert("7185".into());
+        let (jobs, _, _) = build_jobs(&sources, &HashMap::new(), &ownership);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].cand.eligibility, CandidateEligibility::ManualOnly);
+        assert_eq!(jobs[0].cand.shared_source_count, 2);
+    }
+
+    #[test]
+    fn own_cre_stem_sound_stays_automatic() {
+        let sources = vec![speaker_source("jaheir", "7185", "jaheir62")];
+        let mut ownership = SoundOwnershipContext::default();
+        ownership
+            .cres_by_stem
+            .entry("jaheir".into())
+            .or_default()
+            .insert("jaheir".into());
+        ownership
+            .identities_by_cre_stem
+            .entry("jaheir".into())
+            .or_default()
+            .insert("7185".into());
+        let (jobs, _, _) = build_jobs(&sources, &HashMap::new(), &ownership);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].cand.eligibility, CandidateEligibility::Automatic);
     }
 
     #[test]
@@ -645,7 +805,7 @@ mod tests {
             slots: Vec::new(),
             unsafe_metadata_skipped: 0,
         }];
-        let (live_jobs, _, _) = build_jobs(&live, &HashMap::new());
+        let (live_jobs, _, _) = build_jobs(&live, &HashMap::new(), &SoundOwnershipContext::default());
         let gap = [GapFillSpeakerInput {
             cre_resref: "npc".into(),
             identity_key: "1".into(),
@@ -665,7 +825,7 @@ mod tests {
             ],
         }];
         let (gap_jobs, candidates, already) =
-            build_gap_fill_jobs(&gap, &HashMap::new(), &live_jobs);
+            build_gap_fill_jobs(&gap, &HashMap::new(), &live_jobs, &SoundOwnershipContext::default());
         assert_eq!(candidates, 1);
         assert_eq!(gap_jobs.len(), 1);
         assert_eq!(gap_jobs[0].cand.sound_resref, "gap01");
@@ -732,6 +892,7 @@ mod tests {
             ws.path(),
             resolve_harvest_parallelism(None),
             &HashMap::new(),
+            &SoundOwnershipContext::default(),
             &[],
             |_| {},
             || false,

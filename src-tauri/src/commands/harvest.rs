@@ -16,9 +16,10 @@ use tauri::{AppHandle, State};
 use crate::audio::ffmpeg;
 use crate::commands::progress::{ProgressEmitter, OP_HARVEST, OP_SPEECH_VERIFY};
 use crate::db::harvest::{
-    auto_approve_best, auto_approve_manual_gaps, existing_sample_sound_keys,
-    gap_fill_eligible_speakers, gap_fill_voiced_lines, persist_additive, set_decision,
-    AutoApproveCounts, HarvestPersistCounts, ResetDecisionsCounts,
+    auto_approve_best, auto_approve_manual_gaps, demote_cross_identity_automatic_samples,
+    existing_sample_sound_keys, gap_fill_eligible_speakers, gap_fill_voiced_lines,
+    load_sound_ownership_context, persist_additive, set_decision, AutoApproveCounts,
+    HarvestPersistCounts, ResetDecisionsCounts,
 };
 use crate::db::queries::{
     reference_sample_from_row, speaker_from_row, REFERENCE_SAMPLE_COLUMNS, SPEAKER_COLUMNS,
@@ -78,13 +79,14 @@ pub async fn harvest_references(
 
     // Resolve the project + workspace under a SHORT lock, then release it so the
     // long decode loop below runs WITHOUT the DB lock (health polling stays live).
-    let (project_id, workspace, parallelism, existing_keys, gap_fill) = {
+    let (project_id, workspace, parallelism, existing_keys, ownership, gap_fill) = {
         let conn = state.db.lock().await;
         let project_id = ensure_project(&conn, &game_dir, locale.as_deref())?;
         let parallelism = resolve_harvest_parallelism(
             read_setting(&conn, KEY_HARVEST_PARALLELISM)?.as_deref(),
         );
         let existing_keys = existing_sample_sound_keys(&conn, project_id)?;
+        let ownership = load_sound_ownership_context(&conn, project_id)?;
         let eligible = gap_fill_eligible_speakers(&conn, project_id)?;
         let speaker_ids: Vec<i64> = eligible.iter().map(|s| s.speaker_id).collect();
         let voiced = gap_fill_voiced_lines(&conn, project_id, &speaker_ids)?;
@@ -120,6 +122,7 @@ pub async fn harvest_references(
             workspace_dir(&state.db_path, project_id),
             parallelism,
             existing_keys,
+            ownership,
             gap_fill,
         )
     };
@@ -142,6 +145,7 @@ pub async fn harvest_references(
                 &workspace,
                 parallelism,
                 &existing_keys,
+                &ownership,
                 &gap_fill,
                 move |p| {
                     if let Ok(mut e) = emitter.lock() {
@@ -178,6 +182,9 @@ pub async fn harvest_references(
     persisted.samples_skipped_existing = persisted
         .samples_skipped_existing
         .saturating_add(report.candidates_already_present);
+    // Demote already-persisted automatic samples that are clearly another
+    // character's VO. Approvals and clone bindings are left untouched.
+    let _ = demote_cross_identity_automatic_samples(&conn, project_id)?;
     drop(conn);
 
     let phase = if cancelled { "cancelled" } else { "done" };
