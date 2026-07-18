@@ -707,22 +707,32 @@ pub fn best_approved_sample_in_group(
     Ok(best.map(|(_, _, _, sample_id, sid, path)| (sid, sample_id, path)))
 }
 
-/// Speaker id to use in a metadata donor pool: the variant that owns the approved clip.
+/// Speaker id to use in a metadata donor pool.
+///
+/// Eligible when the speaker has a personal (`default` / `override`) bind to an
+/// approved reference clip they own — the same voice shown on their harvest /
+/// override card. Automatic vs manual-only eligibility does not matter; generic
+/// and follow binds do not qualify (those consume a pool voice, they do not
+/// donate one).
 pub fn bindable_donor_speaker_id(
     conn: &Connection,
     _project_id: i64,
     speaker_id: i64,
 ) -> Result<Option<i64>, AppError> {
-    let Some((sample_id, _)) = crate::db::generation::approved_primary_sample(conn, speaker_id)? else {
+    let Some(clone) = crate::db::generation::clone_for_speaker(conn, speaker_id)? else {
         return Ok(None);
     };
-    let provenance: String = conn.query_row(
-        "SELECT provenance_json FROM reference_sample WHERE id=?1",
-        params![sample_id],
-        |row| row.get(0),
-    )?;
-    let automatic = crate::voices::harvest::provenance_is_automatic(&provenance);
-    Ok(automatic.then_some(speaker_id))
+    match clone.binding_source {
+        BindingSource::Default | BindingSource::Override => {}
+        BindingSource::Generic | BindingSource::Follow => return Ok(None),
+    }
+    let Some(sample_id) = clone.primary_sample_id else {
+        return Ok(None);
+    };
+    Ok(
+        crate::db::generation::approved_sample_by_id(conn, speaker_id, sample_id)?
+            .map(|_| speaker_id),
+    )
 }
 
 /// Compatibility helper. Bulk binding performs verified-identity reconciliation;

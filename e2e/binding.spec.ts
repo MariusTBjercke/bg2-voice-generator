@@ -136,7 +136,9 @@ test.describe("Guided voice binding", () => {
     await expect(page.getByRole("button", { name: "Clear pool", exact: true })).toBeVisible();
     await expect(group.getByRole("button", { name: "Play", exact: true }).first()).toBeVisible();
     await page.getByRole("button", { name: "Add harvested voice from other demographics…" }).click();
-    await expect(group.locator("select.donor-select").nth(1)).toContainText("Other harvested voice…");
+    await expect(group.getByRole("listbox", { name: "Other harvested voice" })).toBeVisible();
+    await expect(group.getByRole("searchbox", { name: "Search other harvested voice" })).toBeVisible();
+    await expect(group.getByText(/Similar creature type/)).toBeVisible();
   });
 
   test("renders mirrored harvested memberships once and keeps legacy donors as fallbacks", async ({ page }) => {
@@ -282,6 +284,19 @@ test.describe("Guided voice binding", () => {
     await expect(page.getByPlaceholder("filter groups…")).toHaveValue("Male");
     await expect(page.getByRole("heading", { name: "Xzar" })).toBeVisible();
     await expect(page.getByLabel("Preview dialogue")).toHaveValue("Persistent preview text");
+  });
+
+  test("persists the demographic group page across navigation and reload", async ({ page }) => {
+    const groupsPanel = page.locator("#demographic-groups-panel");
+    await groupsPanel.getByRole("button", { name: "Next page" }).click();
+    await expect(groupsPanel.getByText("2 / 2", { exact: true })).toBeVisible();
+
+    await goTo(page, "Generation");
+    await goTo(page, "Binding");
+    await expect(page.locator("#demographic-groups-panel").getByText("2 / 2", { exact: true })).toBeVisible();
+
+    await page.reload();
+    await expect(page.locator("#demographic-groups-panel").getByText("2 / 2", { exact: true })).toBeVisible();
   });
 
   test("persists library filters separately from character filters", async ({ page }) => {

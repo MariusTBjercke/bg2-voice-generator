@@ -43,6 +43,7 @@ export interface InstallUiPreferences {
     expandedGroupKey: string | null;
     selectedIdentityKey: string | null;
     demographicSearch: string;
+    demographicGroupPage: number;
     previewText: string;
     previewA: BindingPreviewPreferences;
     previewB: BindingPreviewPreferences;
@@ -85,6 +86,7 @@ export const defaultInstallUiPreferences = (): InstallUiPreferences => ({
     expandedGroupKey: null,
     selectedIdentityKey: null,
     demographicSearch: "",
+    demographicGroupPage: 0,
     previewText: "A fine evening for a little adventure.",
     previewA: { settingsSource: "saved", reference: "single" },
     previewB: { settingsSource: "edited", reference: "composite" },
@@ -101,6 +103,12 @@ function string(value: unknown, fallback = ""): string {
 
 function nullableString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function nonNegativeInt(value: unknown, fallback = 0): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? Math.floor(value)
+    : fallback;
 }
 
 function oneOf<T extends string>(value: unknown, values: readonly T[], fallback: T): T {
@@ -174,6 +182,10 @@ export function normalizeInstallUiPreferences(value: unknown): InstallUiPreferen
       expandedGroupKey: nullableString(binding.expandedGroupKey),
       selectedIdentityKey: nullableString(binding.selectedIdentityKey),
       demographicSearch: string(binding.demographicSearch),
+      demographicGroupPage: nonNegativeInt(
+        binding.demographicGroupPage,
+        defaults.binding.demographicGroupPage,
+      ),
       previewText: string(binding.previewText, defaults.binding.previewText),
       previewA: normalizePreview(binding.previewA, defaults.binding.previewA),
       previewB: normalizePreview(binding.previewB, defaults.binding.previewB),

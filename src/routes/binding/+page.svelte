@@ -21,6 +21,7 @@
   import ErrorNotice from "$lib/components/ErrorNotice.svelte";
   import Pager from "$lib/components/Pager.svelte";
   import SearchFilterBar from "$lib/components/SearchFilterBar.svelte";
+  import SearchableSelect from "$lib/components/SearchableSelect.svelte";
   import { filterItems, type FilterConfig, type FilterValues } from "$lib/filters";
   import {
     defaultVoiceLibraryFilter,
@@ -58,6 +59,7 @@
   import {
     groupDemographicVoiceMatch,
     groupHasDemographicMismatch,
+    rankCrossDemographicDonors,
   } from "$lib/speakers/demographics";
   import { bestApprovedSampleForBinding, groupSamplesBySoundResref, formatSoundSampleOptionLabel, pickSampleIdForSoundGroup } from "$lib/speakers/samples";
   import { invalidateSpeakerGroups, loadSpeakerGroups } from "$lib/stores/speakerGroups";
@@ -210,6 +212,8 @@
   let demographicsLoaded = $state(false);
   let demographicsLoadGen = 0;
   let expandedGroupKey = $state<string | null>(null);
+  /** Last expanded key we already kicked off sample/eligible loads for (avoids effect loops). */
+  let expandedGroupDataKey = $state<string | null>(null);
   let groupPage = $state(0);
   let groupFilter = $state("");
   let donorPickId = $state<number | "">("");
@@ -228,8 +232,10 @@
   let matchingDonors = $state<Record<string, Speaker[]>>({});
   let crossDonors = $state<Record<string, Speaker[]>>({});
   let eligibleLoading = $state<Set<string>>(new Set());
-  let crossPickId = $state<number | "">("");
+  let crossPickValue = $state("");
   let showCrossGroupKey = $state<string | null>(null);
+  /** Prefer same creature type (e.g. other Undead) when browsing cross-demographic donors. */
+  let crossSimilarOnly = $state(true);
   let groupNotice = $state<Record<string, string>>({});
   let poolChangesPending = $state(false);
   let clearingBindings = $state(false);
@@ -241,6 +247,8 @@
   let charactersListOpen = $state(true);
   let preferencesDir = $state<string | null>(null);
   let preferencesHydrated = $state(false);
+  /** Skip the next groupFilter→page-0 reset so hydrating search does not wipe the restored page. */
+  let skipGroupPageReset = false;
 
   const dir = $derived($project.gameDir);
   const customVoiceCount = $derived(
@@ -373,7 +381,8 @@
 
   async function loadEligibleDonors(g: DemographicGroup, crossDemographic: boolean) {
     if (!dir) return;
-    const key = `${groupKey(g)}:${crossDemographic ? "cross" : "matching"}`;
+    const gKey = groupKey(g);
+    const key = `${gKey}:${crossDemographic ? "cross" : "matching"}`;
     if (eligibleLoading.has(key)) return;
     eligibleLoading = new Set(eligibleLoading).add(key);
     try {
@@ -385,17 +394,45 @@
         crossDemographic,
       });
       if (crossDemographic) {
-        crossDonors = { ...crossDonors, [groupKey(g)]: list };
+        crossDonors = { ...crossDonors, [gKey]: list };
       } else {
-        matchingDonors = { ...matchingDonors, [groupKey(g)]: list };
+        matchingDonors = { ...matchingDonors, [gKey]: list };
       }
     } catch (e) {
       error = String(e);
+      // Mark as loaded-empty so the select leaves the loading state.
+      if (crossDemographic) {
+        crossDonors = { ...crossDonors, [gKey]: crossDonors[gKey] ?? [] };
+      } else {
+        matchingDonors = { ...matchingDonors, [gKey]: matchingDonors[gKey] ?? [] };
+      }
     } finally {
       const next = new Set(eligibleLoading);
       next.delete(key);
       eligibleLoading = next;
     }
+  }
+
+  async function reloadEligibleDonors(g: DemographicGroup) {
+    // Keep prior options visible while refetching so selects don't flash "Loading…".
+    await loadEligibleDonors(g, false);
+    if (showCrossGroupKey === groupKey(g)) {
+      await loadEligibleDonors(g, true);
+    }
+  }
+
+  function poolRepresentedIdentityKeys(g: DemographicGroup): Set<string> {
+    const keys = new Set<string>();
+    for (const donorId of donorsForGroup(g)) {
+      keys.add(donorIdentityKey(donorId));
+    }
+    for (const profileId of profileIdsForGroup(g)) {
+      const stored = profileById(profileId);
+      const profile = stored ? liveHarvestedPoolProfile(stored) : undefined;
+      const identity = profile ? profileIdentityKey(profile) : null;
+      if (identity) keys.add(identity);
+    }
+    return keys;
   }
 
   function groupLabel(g: DemographicGroup): string {
@@ -429,13 +466,54 @@
   }
 
   function availableMatchingDonors(g: DemographicGroup): Speaker[] {
-    const existing = new Set(donorsForGroup(g));
-    return (matchingDonors[groupKey(g)] ?? []).filter((speaker) => !existing.has(speaker.id));
+    const represented = poolRepresentedIdentityKeys(g);
+    return (matchingDonors[groupKey(g)] ?? []).filter(
+      (speaker) => !represented.has(donorIdentityKey(speaker.id)),
+    );
   }
 
   function availableCrossDonors(g: DemographicGroup): Speaker[] {
-    const existing = new Set(donorsForGroup(g));
-    return (crossDonors[groupKey(g)] ?? []).filter((speaker) => !existing.has(speaker.id));
+    const represented = poolRepresentedIdentityKeys(g);
+    return (crossDonors[groupKey(g)] ?? []).filter(
+      (speaker) => !represented.has(donorIdentityKey(speaker.id)),
+    );
+  }
+
+  function crossDonorPickerOptions(g: DemographicGroup) {
+    const ranked = rankCrossDemographicDonors(
+      { sex: g.sex, race: g.race, creature_category: g.creature_category },
+      uniqueDonorOptions(availableCrossDonors(g)).map((opt) => {
+        const speaker = speakerById(opt.id);
+        const detail = speaker ? (demographicLabelFor(speaker) ?? "other") : "other";
+        return {
+          id: opt.id,
+          label: opt.label,
+          detail,
+          axes: {
+            sex: speaker?.sex ?? -1,
+            race: speaker?.race ?? -1,
+            creature_category: speaker?.creature_category ?? -1,
+          },
+        };
+      }),
+    );
+    const similarLabel = `Same creature type (${g.creature_category_label})`;
+    const visible = crossSimilarOnly
+      ? ranked.filter((option) => option.sameCreatureCategory)
+      : ranked;
+    return visible.map((option) => ({
+      value: String(option.id),
+      label: option.label,
+      detail: option.detail,
+      section: option.sameCreatureCategory ? similarLabel : "Other demographics",
+    }));
+  }
+
+  function crossDonorSimilarCount(g: DemographicGroup): number {
+    return uniqueDonorOptions(availableCrossDonors(g)).filter((opt) => {
+      const speaker = speakerById(opt.id);
+      return speaker?.creature_category === g.creature_category;
+    }).length;
   }
 
   function speakerById(id: number): Speaker | undefined {
@@ -453,6 +531,33 @@
 
   function profileById(id: number): VoiceProfile | undefined {
     return voiceProfiles.find((profile) => profile.id === id);
+  }
+
+  /**
+   * Pool rows store a harvested profile id. After a personal rebind the DB syncs that
+   * slot, but until demographics reload the cached id can still point at the old clip.
+   * Prefer the display group's current personal harvested profile so Play matches the
+   * override card (and demographic consumers after sync).
+   */
+  function liveHarvestedPoolProfile(profile: VoiceProfile): VoiceProfile {
+    if (profile.origin !== "harvested" || profile.harvested_speaker_id === null) {
+      return profile;
+    }
+    const group = groupForSpeaker(identityGroups, profile.harvested_speaker_id);
+    const candidateIds = group
+      ? group.variants.map((v) => v.speaker_id)
+      : [profile.harvested_speaker_id];
+    for (const sid of candidateIds) {
+      const eff = effectiveBySpeaker[sid];
+      if (
+        eff?.voice_profile_id != null &&
+        (eff.binding_source === "override" || eff.binding_source === "default")
+      ) {
+        const live = profileById(eff.voice_profile_id);
+        if (live) return live;
+      }
+    }
+    return profile;
   }
 
   function originLabel(profile: VoiceProfile): string {
@@ -655,7 +760,7 @@
     if (!dir || profilePoolPick === "") return;
     try {
       await invoke<void>("add_metadata_profile", { gameDir: dir, sex: g.sex, race: g.race, creatureCategory: g.creature_category, voiceProfileId: profilePoolPick });
-      profilePoolPick = ""; await loadDemographics(); await afterPoolChange();
+      profilePoolPick = ""; await loadDemographics({ silent: true }); await reloadEligibleDonors(g); await afterPoolChange();
     } catch (e) { error = String(e); }
   }
 
@@ -663,7 +768,7 @@
     if (!dir) return;
     try {
       await invoke<void>("remove_metadata_profile", { gameDir: dir, sex: g.sex, race: g.race, creatureCategory: g.creature_category, voiceProfileId: profileId });
-      await loadDemographics(); await afterPoolChange();
+      await loadDemographics({ silent: true }); await reloadEligibleDonors(g); await afterPoolChange();
     } catch (e) { error = String(e); }
   }
 
@@ -763,7 +868,9 @@
     charactersListOpen = preferences.charactersListOpen;
     expandedGroupKey = preferences.expandedGroupKey;
     selectedKey = preferences.selectedIdentityKey;
+    skipGroupPageReset = true;
     groupFilter = preferences.demographicSearch;
+    groupPage = preferences.demographicGroupPage;
     previewText = preferences.previewText;
     previewA = freshPreviewSlot(preferences.previewA.settingsSource, preferences.previewA.reference);
     previewB = freshPreviewSlot(preferences.previewB.settingsSource, preferences.previewB.reference);
@@ -778,6 +885,7 @@
       expandedGroupKey,
       selectedIdentityKey: selected?.identity_key ?? selectedKey,
       demographicSearch: groupFilter,
+      demographicGroupPage: groupPage,
       previewText,
       previewA: { settingsSource: previewA.settingsSource, reference: previewA.reference },
       previewB: { settingsSource: previewB.settingsSource, reference: previewB.reference },
@@ -867,30 +975,42 @@
     }
   }
 
+  /** Audition id for an effective binding: sample id, or stable negative profile id. */
+  function effectivePlayId(binding: EffectiveSpeakerBinding): number | null {
+    if (binding.sample_id !== null) return binding.sample_id;
+    if (binding.voice_profile_id !== null) return -binding.voice_profile_id;
+    return null;
+  }
+
+  function canPlayEffective(binding: EffectiveSpeakerBinding | undefined | null): boolean {
+    return !!binding?.sample_path && effectivePlayId(binding) !== null;
+  }
+
   async function toggleEffective(binding: EffectiveSpeakerBinding) {
     stopPlaylist();
-    if (!binding.sample_path || binding.sample_id === null) return;
+    const playId = effectivePlayId(binding);
+    if (!binding.sample_path || playId === null) return;
     if (!audio) {
       audioError = {
         ...audioError,
-        [binding.sample_id]: "Audio player is not ready yet — try again in a moment.",
+        [playId]: "Audio player is not ready yet — try again in a moment.",
       };
       return;
     }
-    if (playingId === binding.sample_id) {
+    if (playingId === playId) {
       audio.pause();
       return;
     }
-    audioError = { ...audioError, [binding.sample_id]: "" };
+    audioError = { ...audioError, [playId]: "" };
     try {
       audio.src = assetUrl(binding.sample_path);
       await audio.play();
-      playingId = binding.sample_id;
+      playingId = playId;
     } catch (e) {
       playingId = null;
       audioError = {
         ...audioError,
-        [binding.sample_id]: `Could not play: ${String(e)}`,
+        [playId]: `Could not play: ${String(e)}`,
       };
     }
   }
@@ -902,18 +1022,19 @@
   }
 
   async function playBindingClip(binding: EffectiveSpeakerBinding): Promise<boolean> {
-    if (!binding.sample_path || binding.sample_id === null || !audio) return false;
-    audioError = { ...audioError, [binding.sample_id]: "" };
+    const playId = effectivePlayId(binding);
+    if (!binding.sample_path || playId === null || !audio) return false;
+    audioError = { ...audioError, [playId]: "" };
     try {
       audio.src = assetUrl(binding.sample_path);
       await audio.play();
-      playingId = binding.sample_id;
+      playingId = playId;
       return true;
     } catch (e) {
       playingId = null;
       audioError = {
         ...audioError,
-        [binding.sample_id]: `Could not play: ${String(e)}`,
+        [playId]: `Could not play: ${String(e)}`,
       };
       return false;
     }
@@ -956,8 +1077,7 @@
         return rep ? effectiveBySpeaker[rep.id] : undefined;
       })
       .filter(
-        (b): b is EffectiveSpeakerBinding =>
-          !!b && b.sample_path !== null && b.sample_id !== null,
+        (b): b is EffectiveSpeakerBinding => !!b && canPlayEffective(b),
       );
     if (queue.length === 0) return;
     if (playlistActive) {
@@ -1146,10 +1266,7 @@
     ),
   );
   const playableFilteredCount = $derived(
-    filteredIdentityGroups.filter((g) => {
-      const effective = effectiveForGroup(g);
-      return !!effective?.sample_path && effective.sample_id !== null;
-    }).length,
+    filteredIdentityGroups.filter((g) => canPlayEffective(effectiveForGroup(g))).length,
   );
   const pagedIdentityGroups = $derived(
     filteredIdentityGroups.slice(
@@ -1469,7 +1586,7 @@
       });
       setClone(update.clone.speaker_id, update.clone);
       invalidateGeneration("critical", "metadata", "candidates");
-      await loadClones();
+      await Promise.all([loadClones(), loadVoiceProfiles(), loadDemographics()]);
       const kind =
         update.references.length === 1
           ? "single"
@@ -1505,7 +1622,12 @@
       invalidateGeneration("critical", "metadata");
       bindWarning = res.duration_warning;
       if (hadClone && repId !== null) reboundIds = new Set(reboundIds).add(repId);
-      await Promise.all([loadClones(), loadSpeakersWithLines(), loadVoiceProfiles()]);
+      await Promise.all([
+        loadClones(),
+        loadSpeakersWithLines(),
+        loadVoiceProfiles(),
+        loadDemographics(),
+      ]);
     } catch (e) {
       error = String(e);
     } finally {
@@ -1557,7 +1679,12 @@
       autoBindResult = await invoke<AutoBindResult>("auto_bind_all", {
         gameDir: dir,
       });
-      await Promise.all([loadClones(), loadSpeakersWithLines(), loadVoiceProfiles()]);
+      await Promise.all([
+        loadClones(),
+        loadSpeakersWithLines(),
+        loadVoiceProfiles(),
+        loadDemographics(),
+      ]);
       invalidateGeneration("critical", "metadata");
     } catch (e) {
       error = String(e);
@@ -1566,16 +1693,19 @@
     }
   }
 
-  async function loadDemographics() {
+  async function loadDemographics(opts: { silent?: boolean } = {}) {
     if (!dir) {
       demographicGroups = [];
       metadataBindings = [];
       demographicsLoaded = false;
       return;
     }
+    const silent = opts.silent === true && demographicsLoaded;
     const gen = ++demographicsLoadGen;
-    loadingDemographics = true;
-    demographicsLoaded = false;
+    if (!silent) {
+      loadingDemographics = true;
+      demographicsLoaded = false;
+    }
     try {
       const [groups, bindings] = await Promise.all([
         invoke<DemographicGroup[]>("list_demographic_groups", { gameDir: dir }),
@@ -1609,15 +1739,30 @@
     const key = groupKey(g);
     if (expandedGroupKey === key) {
       expandedGroupKey = null;
+      expandedGroupDataKey = null;
     } else {
       expandedGroupKey = key;
-      void loadDonorSamplesForGroup(g);
-      void loadEligibleDonors(g, false);
+      // Allow the hydrate effect to run for this key (including re-expand).
+      expandedGroupDataKey = null;
     }
     donorPickId = "";
-    crossPickId = "";
+    crossPickValue = "";
     showCrossGroupKey = null;
+    crossSimilarOnly = true;
   }
+
+  // Persisted / restored expanded rows never go through a click — hydrate their
+  // matching-voice options and legacy donor samples once per expanded key.
+  $effect(() => {
+    if (!dir || !demographicsLoaded || !expandedGroupKey) return;
+    const key = expandedGroupKey;
+    if (expandedGroupDataKey === key) return;
+    const g = demographicGroups.find((row) => groupKey(row) === key);
+    if (!g) return;
+    expandedGroupDataKey = key;
+    void loadDonorSamplesForGroup(g);
+    void loadEligibleDonors(g, false);
+  });
 
   async function afterPoolChange() {
     poolChangesPending = true;
@@ -1625,7 +1770,7 @@
   }
 
   async function addDonorToGroup(g: DemographicGroup, crossDemographic = false) {
-    const donorId = crossDemographic ? crossPickId : donorPickId;
+    const donorId = crossDemographic ? crossPickValue : donorPickId;
     if (!dir || donorId === "") return;
     error = null;
     try {
@@ -1634,12 +1779,13 @@
         sex: g.sex,
         race: g.race,
         creatureCategory: g.creature_category,
-        donorSpeakerId: donorId,
+        donorSpeakerId: typeof donorId === "string" ? Number(donorId) : donorId,
       });
-      await ensureDonorSamples(donorId);
+      await ensureDonorSamples(typeof donorId === "string" ? Number(donorId) : donorId);
       donorPickId = "";
-      crossPickId = "";
-      await loadDemographics();
+      crossPickValue = "";
+      await loadDemographics({ silent: true });
+      await reloadEligibleDonors(g);
       await afterPoolChange();
     } catch (e) {
       error = String(e);
@@ -1657,7 +1803,8 @@
         creatureCategory: g.creature_category,
         donorSpeakerId: donorId,
       });
-      await loadDemographics();
+      await loadDemographics({ silent: true });
+      await reloadEligibleDonors(g);
       await afterPoolChange();
     } catch (e) {
       error = String(e);
@@ -1695,7 +1842,8 @@
             "No speaker in this demographic has an approved reference clip. Harvest and approve one, or add a donor from another demographic.",
         };
       }
-      await loadDemographics();
+      await loadDemographics({ silent: true });
+      await reloadEligibleDonors(g);
       if (suggested) await afterPoolChange();
     } catch (e) {
       error = String(e);
@@ -1735,7 +1883,8 @@
         race: g.race,
         creatureCategory: g.creature_category,
       });
-      await loadDemographics();
+      await loadDemographics({ silent: true });
+      await reloadEligibleDonors(g);
       await afterPoolChange();
     } catch (e) {
       error = String(e);
@@ -1903,6 +2052,10 @@
 
   $effect(() => {
     void groupFilter;
+    if (skipGroupPageReset) {
+      skipGroupPageReset = false;
+      return;
+    }
     groupPage = 0;
   });
 </script>
@@ -2231,7 +2384,8 @@
                       {#if profileIds.length > 0}
                         <ul class="donor-list" aria-label="Voices in pool">
                           {#each profileIds as profileId (profileId)}
-                            {@const profile = profileById(profileId)}
+                            {@const stored = profileById(profileId)}
+                            {@const profile = stored ? liveHarvestedPoolProfile(stored) : undefined}
                             {@const primaryReference = profile ? profilePrimaryReference(profile) : undefined}
                             <li class="donor-row">
                               <span>{profile?.display_name ?? `Profile ${profileId}`}</span>
@@ -2310,9 +2464,9 @@
                       {/if}
                       {#if matchingDonors[key] !== undefined && matching.length === 0}
                         <p class="hint donor-hint">
-                          No unused harvested voice in this demographic has an approved reference
-                          clip. Harvest and approve one, or add a harvested voice from another
-                          demographic.
+                          No unused speaker in this demographic has a personally bound harvest
+                          voice. Bind one on their override card, or add a harvested voice from
+                          another demographic.
                         </p>
                       {/if}
                       <div class="group-actions profile-pool-actions">
@@ -2325,15 +2479,23 @@
                         <Button onclick={() => addProfileToGroup(g)} disabled={profilePoolPick === ""}>Add custom voice</Button>
                       </div>
                       <div class="group-actions">
-                        <select class="donor-select" bind:value={donorPickId}>
-                          <option value="">Matching harvested voice…</option>
+                        <select
+                          class="donor-select"
+                          bind:value={donorPickId}
+                          disabled={matchingDonors[key] === undefined}
+                        >
+                          <option value="">
+                            {matchingDonors[key] === undefined
+                              ? "Loading harvested voices…"
+                              : "Matching harvested voice…"}
+                          </option>
                           {#each uniqueDonorOptions(matching) as opt (opt.id)}
                             <option value={opt.id}>{opt.label}</option>
                           {/each}
                         </select>
                         <Button
                           onclick={() => addDonorToGroup(g, false)}
-                          disabled={donorPickId === ""}
+                          disabled={donorPickId === "" || matchingDonors[key] === undefined}
                         >
                           Add
                         </Button>
@@ -2354,36 +2516,58 @@
                             variant="ghost"
                             onclick={() => {
                               showCrossGroupKey = key;
+                              crossPickValue = "";
+                              crossSimilarOnly = true;
                               void loadEligibleDonors(g, true);
                             }}
                           >
                             Add harvested voice from other demographics…
                           </Button>
                         {:else}
-                          <select class="donor-select" bind:value={crossPickId}>
-                            <option value="">Other harvested voice…</option>
-                            {#each uniqueDonorOptions(cross) as opt (opt.id)}
-                              {@const s = speakerById(opt.id)}
-                              <option value={opt.id}>
-                                {opt.label} — {s ? (demographicLabelFor(s) ?? "other") : "other"}
-                              </option>
-                            {/each}
-                          </select>
-                          <Button
-                            onclick={() => addDonorToGroup(g, true)}
-                            disabled={crossPickId === ""}
-                          >
-                            Add harvested voice
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            onclick={() => {
-                              showCrossGroupKey = null;
-                              crossPickId = "";
-                            }}
-                          >
-                            Cancel
-                          </Button>
+                          {@const crossOptions = crossDonorPickerOptions(g)}
+                          {@const similarCount = crossDonorSimilarCount(g)}
+                          <div class="cross-picker">
+                            {#if crossDonors[key] === undefined}
+                              <p class="hint donor-hint">Loading harvested voices…</p>
+                            {:else}
+                              <SearchableSelect
+                                label="Other harvested voice"
+                                bind:value={crossPickValue}
+                                options={crossOptions}
+                                searchPlaceholder={`Filter by name or demographic (e.g. ${g.creature_category_label})…`}
+                                emptyText={
+                                  crossSimilarOnly && similarCount === 0
+                                    ? `No other ${g.creature_category_label} harvested voices — turn off the filter to browse all demographics.`
+                                    : "No matching harvested voices"
+                                }
+                              />
+                            {/if}
+                            <label class="cross-similar-toggle">
+                              <input type="checkbox" bind:checked={crossSimilarOnly} />
+                              Similar creature type ({g.creature_category_label}) only
+                              {#if similarCount > 0}
+                                <span class="sub">({similarCount})</span>
+                              {/if}
+                            </label>
+                            <div class="cross-picker-actions">
+                              <Button
+                                onclick={() => addDonorToGroup(g, true)}
+                                disabled={crossPickValue === "" || crossDonors[key] === undefined}
+                              >
+                                Add harvested voice
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                onclick={() => {
+                                  showCrossGroupKey = null;
+                                  crossPickValue = "";
+                                  crossSimilarOnly = true;
+                                }}
+                              >
+                                Cancel
+                              </Button>
+                            </div>
+                          </div>
                         {/if}
                       </div>
                     </div>
@@ -2570,13 +2754,13 @@
                         <StatusBadge tone="warn">no lines</StatusBadge>
                       {/if}
                     </button>
-                    {#if effective?.sample_path && effective.sample_id !== null}
+                    {#if canPlayEffective(effective)}
                       <button
                         class="row-play"
                         type="button"
-                        aria-label={`${playingId === effective.sample_id ? "Pause" : "Play"} effective voice for ${g.display_name}`}
-                        onclick={() => toggleEffective(effective)}
-                      >{playingId === effective.sample_id ? "⏸" : "▶"}</button>
+                        aria-label={`${playingId === effectivePlayId(effective!) ? "Pause" : "Play"} effective voice for ${g.display_name}`}
+                        onclick={() => toggleEffective(effective!)}
+                      >{playingId === effectivePlayId(effective!) ? "⏸" : "▶"}</button>
                     {/if}
                   </div>
                 </li>
@@ -2690,9 +2874,9 @@
                     ? "Include in pack"
                     : "Exclude from pack"}
               </Button>
-              {#if !selected.excluded && effective?.sample_path && effective.sample_id !== null}
-                <Button variant="ghost" onclick={() => toggleEffective(effective)}>
-                  {playingId === effective.sample_id ? "Pause effective voice" : "Play effective voice"}
+              {#if !selected.excluded && canPlayEffective(effective)}
+                <Button variant="ghost" onclick={() => toggleEffective(effective!)}>
+                  {playingId === effectivePlayId(effective!) ? "Pause effective voice" : "Play effective voice"}
                 </Button>
               {/if}
               {#if !selected.excluded && clone && clone.binding_source !== "generic"}
@@ -3511,6 +3695,28 @@
     gap: var(--space-2);
     align-items: center;
     margin-top: var(--space-2);
+  }
+  .cross-picker {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+  .cross-similar-toggle {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: 0.9rem;
+    color: var(--text-muted);
+    cursor: pointer;
+    user-select: none;
+  }
+  .cross-picker-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    align-items: center;
   }
   .donor-hint {
     margin: var(--space-2) 0;

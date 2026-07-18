@@ -158,6 +158,47 @@ pub fn remove_profile(conn: &Connection, binding_id: i64, profile_id: i64) -> Re
     )? > 0)
 }
 
+/// Replace `old_profile_id` with `new_profile_id` in one pool, preserving sort order.
+///
+/// If `new_profile_id` is already a member, only the old row is removed. No-op when
+/// the ids match or the old profile is not in the binding.
+pub fn replace_profile(
+    conn: &Connection,
+    binding_id: i64,
+    old_profile_id: i64,
+    new_profile_id: i64,
+) -> Result<bool, AppError> {
+    if old_profile_id == new_profile_id {
+        return Ok(false);
+    }
+    let sort_order: Option<i64> = conn
+        .query_row(
+            "SELECT sort_order FROM metadata_binding_profile \
+             WHERE binding_id=?1 AND voice_profile_id=?2",
+            params![binding_id, old_profile_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(sort_order) = sort_order else {
+        return Ok(false);
+    };
+    remove_profile(conn, binding_id, old_profile_id)?;
+    let already: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM metadata_binding_profile \
+         WHERE binding_id=?1 AND voice_profile_id=?2",
+        params![binding_id, new_profile_id],
+        |r| r.get(0),
+    )?;
+    if already == 0 {
+        conn.execute(
+            "INSERT INTO metadata_binding_profile(binding_id,voice_profile_id,sort_order) \
+             VALUES(?1,?2,?3)",
+            params![binding_id, new_profile_id, sort_order],
+        )?;
+    }
+    Ok(true)
+}
+
 /// Donor speaker ids for one binding row.
 pub fn donors_for_binding(conn: &Connection, binding_id: i64) -> Result<Vec<i64>, AppError> {
     let mut stmt = conn.prepare(
@@ -504,7 +545,7 @@ pub fn metadata_apply_targets(
     Ok(rows)
 }
 
-/// True when `donor_speaker_id` (or a variant in its identity group) has an approved primary sample.
+/// True when `donor_speaker_id` has a personal bind to an owned approved harvest clip.
 pub fn donor_is_bindable(
     conn: &Connection,
     project_id: i64,
@@ -550,7 +591,9 @@ pub fn import_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::generation::upsert_clone;
     use crate::db::schema;
+    use crate::models::BindingSource;
 
     fn mem_db() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -585,17 +628,29 @@ mod tests {
         conn.last_insert_rowid()
     }
 
-    fn approve(conn: &Connection, sid: i64, path: &str) {
-        approve_with_score(conn, sid, path, 0.0);
+    fn approve(conn: &Connection, sid: i64, path: &str) -> i64 {
+        approve_with_score(conn, sid, path, 0.0)
     }
 
-    fn approve_with_score(conn: &Connection, sid: i64, path: &str, overall: f64) {
+    fn approve_with_score(conn: &Connection, sid: i64, path: &str, overall: f64) -> i64 {
         conn.execute(
             "INSERT INTO reference_sample (speaker_id, decision, local_derivative_path, scores_json) \
              VALUES (?1, 'approved', ?2, ?3)",
             params![sid, path, serde_json::json!({ "overall": overall }).to_string()],
         )
         .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// Approve a clip and personally bind it — the gate for demographic pool donors.
+    fn approve_and_bind(conn: &Connection, sid: i64, path: &str) -> i64 {
+        approve_and_bind_with_score(conn, sid, path, 0.0)
+    }
+
+    fn approve_and_bind_with_score(conn: &Connection, sid: i64, path: &str, overall: f64) -> i64 {
+        let sample_id = approve_with_score(conn, sid, path, overall);
+        upsert_clone(conn, sid, sample_id, BindingSource::Default).unwrap();
+        sample_id
     }
 
     fn speaker_named(
@@ -673,9 +728,9 @@ mod tests {
         let conn = mem_db();
         let pid = project(&conn);
         let donor = speaker(&conn, pid, "donor", 1, 2, 3);
-        approve(&conn, donor, "/ws/d.wav");
+        approve_and_bind(&conn, donor, "/ws/d.wav");
         let other = speaker(&conn, pid, "other", 2, 2, 3);
-        approve(&conn, other, "/ws/o.wav");
+        approve_and_bind(&conn, other, "/ws/o.wav");
         assert_eq!(suggest_donors(&conn, pid, 1, 2, 3).unwrap(), vec![donor]);
         assert_eq!(
             eligible_donors(&conn, pid, 1, 2, 3, false).unwrap(),
@@ -688,7 +743,17 @@ mod tests {
     }
 
     #[test]
-    fn manual_only_approved_sample_is_not_an_automatic_donor() {
+    fn approved_without_personal_bind_is_not_a_donor() {
+        let conn = mem_db();
+        let pid = project(&conn);
+        let donor = speaker(&conn, pid, "unbound", 1, 2, 3);
+        approve(&conn, donor, "/ws/u.wav");
+        assert!(suggest_donors(&conn, pid, 1, 2, 3).unwrap().is_empty());
+        assert!(!donor_is_bindable(&conn, pid, donor).unwrap());
+    }
+
+    #[test]
+    fn manual_only_sample_is_a_donor_when_personally_bound() {
         let conn = mem_db();
         let pid = project(&conn);
         let donor = speaker(&conn, pid, "slot_voice", 1, 2, 3);
@@ -696,7 +761,24 @@ mod tests {
             "INSERT INTO reference_sample (speaker_id, provenance_json, decision, local_derivative_path) \
              VALUES (?1, '{\"eligibility\":\"manual_only\"}', 'approved', '/ws/slot.wav')",
             params![donor],
-        ).unwrap();
+        )
+        .unwrap();
+        let sample_id = conn.last_insert_rowid();
+        assert!(suggest_donors(&conn, pid, 1, 2, 3).unwrap().is_empty());
+        assert!(!donor_is_bindable(&conn, pid, donor).unwrap());
+
+        upsert_clone(&conn, donor, sample_id, BindingSource::Override).unwrap();
+        assert_eq!(suggest_donors(&conn, pid, 1, 2, 3).unwrap(), vec![donor]);
+        assert!(donor_is_bindable(&conn, pid, donor).unwrap());
+    }
+
+    #[test]
+    fn generic_bind_is_not_a_donor() {
+        let conn = mem_db();
+        let pid = project(&conn);
+        let donor = speaker(&conn, pid, "generic", 1, 2, 3);
+        let sample_id = approve(&conn, donor, "/ws/g.wav");
+        upsert_clone(&conn, donor, sample_id, BindingSource::Generic).unwrap();
         assert!(suggest_donors(&conn, pid, 1, 2, 3).unwrap().is_empty());
         assert!(!donor_is_bindable(&conn, pid, donor).unwrap());
     }
@@ -707,8 +789,8 @@ mod tests {
         let pid = project(&conn);
         let low_id = speaker(&conn, pid, "low_id", 1, 2, 3);
         let best = speaker(&conn, pid, "best", 1, 2, 3);
-        approve_with_score(&conn, low_id, "/ws/low.wav", 0.60);
-        approve_with_score(&conn, best, "/ws/best.wav", 0.92);
+        approve_and_bind_with_score(&conn, low_id, "/ws/low.wav", 0.60);
+        approve_and_bind_with_score(&conn, best, "/ws/best.wav", 0.92);
         assert_eq!(suggest_best_donor(&conn, pid, 1, 2, 3).unwrap(), Some(best));
     }
 
@@ -724,7 +806,7 @@ mod tests {
             params![pid, rep],
         )
         .unwrap();
-        approve(&conn, sampled, "/ws/jaheira.wav");
+        approve_and_bind(&conn, sampled, "/ws/jaheira.wav");
 
         assert_eq!(
             eligible_donors(&conn, pid, 1, 2, 3, false).unwrap(),
@@ -738,7 +820,7 @@ mod tests {
         let conn = mem_db();
         let pid = project(&conn);
         let donor = speaker(&conn, pid, "donor", 1, 2, 3);
-        approve(&conn, donor, "/ws/d.wav");
+        approve_and_bind(&conn, donor, "/ws/d.wav");
         speaker(&conn, pid, "npc", 1, 2, 3);
         let binding_id = ensure_binding(&conn, pid, 1, 2, 3).unwrap();
         add_donor(&conn, binding_id, donor).unwrap();
@@ -756,8 +838,8 @@ mod tests {
         let pid = project(&conn);
         let old = speaker(&conn, pid, "old", 1, 2, 3);
         let fresh = speaker(&conn, pid, "fresh", 1, 2, 3);
-        approve(&conn, old, "/ws/old.wav");
-        approve(&conn, fresh, "/ws/fresh.wav");
+        approve_and_bind(&conn, old, "/ws/old.wav");
+        approve_and_bind(&conn, fresh, "/ws/fresh.wav");
         let binding_id = ensure_binding(&conn, pid, 1, 2, 3).unwrap();
         add_donor(&conn, binding_id, old).unwrap();
 
@@ -772,10 +854,10 @@ mod tests {
         let conn = mem_db();
         let pid = project(&conn);
         let male = speaker(&conn, pid, "male_donor", 1, 1, 1);
-        approve(&conn, male, "/ws/male.wav");
+        approve_and_bind(&conn, male, "/ws/male.wav");
         speaker(&conn, pid, "male_undead", 1, 2, 4);
         let female = speaker(&conn, pid, "female_donor", 2, 2, 4);
-        approve(&conn, female, "/ws/female.wav");
+        approve_and_bind(&conn, female, "/ws/female.wav");
 
         auto_configure_metadata_pools(&conn, pid, false).unwrap();
         assert_eq!(donors_for_key(&conn, pid, 1, 2, 4).unwrap(), vec![male]);
@@ -787,9 +869,9 @@ mod tests {
         let conn = mem_db();
         let pid = project(&conn);
         let low_id_humanoid = speaker(&conn, pid, "saemon_like", 1, 1, 1);
-        approve_with_score(&conn, low_id_humanoid, "/ws/humanoid.wav", 0.99);
+        approve_and_bind_with_score(&conn, low_id_humanoid, "/ws/humanoid.wav", 0.99);
         let closer_undead = speaker(&conn, pid, "undead", 1, 108, 4);
-        approve_with_score(&conn, closer_undead, "/ws/undead.wav", 0.70);
+        approve_and_bind_with_score(&conn, closer_undead, "/ws/undead.wav", 0.70);
         speaker(&conn, pid, "elf_undead_target", 1, 2, 4);
 
         auto_configure_metadata_pools(&conn, pid, false).unwrap();

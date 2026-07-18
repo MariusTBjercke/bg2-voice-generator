@@ -85,3 +85,58 @@ export function groupHasDemographicMismatch(
 ): boolean {
   return groupDemographicVoiceMatch(group, binding, speakersById, profilesById) === "mismatch";
 }
+
+/** Pool axes used when ranking cross-demographic harvested voices. */
+export type DemographicAxes = {
+  sex: number;
+  race: number;
+  creature_category: number;
+};
+
+/**
+ * Mirror of `generator/binding.rs` `best_donor` weights (class omitted — not a pool axis):
+ * sex=8, creature_category=4, race=2.
+ */
+export function demographicSimilarityScore(
+  target: DemographicAxes,
+  candidate: DemographicAxes,
+): number {
+  return (
+    (candidate.sex === target.sex ? 8 : 0) +
+    (candidate.creature_category === target.creature_category ? 4 : 0) +
+    (candidate.race === target.race ? 2 : 0)
+  );
+}
+
+export type RankedCrossDonorOption = {
+  id: number;
+  label: string;
+  detail: string;
+  score: number;
+  sameCreatureCategory: boolean;
+};
+
+/**
+ * Rank harvested voices for the cross-demographic pool picker.
+ * Same creature type sorts first (e.g. other Undead), then by similarity score, then label.
+ */
+export function rankCrossDemographicDonors(
+  target: DemographicAxes,
+  options: Array<{ id: number; label: string; detail: string; axes: DemographicAxes }>,
+): RankedCrossDonorOption[] {
+  return options
+    .map((option) => ({
+      id: option.id,
+      label: option.label,
+      detail: option.detail,
+      score: demographicSimilarityScore(target, option.axes),
+      sameCreatureCategory: option.axes.creature_category === target.creature_category,
+    }))
+    .sort((a, b) => {
+      if (a.sameCreatureCategory !== b.sameCreatureCategory) {
+        return a.sameCreatureCategory ? -1 : 1;
+      }
+      if (b.score !== a.score) return b.score - a.score;
+      return a.label.localeCompare(b.label, undefined, { sensitivity: "base" });
+    });
+}

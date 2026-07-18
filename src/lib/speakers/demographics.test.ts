@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  demographicSimilarityScore,
   demographicVoiceMatch,
   groupHasDemographicMismatch,
+  rankCrossDemographicDonors,
 } from "$lib/speakers/demographics";
 import type { EffectiveSpeakerBinding, Speaker, SpeakerGroup } from "$lib/types";
 
@@ -125,5 +127,51 @@ describe("groupHasDemographicMismatch", () => {
         {},
       ),
     ).toBe(false);
+  });
+});
+
+describe("demographicSimilarityScore / rankCrossDemographicDonors", () => {
+  const undead = { sex: 1, race: 1, creature_category: 4 };
+
+  it("mirrors backend weights (sex > creature type > race)", () => {
+    expect(
+      demographicSimilarityScore(undead, { sex: 1, race: 99, creature_category: 99 }),
+    ).toBe(8);
+    expect(
+      demographicSimilarityScore(undead, { sex: 2, race: 99, creature_category: 4 }),
+    ).toBe(4);
+    expect(
+      demographicSimilarityScore(undead, { sex: 2, race: 1, creature_category: 99 }),
+    ).toBe(2);
+    expect(
+      demographicSimilarityScore(undead, { sex: 1, race: 1, creature_category: 4 }),
+    ).toBe(14);
+  });
+
+  it("lists same creature type first, then by score", () => {
+    const ranked = rankCrossDemographicDonors(undead, [
+      {
+        id: 1,
+        label: "Humanoid",
+        detail: "Male / Human / Humanoid",
+        axes: { sex: 1, race: 1, creature_category: 1 },
+      },
+      {
+        id: 2,
+        label: "Other undead",
+        detail: "Female / Elf / Undead",
+        axes: { sex: 2, race: 2, creature_category: 4 },
+      },
+      {
+        id: 3,
+        label: "Matching undead",
+        detail: "Male / Human / Undead",
+        axes: { sex: 1, race: 1, creature_category: 4 },
+      },
+    ]);
+    expect(ranked.map((o) => o.id)).toEqual([3, 2, 1]);
+    expect(ranked[0].sameCreatureCategory).toBe(true);
+    expect(ranked[1].sameCreatureCategory).toBe(true);
+    expect(ranked[2].sameCreatureCategory).toBe(false);
   });
 });

@@ -24,6 +24,7 @@ describe("UI preference persistence", () => {
       binding: {
         demographicGroupsOpen: "no",
         selectedIdentityKey: 12,
+        demographicGroupPage: -3,
         previewA: { settingsSource: "unknown", reference: "missing" },
       },
     });
@@ -35,7 +36,15 @@ describe("UI preference persistence", () => {
     expect(normalized.generationMoreFiltersOpen).toBe(false);
     expect(normalized.binding.demographicGroupsOpen).toBe(true);
     expect(normalized.binding.selectedIdentityKey).toBeNull();
+    expect(normalized.binding.demographicGroupPage).toBe(0);
     expect(normalized.binding.previewA).toEqual(defaults.binding.previewA);
+  });
+
+  it("keeps a valid demographic group page index", () => {
+    const normalized = normalizeInstallUiPreferences({
+      binding: { demographicGroupPage: 2.7 },
+    });
+    expect(normalized.binding.demographicGroupPage).toBe(2);
   });
 
   it("keeps preferences isolated by install", () => {

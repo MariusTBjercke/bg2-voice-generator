@@ -56,12 +56,32 @@ const MIGRATIONS: &[Migration] = &[
         version: 9,
         sql: V9_FOLLOW_BINDING_GATE,
     },
+    Migration {
+        version: 10,
+        sql: V10_HARVESTED_POOL_VOICE_SYNC_GATE,
+    },
+    Migration {
+        version: 11,
+        sql: V11_MISMATCHED_PERSONAL_HARVEST_REPAIR_GATE,
+    },
 ];
 
 /// v9 — live “follow character” bindings. DDL runs in a Rust hook so foreign keys
 /// can be disabled for the clone/generation table rebuilds (CHECK cannot be widened
 /// with ALTER TABLE).
 const V9_FOLLOW_BINDING_GATE: &str = r#"
+SELECT 1;
+"#;
+
+/// v10 — retarget harvested demographic pool profiles to each donor's current
+/// personal voice (Rust data hook). No DDL.
+const V10_HARVESTED_POOL_VOICE_SYNC_GATE: &str = r#"
+SELECT 1;
+"#;
+
+/// v11 — repair personal binds pointing at another speaker's harvested profile,
+/// then re-sync demographic pools (Rust data hook). No DDL.
+const V11_MISMATCHED_PERSONAL_HARVEST_REPAIR_GATE: &str = r#"
 SELECT 1;
 "#;
 
@@ -554,6 +574,12 @@ pub fn run_migrations(conn: &mut Connection) -> Result<(), AppError> {
             }
             9 => {
                 migrate_v9_follow_binding(&tx)?;
+            }
+            10 => {
+                crate::generator::metadata_binding::repair_harvested_pool_voices(&tx)?;
+            }
+            11 => {
+                crate::generator::metadata_binding::repair_harvested_pool_voices(&tx)?;
             }
             _ => {}
         }

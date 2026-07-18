@@ -201,6 +201,14 @@ pub fn ensure_harvested_profile(
             })?;
         owner.get_or_insert(row.0);
     }
+    let owner = owner.expect("non-empty samples");
+    let display: String = conn.query_row(
+        "SELECT COALESCE(display_name,cre_resref) FROM speaker WHERE id=?1",
+        [owner],
+        |r| r.get(0),
+    )?;
+    let label = format!("Harvested — {display}");
+    let now = chrono::Utc::now().to_rfc3339();
     for profile in profiles_for_project(conn, project_id)? {
         if profile.origin == VoiceProfileOrigin::Harvested {
             let ids: Vec<i64> = profile
@@ -208,26 +216,32 @@ pub fn ensure_harvested_profile(
                 .iter()
                 .filter_map(|r| r.reference_sample_id)
                 .collect();
-            if ids == ordered_sample_ids {
+            if ids != ordered_sample_ids {
+                continue;
+            }
+            // Reuse only when this profile is owned by the sample speaker; otherwise
+            // reclaim a wrongly labeled leftover (e.g. foreign name on this clip set).
+            if profile.harvested_speaker_id == Some(owner)
+                && profile.display_name == label
+            {
                 conn.execute(
                     "UPDATE voice_profile SET availability='available',updated_at=?2 WHERE id=?1",
-                    params![profile.id, chrono::Utc::now().to_rfc3339()],
+                    params![profile.id, now],
                 )?;
                 return Ok(profile.id);
             }
+            conn.execute(
+                "UPDATE voice_profile SET harvested_speaker_id=?2, display_name=?3, \
+                 availability='available', updated_at=?4 WHERE id=?1",
+                params![profile.id, owner, label, now],
+            )?;
+            return Ok(profile.id);
         }
     }
-    let owner = owner.expect("non-empty samples");
-    let display: String = conn.query_row(
-        "SELECT COALESCE(display_name,cre_resref) FROM speaker WHERE id=?1",
-        [owner],
-        |r| r.get(0),
-    )?;
-    let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
         "INSERT INTO voice_profile(project_id,display_name,origin,harvested_speaker_id,availability,created_at,updated_at) \
          VALUES(?1,?2,'harvested',?3,'available',?4,?4)",
-        params![project_id, format!("Harvested — {display}"), owner, now],
+        params![project_id, label, owner, now],
     )?;
     let profile_id = conn.last_insert_rowid();
     for (sort_order, sample_id) in ordered_sample_ids.iter().enumerate() {
