@@ -85,6 +85,17 @@ pub enum BindingSource {
     Default,
     /// Optional generic fallback (lowest precedence).
     Generic,
+    /// Live-follow another speaker's current effective voice.
+    Follow,
+}
+
+/// Local agent/human decision on a personal voice binding (`binding_review.status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingReviewStatus {
+    #[default]
+    Flagged,
+    Reviewed,
 }
 
 /// Clone readiness (`clone.status`).
@@ -219,7 +230,10 @@ pub struct OmniVoiceRenderSettings {
     /// `-1` selects a fresh random seed; all non-negative values are fixed seeds.
     pub seed: i64,
     /// `None` disables normalization; otherwise -6.0..=0.0 dBFS.
+    /// Ignored when [`Self::peak_normalize_inherit`] is true (use the machine-wide default).
     pub peak_normalize_dbfs: Option<f32>,
+    /// When true, ignore `peak_normalize_dbfs` and use the machine-wide peak default.
+    pub peak_normalize_inherit: bool,
 }
 
 impl Default for OmniVoiceRenderSettings {
@@ -239,6 +253,7 @@ impl Default for OmniVoiceRenderSettings {
             audio_chunk_threshold: 30.0,
             seed: 42,
             peak_normalize_dbfs: Some(-1.0),
+            peak_normalize_inherit: true,
         }
     }
 }
@@ -304,11 +319,56 @@ impl OmniVoiceRenderSettings {
         Ok(())
     }
 
+    /// Apply the machine-wide peak default when this clone inherits it. The result is
+    /// canonical for synth + fingerprinting: `peak_normalize_inherit` is always false
+    /// and `peak_normalize_dbfs` holds the effective level (`None` = off).
+    pub fn with_resolved_peak(mut self, global_peak: Option<f32>) -> Self {
+        if self.peak_normalize_inherit {
+            self.peak_normalize_dbfs = global_peak;
+        }
+        self.peak_normalize_inherit = false;
+        self
+    }
+
     /// Stable identity used by batching, fan-out, candidates, and later persisted
-    /// generation snapshots. Struct field order makes the serialized bytes canonical.
+    /// generation snapshots. `peak_normalize_inherit` is omitted so the hash tracks
+    /// the effective peak level only (callers must [`Self::with_resolved_peak`] first).
     pub fn fingerprint(&self) -> Result<String, String> {
         self.validate()?;
-        let bytes = serde_json::to_vec(self)
+        #[derive(Serialize)]
+        struct FingerprintBody<'a> {
+            speed: &'a Option<f32>,
+            num_steps: i64,
+            guidance_scale: f32,
+            t_shift: f32,
+            layer_penalty_factor: f32,
+            position_temperature: f32,
+            class_temperature: f32,
+            prompt_denoise: bool,
+            preprocess_prompt: bool,
+            postprocess_output: bool,
+            audio_chunk_duration: f32,
+            audio_chunk_threshold: f32,
+            seed: i64,
+            peak_normalize_dbfs: &'a Option<f32>,
+        }
+        let body = FingerprintBody {
+            speed: &self.speed,
+            num_steps: self.num_steps,
+            guidance_scale: self.guidance_scale,
+            t_shift: self.t_shift,
+            layer_penalty_factor: self.layer_penalty_factor,
+            position_temperature: self.position_temperature,
+            class_temperature: self.class_temperature,
+            prompt_denoise: self.prompt_denoise,
+            preprocess_prompt: self.preprocess_prompt,
+            postprocess_output: self.postprocess_output,
+            audio_chunk_duration: self.audio_chunk_duration,
+            audio_chunk_threshold: self.audio_chunk_threshold,
+            seed: self.seed,
+            peak_normalize_dbfs: &self.peak_normalize_dbfs,
+        };
+        let bytes = serde_json::to_vec(&body)
             .map_err(|e| format!("could not serialize OmniVoice render settings: {e}"))?;
         Ok(sha256_hex(&bytes))
     }
@@ -362,7 +422,10 @@ impl OmniVoiceRenderSettingsPatch {
         if let Some(v) = self.audio_chunk_duration { base.audio_chunk_duration = v; }
         if let Some(v) = self.audio_chunk_threshold { base.audio_chunk_threshold = v; }
         if let Some(v) = self.seed { base.seed = v; }
-        if let Some(v) = self.peak_normalize_dbfs { base.peak_normalize_dbfs = v; }
+        if let Some(v) = self.peak_normalize_dbfs {
+            base.peak_normalize_dbfs = v;
+            base.peak_normalize_inherit = false;
+        }
         base.validate()?;
         Ok(base)
     }
@@ -748,6 +811,7 @@ enum_sql!(LineKind);
 enum_sql!(LineStatus);
 enum_sql!(SampleDecision);
 enum_sql!(BindingSource);
+enum_sql!(BindingReviewStatus);
 enum_sql!(CloneStatus);
 enum_sql!(GenerationStatus);
 enum_sql!(RenderCandidateStatus);
@@ -945,6 +1009,9 @@ pub struct Clone {
     pub primary_sample_id: Option<i64>,
     /// Authoritative reusable voice. Legacy rows may leave this null until migrated.
     pub voice_profile_id: Option<i64>,
+    /// When `binding_source` is `Follow`, the speaker whose effective voice is used.
+    #[serde(default)]
+    pub follow_speaker_id: Option<i64>,
     pub binding_source: BindingSource,
     pub status: CloneStatus,
     /// Fully populated settings JSON; old rows deserialize through application defaults.
@@ -1092,6 +1159,118 @@ pub struct LineRenderOverrideWriteResult {
     pub candidate_discarded: bool,
 }
 
+/// Progress counters for personal voice-binding audit.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BindingAuditProgress {
+    pub personal_ready: i64,
+    pub flagged: i64,
+    pub reviewed: i64,
+    pub remaining_personal: i64,
+    pub generic_skipped: i64,
+    pub unbound: i64,
+}
+
+/// One heuristic reason a personal bind may be wrong-character VO.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BindingSuspiciousHint {
+    pub code: String,
+    pub detail: String,
+}
+
+/// Local marker row (`binding_review`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BindingReviewMarker {
+    pub project_id: i64,
+    pub cre_resref: String,
+    pub status: BindingReviewStatus,
+    pub reason: String,
+    pub updated_at: String,
+}
+
+/// One speaker with a personal (`default`/`override`) ready clone.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BindingPersonalRow {
+    pub speaker_id: i64,
+    pub display_name: String,
+    pub cre_resref: String,
+    pub sex: i64,
+    pub display_identity_key: String,
+    pub operational_identity_key: String,
+    pub binding_source: BindingSource,
+    pub clone_status: CloneStatus,
+    pub sample_id: Option<i64>,
+    pub sample_sound_resref: Option<String>,
+    /// CRE that owns the primary sample row (may differ from `cre_resref` after group share).
+    pub sample_owner_cre_resref: Option<String>,
+    pub sample_eligibility: Option<String>,
+    pub sample_shared_source_count: i64,
+    pub sample_text_excerpt: String,
+    pub review_status: Option<BindingReviewStatus>,
+    pub review_reason: String,
+    pub heuristic_hints: Vec<BindingSuspiciousHint>,
+}
+
+/// Suspicious personal bind (heuristics and/or agent flag).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BindingSuspiciousRow {
+    pub speaker_id: i64,
+    pub display_name: String,
+    pub cre_resref: String,
+    pub sex: i64,
+    pub display_identity_key: String,
+    pub binding_source: Option<BindingSource>,
+    pub sample_id: Option<i64>,
+    pub sample_sound_resref: Option<String>,
+    pub sample_owner_cre_resref: Option<String>,
+    pub sample_text_excerpt: String,
+    pub review_status: Option<BindingReviewStatus>,
+    pub review_reason: String,
+    pub heuristic_hints: Vec<BindingSuspiciousHint>,
+}
+
+/// Compact reference-sample row for binding `show`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BindingSampleSummary {
+    pub sample_id: i64,
+    pub source_sound_resref: Option<String>,
+    pub decision: SampleDecision,
+    pub eligibility: String,
+    pub shared_source_count: i64,
+    pub overall_score: Option<f64>,
+    pub source_text_excerpt: String,
+    pub has_local_derivative: bool,
+}
+
+/// Full binding dump for one speaker.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BindingShowDetail {
+    pub speaker_id: i64,
+    pub display_name: String,
+    pub cre_resref: String,
+    pub sex: i64,
+    pub display_identity_key: String,
+    pub operational_identity_key: String,
+    pub binding_source: Option<BindingSource>,
+    pub clone_status: Option<CloneStatus>,
+    pub sample_id: Option<i64>,
+    pub review: Option<BindingReviewMarker>,
+    pub personal: Option<BindingPersonalRow>,
+    pub samples: Vec<BindingSampleSummary>,
+    pub display_group_siblings: Vec<BindingPersonalRow>,
+    pub shares_voice_with_display_group: bool,
+}
+
+/// Display-group summary for binding audit.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BindingGroupSummary {
+    pub identity_key: String,
+    pub display_name: String,
+    pub variant_count: i64,
+    pub member_cre_resrefs: Vec<String>,
+    pub shares_voice: bool,
+    pub shared_personal_primary_sample: bool,
+}
+
 /// A generated WeiDU pack export record (`export`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Export {
@@ -1145,6 +1324,9 @@ mod contract_tests {
         assert_eq!(token(&SampleDecision::Approved), "approved");
         assert_eq!(token(&BindingSource::Override), "override");
         assert_eq!(token(&BindingSource::Generic), "generic");
+        assert_eq!(token(&BindingSource::Follow), "follow");
+        assert_eq!(token(&BindingReviewStatus::Flagged), "flagged");
+        assert_eq!(token(&BindingReviewStatus::Reviewed), "reviewed");
         assert_eq!(token(&CloneStatus::Failed), "failed");
         assert_eq!(token(&GenerationStatus::Running), "running");
         assert_eq!(token(&VoiceProfileOrigin::Designed), "designed");
@@ -1178,9 +1360,11 @@ mod contract_tests {
                 "audio_chunk_threshold",
                 "seed",
                 "peak_normalize_dbfs",
+                "peak_normalize_inherit",
             ],
             keys(&settings),
         );
+        assert!(settings.peak_normalize_inherit);
     }
 
     #[test]
@@ -1321,6 +1505,7 @@ mod contract_tests {
                     speaker_id: 0,
                     primary_sample_id: None,
                     voice_profile_id: None,
+                    follow_speaker_id: None,
                     binding_source: BindingSource::Default,
                     status: CloneStatus::Pending,
                     render_settings_json: String::new(),
@@ -1593,6 +1778,7 @@ mod contract_tests {
                 "speaker_id",
                 "primary_sample_id",
                 "voice_profile_id",
+                "follow_speaker_id",
                 "binding_source",
                 "status",
                 "render_settings_json",
@@ -1602,6 +1788,7 @@ mod contract_tests {
                 speaker_id: 0,
                 primary_sample_id: None,
                 voice_profile_id: None,
+                follow_speaker_id: None,
                 binding_source: BindingSource::default(),
                 status: CloneStatus::default(),
                 render_settings_json: String::new(),
@@ -1620,6 +1807,7 @@ mod contract_tests {
                     speaker_id: 0,
                     primary_sample_id: None,
                     voice_profile_id: None,
+                    follow_speaker_id: None,
                     binding_source: BindingSource::default(),
                     status: CloneStatus::default(),
                     render_settings_json: String::new(),
@@ -2017,8 +2205,119 @@ mod contract_tests {
                 "donor_speaker_id",
                 "donor_display_name",
                 "inherited",
+                "follow_speaker_id",
+                "follow_display_name",
+                "sample_voice_sex",
             ],
             keys(&crate::commands::metadata_binding::EffectiveSpeakerBinding::default()),
+        );
+        expect(
+            vec![
+                "personal_ready",
+                "flagged",
+                "reviewed",
+                "remaining_personal",
+                "generic_skipped",
+                "unbound",
+            ],
+            keys(&BindingAuditProgress::default()),
+        );
+        expect(
+            vec!["code", "detail"],
+            keys(&BindingSuspiciousHint::default()),
+        );
+        expect(
+            vec![
+                "project_id",
+                "cre_resref",
+                "status",
+                "reason",
+                "updated_at",
+            ],
+            keys(&BindingReviewMarker::default()),
+        );
+        expect(
+            vec![
+                "speaker_id",
+                "display_name",
+                "cre_resref",
+                "sex",
+                "display_identity_key",
+                "operational_identity_key",
+                "binding_source",
+                "clone_status",
+                "sample_id",
+                "sample_sound_resref",
+                "sample_owner_cre_resref",
+                "sample_eligibility",
+                "sample_shared_source_count",
+                "sample_text_excerpt",
+                "review_status",
+                "review_reason",
+                "heuristic_hints",
+            ],
+            keys(&BindingPersonalRow::default()),
+        );
+        expect(
+            vec![
+                "speaker_id",
+                "display_name",
+                "cre_resref",
+                "sex",
+                "display_identity_key",
+                "binding_source",
+                "sample_id",
+                "sample_sound_resref",
+                "sample_owner_cre_resref",
+                "sample_text_excerpt",
+                "review_status",
+                "review_reason",
+                "heuristic_hints",
+            ],
+            keys(&BindingSuspiciousRow::default()),
+        );
+        expect(
+            vec![
+                "sample_id",
+                "source_sound_resref",
+                "decision",
+                "eligibility",
+                "shared_source_count",
+                "overall_score",
+                "source_text_excerpt",
+                "has_local_derivative",
+            ],
+            keys(&BindingSampleSummary::default()),
+        );
+        expect(
+            vec![
+                "speaker_id",
+                "display_name",
+                "cre_resref",
+                "sex",
+                "display_identity_key",
+                "operational_identity_key",
+                "binding_source",
+                "clone_status",
+                "sample_id",
+                "review",
+                "personal",
+                "samples",
+                "display_group_siblings",
+                "shares_voice_with_display_group",
+            ],
+            keys(&BindingShowDetail::default()),
+        );
+        expect(
+            vec![
+                "identity_key",
+                "display_name",
+                "variant_count",
+                "member_cre_resrefs",
+                "shares_voice",
+                "shared_personal_primary_sample",
+            ],
+            keys(&BindingGroupSummary::default()),
         );
         expect(
             vec![
@@ -2108,6 +2407,7 @@ mod contract_tests {
                     speaker_id: 0,
                     primary_sample_id: None,
                     voice_profile_id: None,
+                    follow_speaker_id: None,
                     binding_source: crate::models::BindingSource::Default,
                     status: crate::models::CloneStatus::Ready,
                     render_settings_json: String::new(),

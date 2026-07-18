@@ -36,7 +36,7 @@
     GENERATION_FOCUS_ORPHANS,
     GENERATION_FOCUS_VOICE_CHANGED,
   } from "$lib/navigation/generationDeepLink";
-  import { identityHref, pathWithoutIdentity, readIdentityParam } from "$lib/navigation/speakerDeepLink";
+  import { findGroupByIdentityParam, identityHref, pathWithoutIdentity, readIdentityParam } from "$lib/navigation/speakerDeepLink";
   import { groupSummary, speakerIdToGroupMap } from "$lib/speakers/groups";
   import { loadSpeakerGroups } from "$lib/stores/speakerGroups";
   import { progress } from "$lib/stores/progress";
@@ -142,6 +142,9 @@
   let batchSize = $state<string | number | null>("");
   let charBudget = $state<string | number | null>("");
   let charnameStandIn = $state("");
+  /** Machine-wide peak default: null = off; number = target dBFS (default −1). */
+  let peakNormalizeEnabled = $state(true);
+  let peakNormalizeDbfs = $state<number>(-1);
   let savingSettings = $state(false);
   let settingsError = $state<string | null>(null);
 
@@ -372,7 +375,7 @@
     sexes: labelRecord(sexOptions),
     races: labelRecord(raceOptions),
     creatureCategories: labelRecord(creatureOptions),
-    bindingModes: { demographic: "Demographic default", personal: "Personal override" },
+    bindingModes: { demographic: "Demographic default", personal: "Personal override", following: "Following character" },
     donors: labelRecord(donorOptions),
     dlgs: labelRecord(dlgOptions),
     renderStates: {
@@ -897,27 +900,38 @@
     }
   }
 
-  // Load the two batch-tuning settings into the inputs (blank when unset -> default).
+  // Load batch-tuning + peak-normalize defaults (blank batch fields -> backend default).
   async function loadBatchSettings() {
     try {
       batchSize = (await invoke<string | null>("get_setting", { key: KEY_BATCH_SIZE })) ?? "";
       charBudget = (await invoke<string | null>("get_setting", { key: KEY_CHAR_BUDGET })) ?? "";
       charnameStandIn =
         (await invoke<string | null>("get_setting", { key: KEY_CHARNAME_STANDIN })) ?? "";
+      const peak = await invoke<number | null>("get_peak_normalize_default", {});
+      peakNormalizeEnabled = peak !== null;
+      peakNormalizeDbfs = peak ?? -1;
     } catch (e) {
       settingsError = String(e);
     }
   }
 
-  // Persist both batch-tuning settings. An empty field clears the key (reverts to the
-  // default), matching the set_setting contract. The number inputs bind number|null,
-  // so normalize to a trimmed string first.
+  // Persist batch-tuning + peak-normalize defaults. Empty batch fields clear those
+  // keys (reverts to the backend default). Peak uses a dedicated command so
+  // inheriting clones soft-invalidate. Number inputs bind number|null, so normalize
+  // batch fields to trimmed strings first.
   async function saveBatchSettings() {
     savingSettings = true;
     settingsError = null;
     try {
       await invoke<void>("set_setting", { key: KEY_BATCH_SIZE, value: String(batchSize ?? "").trim() });
       await invoke<void>("set_setting", { key: KEY_CHAR_BUDGET, value: String(charBudget ?? "").trim() });
+      const peakValue = peakNormalizeEnabled ? Number(peakNormalizeDbfs) : null;
+      if (peakNormalizeEnabled && (Number.isNaN(peakValue!) || peakValue! < -6 || peakValue! > 0)) {
+        throw new Error("Peak normalize target must be between -6 and 0 dBFS");
+      }
+      await invoke<number>("set_peak_normalize_default", { value: peakValue });
+      // Soft-invalidated inheriting clips may now show as voice-changed.
+      await refreshLinesAndGenerations();
     } catch (e) {
       settingsError = String(e);
     } finally {
@@ -1125,8 +1139,12 @@
   $effect(() => {
     const deepKey = readIdentityParam(page.url);
     if (!deepKey || !filtersHydrated) return;
-    if (scope.speakers.length !== 1 || scope.speakers[0] !== deepKey) {
-      scope = normalizeGenerationScope({ ...scope, speakers: [deepKey] });
+    // Wait for speaker groups so legacy plain strrefs resolve to sex-scoped keys.
+    if (identityGroups.length === 0) return;
+    const match = findGroupByIdentityParam(identityGroups, deepKey);
+    const resolvedKey = match?.identity_key ?? deepKey;
+    if (scope.speakers.length !== 1 || scope.speakers[0] !== resolvedKey) {
+      scope = normalizeGenerationScope({ ...scope, speakers: [resolvedKey] });
     }
     void goto(pathWithoutIdentity(page.url), { replaceState: true, keepFocus: true });
   });
@@ -1426,6 +1444,7 @@
                   <legend>Voice source</legend>
                   <label><input type="checkbox" checked={scope.bindingModes.includes("demographic")} onchange={(event) => toggleScopeValue("bindingModes", "demographic", event.currentTarget.checked)} /> Demographic default</label>
                   <label><input type="checkbox" checked={scope.bindingModes.includes("personal")} onchange={(event) => toggleScopeValue("bindingModes", "personal", event.currentTarget.checked)} /> Personal override</label>
+                  <label><input type="checkbox" checked={scope.bindingModes.includes("following")} onchange={(event) => toggleScopeValue("bindingModes", "following", event.currentTarget.checked)} /> Following character</label>
                 </fieldset>
                 <fieldset>
                   <legend>Render state</legend>
@@ -1500,6 +1519,29 @@
             bind:value={charBudget}
           />
         </div>
+        <div class="batch-field peak-field">
+          <label class="check" for="peak-normalize-enabled">
+            <input
+              id="peak-normalize-enabled"
+              type="checkbox"
+              bind:checked={peakNormalizeEnabled}
+            />
+            Peak normalize
+          </label>
+          {#if peakNormalizeEnabled}
+            <label class="number-control" for="peak-normalize-dbfs">
+              Target dBFS
+              <input
+                id="peak-normalize-dbfs"
+                type="number"
+                min="-6"
+                max="0"
+                step="0.1"
+                bind:value={peakNormalizeDbfs}
+              />
+            </label>
+          {/if}
+        </div>
         <Button variant="ghost" onclick={saveBatchSettings} disabled={savingSettings}>
           {savingSettings ? "Saving…" : "Save"}
         </Button>
@@ -1507,6 +1549,8 @@
           Lines sharing a voice are sent to the engine together, capped by BOTH the
           batch size and the total character budget (the main VRAM dial). Leave a field
           blank to use the default ({DEFAULT_BATCH_SIZE} / {DEFAULT_CHAR_BUDGET}).
+          Peak normalize is the default for all voices unless overridden on Binding
+          (unset target = −1 dBFS).
         </p>
       </div>
       <ErrorNotice message={settingsError} />
@@ -2052,6 +2096,20 @@
   .batch-field input:focus {
     outline: none;
     border-color: var(--accent);
+  }
+  .peak-field .check {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: 0.8rem;
+    color: var(--text-muted);
+  }
+  .peak-field .number-control {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    font-size: 0.8rem;
+    color: var(--text-muted);
   }
   .batch-hint {
     flex: 1 1 16rem;

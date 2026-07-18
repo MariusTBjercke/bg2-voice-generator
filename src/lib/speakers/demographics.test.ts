@@ -59,6 +59,9 @@ function binding(
     donor_speaker_id: null,
     donor_display_name: null,
     inherited: true,
+    follow_speaker_id: null,
+    follow_display_name: null,
+    sample_voice_sex: null,
     ...partial,
   };
 }

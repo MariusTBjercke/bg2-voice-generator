@@ -534,6 +534,7 @@ mod tests {
             "{}",
             &crate::models::OmniVoiceRenderSettings::default(),
             "old-ref",
+            None,
         )
         .unwrap();
         let personal_gen = get_or_create_generation(&conn, personal_line, personal_clone).unwrap();
@@ -547,6 +548,7 @@ mod tests {
             "{}",
             &crate::models::OmniVoiceRenderSettings::default(),
             "old-ref",
+            None,
         )
         .unwrap();
 

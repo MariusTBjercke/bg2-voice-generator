@@ -1,9 +1,11 @@
 import type { Clone, ReferenceSample, Speaker, SpeakerGroup, SpeakerVariant } from "$lib/types";
 
-/** Identity key for a speaker row (named strref or singleton). */
-export function identityKey(speaker: Pick<Speaker, "id" | "long_name_strref">): string {
+/** Identity key for a speaker row (named strref+sex or singleton). */
+export function identityKey(
+  speaker: Pick<Speaker, "id" | "long_name_strref" | "sex">,
+): string {
   if (speaker.long_name_strref !== null) {
-    return String(speaker.long_name_strref);
+    return `${speaker.long_name_strref}:${speaker.sex}`;
   }
   return `ungrouped:${speaker.id}`;
 }
@@ -43,13 +45,23 @@ export function expandIdentityFilter(
       out.add(v.speaker_id);
     }
   }
-  // Legacy saved filters may still store raw speaker ids.
+  // Legacy saved filters may still store raw speaker ids or plain strrefs.
   for (const key of selectedKeys) {
     if (key.startsWith("ungrouped:")) {
       const id = Number(key.slice("ungrouped:".length));
       if (Number.isFinite(id)) out.add(id);
+    } else if (/^\d+:\d+$/.test(key)) {
+      // Sex-scoped identity key — already handled via group.identity_key above.
+      continue;
     } else if (/^\d+$/.test(key)) {
-      out.add(Number(key));
+      const strref = Number(key);
+      for (const g of groups) {
+        if (g.long_name_strref === strref) {
+          for (const v of g.variants) out.add(v.speaker_id);
+        }
+      }
+      // Also treat as a raw speaker id (older filter shape).
+      out.add(strref);
     }
   }
   return out;
@@ -114,19 +126,25 @@ export function representativeVariant(g: SpeakerGroup): SpeakerVariant {
   );
 }
 
-/** Personal clone for a display group: representative first, then any sibling variant. */
+/** Personal clone for a display group: prefer Ready (+ primary) over pending shells. */
 export function personalCloneForGroup(
   group: SpeakerGroup,
   clonesBySpeaker: Record<number, Clone>,
 ): Clone | null {
   const repId = representativeVariant(group).speaker_id;
-  const repClone = clonesBySpeaker[repId];
-  if (repClone && repClone.binding_source !== "generic") return repClone;
+  const personal: Clone[] = [];
   for (const variant of group.variants) {
     const clone = clonesBySpeaker[variant.speaker_id];
-    if (clone && clone.binding_source !== "generic") return clone;
+    if (clone && clone.binding_source !== "generic") personal.push(clone);
   }
-  return repClone ?? null;
+  if (personal.length === 0) {
+    return clonesBySpeaker[repId] ?? null;
+  }
+  const ready = personal.filter(
+    (c) => c.status === "ready" && c.primary_sample_id != null,
+  );
+  const pool = ready.length > 0 ? ready : personal;
+  return pool.find((c) => c.speaker_id === repId) ?? pool[0] ?? null;
 }
 
 /** Filter groups by search text (display name or any variant cre_resref). */

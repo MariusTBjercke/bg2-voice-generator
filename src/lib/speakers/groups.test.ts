@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { SpeakerGroup } from "$lib/types";
-import { formatApprovedSummary, groupSummary } from "./groups";
+import type { Clone, SpeakerGroup } from "$lib/types";
+import { formatApprovedSummary, groupSummary, personalCloneForGroup } from "./groups";
 
 function group(partial: Partial<SpeakerGroup>): SpeakerGroup {
   return {
@@ -16,6 +16,18 @@ function group(partial: Partial<SpeakerGroup>): SpeakerGroup {
     binding_source: null,
     variants: [],
     excluded: false,
+    ...partial,
+  };
+}
+
+function clone(partial: Partial<Clone> & Pick<Clone, "id" | "speaker_id">): Clone {
+  return {
+    primary_sample_id: null,
+    voice_profile_id: null,
+    follow_speaker_id: null,
+    binding_source: "default",
+    status: "pending",
+    render_settings_json: "{}",
     ...partial,
   };
 }
@@ -52,5 +64,55 @@ describe("groupSummary", () => {
         }),
       ),
     ).toBe("6 variants · 100 lines · 2 approved (12 across variants)");
+  });
+});
+
+describe("personalCloneForGroup", () => {
+  it("prefers a Ready sibling over the representative pending shell", () => {
+    const g = group({
+      identity_key: "4242:1",
+      display_name: "Priest of Oghma",
+      variants: [
+        { speaker_id: 1, cre_resref: "oghma1", line_count: 10, approved_sample_count: 0 },
+        { speaker_id: 2, cre_resref: "oghma2", line_count: 2, approved_sample_count: 1 },
+      ],
+    });
+    const ready = clone({
+      id: 20,
+      speaker_id: 2,
+      status: "ready",
+      primary_sample_id: 99,
+      binding_source: "override",
+    });
+    const bySpeaker = {
+      1: clone({ id: 10, speaker_id: 1, status: "pending", primary_sample_id: null }),
+      2: ready,
+    };
+    expect(personalCloneForGroup(g, bySpeaker)).toEqual(ready);
+  });
+
+  it("still prefers the representative among Ready clones", () => {
+    const g = group({
+      variants: [
+        { speaker_id: 1, cre_resref: "a", line_count: 10, approved_sample_count: 1 },
+        { speaker_id: 2, cre_resref: "b", line_count: 2, approved_sample_count: 1 },
+      ],
+    });
+    const repReady = clone({
+      id: 10,
+      speaker_id: 1,
+      status: "ready",
+      primary_sample_id: 1,
+    });
+    const bySpeaker = {
+      1: repReady,
+      2: clone({
+        id: 20,
+        speaker_id: 2,
+        status: "ready",
+        primary_sample_id: 2,
+      }),
+    };
+    expect(personalCloneForGroup(g, bySpeaker)).toEqual(repReady);
   });
 });

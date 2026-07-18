@@ -30,6 +30,8 @@ describe("UI preference persistence", () => {
     const defaults = defaultInstallUiPreferences();
     expect(normalized.locale).toBeNull();
     expect(normalized.reviewTab).toBe("flagged");
+    expect(normalized.review.aiAssistedOpen).toBe(true);
+    expect(normalized.review.bindingTab).toBe("suspicious");
     expect(normalized.generationMoreFiltersOpen).toBe(false);
     expect(normalized.binding.demographicGroupsOpen).toBe(true);
     expect(normalized.binding.selectedIdentityKey).toBeNull();

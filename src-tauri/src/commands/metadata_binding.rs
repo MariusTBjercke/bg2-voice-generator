@@ -183,6 +183,128 @@ pub struct EffectiveSpeakerBinding {
     pub donor_speaker_id: Option<i64>,
     pub donor_display_name: Option<String>,
     pub inherited: bool,
+    /// When `binding_source` is `Follow`, the character whose voice is used.
+    #[serde(default)]
+    pub follow_speaker_id: Option<i64>,
+    #[serde(default)]
+    pub follow_display_name: Option<String>,
+    /// CRE sex IDS byte inferred from the bound sample's sound resref ownership
+    /// (e.g. `jaheir62` → Jaheira/female), when resolvable.
+    pub sample_voice_sex: Option<i64>,
+}
+
+/// Strip trailing digits from a resref for stem matching (`jaheir62` → `jaheir`).
+fn resref_stem(resref: &str) -> String {
+    resref
+        .trim_end_matches(|c: char| c.is_ascii_digit())
+        .to_ascii_lowercase()
+}
+
+/// Score how likely `cre_resref` is the canonical owner of `sound`.
+fn sound_owner_score(sound: &str, cre_resref: &str, hit_count: i64) -> i64 {
+    let sound = sound.to_ascii_lowercase();
+    let cre = cre_resref.to_ascii_lowercase();
+    let sound_stem = resref_stem(&sound);
+    let cre_stem = resref_stem(&cre);
+    let mut score = hit_count.max(0);
+    if !cre_stem.is_empty() && sound_stem == cre_stem {
+        score += 100;
+    } else if cre_stem.len() >= 4 && sound.starts_with(&cre_stem) {
+        score += 50;
+    }
+    score
+}
+
+/// Build sound-resref → CRE sex for gender-mismatch checks.
+///
+/// Prefers dialogue-line / dialogue_state owners whose CRE stem matches the sound
+/// (`jaheir62` → `jaheir*`). Ambiguous cross-sex ties yield no entry.
+fn build_sound_voice_sex_map(
+    conn: &rusqlite::Connection,
+    project_id: i64,
+) -> Result<std::collections::HashMap<String, i64>, AppError> {
+    // sound → (sex → best score for that sex)
+    let mut by_sound: std::collections::HashMap<String, std::collections::HashMap<i64, i64>> =
+        std::collections::HashMap::new();
+
+    let mut bump = |sound: String, sex: i64, cre: String, hits: i64| {
+        if sound.is_empty() {
+            return;
+        }
+        let score = sound_owner_score(&sound, &cre, hits);
+        let sexes = by_sound.entry(sound).or_default();
+        let entry = sexes.entry(sex).or_insert(0);
+        *entry = (*entry).max(score);
+    };
+
+    {
+        let mut stmt = conn.prepare(
+            "SELECT lower(l.existing_sound_resref), s.sex, s.cre_resref, COUNT(*) \
+             FROM line l \
+             JOIN speaker s ON s.id = l.speaker_id \
+             WHERE s.project_id = ?1 \
+               AND l.existing_sound_resref IS NOT NULL \
+               AND trim(l.existing_sound_resref) != '' \
+             GROUP BY lower(l.existing_sound_resref), s.sex, s.cre_resref",
+        )?;
+        for row in stmt.query_map(params![project_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })? {
+            let (sound, sex, cre, hits) = row?;
+            bump(sound, sex, cre, hits);
+        }
+    }
+
+    {
+        let mut stmt = conn.prepare(
+            "SELECT lower(rs.source_sound_resref), s.sex, s.cre_resref, COUNT(*) \
+             FROM reference_sample rs \
+             JOIN speaker s ON s.id = rs.speaker_id \
+             WHERE s.project_id = ?1 \
+               AND rs.source_sound_resref IS NOT NULL \
+               AND trim(rs.source_sound_resref) != '' \
+               AND rs.provenance_json LIKE '%\"origin\":\"dialogue_state\"%' \
+             GROUP BY lower(rs.source_sound_resref), s.sex, s.cre_resref",
+        )?;
+        for row in stmt.query_map(params![project_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })? {
+            let (sound, sex, cre, hits) = row?;
+            bump(sound, sex, cre, hits);
+        }
+    }
+
+    let mut out = std::collections::HashMap::new();
+    for (sound, sexes) in by_sound {
+        let mut best_sex: Option<i64> = None;
+        let mut best_score = i64::MIN;
+        let mut tie = false;
+        for (sex, score) in sexes {
+            if score > best_score {
+                best_score = score;
+                best_sex = Some(sex);
+                tie = false;
+            } else if score == best_score && best_sex != Some(sex) {
+                tie = true;
+            }
+        }
+        if !tie {
+            if let Some(sex) = best_sex {
+                out.insert(sound, sex);
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn effective_bindings_for_project(
@@ -190,17 +312,22 @@ fn effective_bindings_for_project(
     project_id: i64,
     speaker_id: Option<i64>,
 ) -> Result<Vec<EffectiveSpeakerBinding>, AppError> {
+    let sound_sex = build_sound_voice_sex_map(conn, project_id)?;
     let mut stmt = conn.prepare(
         "WITH line_counts AS ( \
              SELECT speaker_id, COUNT(*) AS line_count FROM line \
              WHERE project_id = ?1 AND speaker_id IS NOT NULL GROUP BY speaker_id \
          ) \
          SELECT s.id, COALESCE(lc.line_count, 0), c.id, c.binding_source, c.status, \
+                c.follow_speaker_id, \
+                COALESCE(follow.display_name, follow.cre_resref), \
                 rs.id, COALESCE(rs.local_derivative_path,vpr.managed_path), donor.id, \
-                COALESCE(donor.display_name, donor.cre_resref), vp.id, vp.display_name, vp.origin \
+                COALESCE(donor.display_name, donor.cre_resref), vp.id, vp.display_name, vp.origin, \
+                rs.source_sound_resref \
          FROM speaker s \
          LEFT JOIN line_counts lc ON lc.speaker_id = s.id \
          LEFT JOIN clone c ON c.speaker_id = s.id \
+         LEFT JOIN speaker follow ON follow.id = c.follow_speaker_id \
          LEFT JOIN reference_sample rs ON rs.id = c.primary_sample_id \
          LEFT JOIN speaker donor ON donor.id = rs.speaker_id \
          LEFT JOIN voice_profile vp ON vp.id=c.voice_profile_id \
@@ -208,26 +335,106 @@ fn effective_bindings_for_project(
          WHERE s.project_id = ?1 AND (?2 IS NULL OR s.id = ?2) \
          ORDER BY COALESCE(s.display_name, s.cre_resref), s.id",
     )?;
-    let rows = stmt
+    let mut rows = stmt
         .query_map(params![project_id, speaker_id], |r| {
             let binding_source: Option<BindingSource> = r.get(3)?;
+            let sound: Option<String> = r.get(14)?;
+            let sample_voice_sex = sound
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(|s| sound_sex.get(&s.to_ascii_lowercase()).copied());
             Ok(EffectiveSpeakerBinding {
                 speaker_id: r.get(0)?,
                 line_count: r.get(1)?,
                 clone_id: r.get(2)?,
                 binding_source,
                 clone_status: r.get(4)?,
-                sample_id: r.get(5)?,
-                sample_path: r.get(6)?,
-                voice_profile_id: r.get(9)?,
-                voice_profile_name: r.get(10)?,
-                voice_profile_origin: r.get(11)?,
-                donor_speaker_id: r.get(7)?,
-                donor_display_name: r.get(8)?,
+                follow_speaker_id: r.get(5)?,
+                follow_display_name: r.get(6)?,
+                sample_id: r.get(7)?,
+                sample_path: r.get(8)?,
+                donor_speaker_id: r.get(9)?,
+                donor_display_name: r.get(10)?,
+                voice_profile_id: r.get(11)?,
+                voice_profile_name: r.get(12)?,
+                voice_profile_origin: r.get(13)?,
                 inherited: binding_source == Some(BindingSource::Generic),
+                sample_voice_sex,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    // Resolve displayed sample/profile through follow edges for live follow bindings.
+    for row in &mut rows {
+        if row.binding_source != Some(BindingSource::Follow) {
+            continue;
+        }
+        let Some(resolved) =
+            crate::db::follow_binding::try_resolve_effective_clone(conn, row.speaker_id)?
+        else {
+            row.clone_status = Some(CloneStatus::Pending);
+            row.sample_id = None;
+            row.sample_path = None;
+            row.voice_profile_id = None;
+            row.voice_profile_name = None;
+            row.voice_profile_origin = None;
+            row.donor_speaker_id = None;
+            row.donor_display_name = None;
+            row.sample_voice_sex = None;
+            continue;
+        };
+        row.clone_status = Some(resolved.status);
+        row.sample_id = resolved.primary_sample_id;
+        row.voice_profile_id = resolved.voice_profile_id;
+        if let Some(profile_id) = resolved.voice_profile_id {
+            let meta: Option<(String, crate::models::VoiceProfileOrigin, Option<String>)> = conn
+                .query_row(
+                    "SELECT vp.display_name, vp.origin, \
+                            COALESCE(rs.local_derivative_path, vpr.managed_path) \
+                     FROM voice_profile vp \
+                     LEFT JOIN voice_profile_reference vpr \
+                       ON vpr.voice_profile_id=vp.id AND vpr.sort_order=0 \
+                     LEFT JOIN reference_sample rs ON rs.id=vpr.reference_sample_id \
+                     WHERE vp.id=?1",
+                    [profile_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            if let Some((name, origin, path)) = meta {
+                row.voice_profile_name = Some(name);
+                row.voice_profile_origin = Some(origin);
+                if row.sample_path.is_none() {
+                    row.sample_path = path;
+                }
+            }
+        }
+        if let Some(sample_id) = resolved.primary_sample_id {
+            let sample_meta: Option<(Option<String>, Option<String>, Option<i64>, Option<String>)> =
+                conn.query_row(
+                    "SELECT rs.local_derivative_path, rs.source_sound_resref, \
+                            donor.id, COALESCE(donor.display_name, donor.cre_resref) \
+                     FROM reference_sample rs \
+                     LEFT JOIN speaker donor ON donor.id = rs.speaker_id \
+                     WHERE rs.id=?1",
+                    [sample_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            if let Some((path, sound, donor_id, donor_name)) = sample_meta {
+                if row.sample_path.is_none() {
+                    row.sample_path = path;
+                }
+                row.donor_speaker_id = donor_id;
+                row.donor_display_name = donor_name;
+                row.sample_voice_sex = sound
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .and_then(|s| sound_sex.get(&s.to_ascii_lowercase()).copied());
+            }
+        }
+    }
     Ok(rows)
 }
 
@@ -354,6 +561,31 @@ pub async fn use_demographic_default(
         .into_iter()
         .next()
         .ok_or_else(|| AppError::Other("speaker vanished after restoring default".into()))
+}
+
+/// Live-link a speaker (or Binding display group) to another character's current voice.
+#[tauri::command]
+pub async fn follow_speaker_voice(
+    state: State<'_, AppState>,
+    game_dir: String,
+    speaker_id: i64,
+    follow_speaker_id: i64,
+    identity_key: Option<String>,
+) -> Result<EffectiveSpeakerBinding, AppError> {
+    let conn = state.db.lock().await;
+    let project_id = project_id_for_game_dir(&conn, &game_dir)?
+        .ok_or_else(|| AppError::Other("unknown game directory".into()))?;
+    crate::db::follow_binding::follow_speaker_voice(
+        &conn,
+        project_id,
+        speaker_id,
+        follow_speaker_id,
+        identity_key.as_deref(),
+    )?;
+    effective_bindings_for_project(&conn, project_id, Some(speaker_id))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| AppError::Other("speaker vanished after follow bind".into()))
 }
 
 /// Add a bindable donor to a demographic pool (creates the binding row if needed).
@@ -670,9 +902,54 @@ mod tests {
         assert_eq!(inherited.donor_display_name.as_deref(), Some("Donor"));
         assert_eq!(inherited.sample_path.as_deref(), Some("/ws/d.wav"));
         assert_eq!(inherited.line_count, 1);
+        assert_eq!(inherited.sample_voice_sex, None);
         let unbound = rows.iter().find(|row| row.speaker_id == 3).unwrap();
         assert_eq!(unbound.clone_id, None);
         assert!(!unbound.inherited);
+    }
+
+    #[test]
+    fn sample_voice_sex_follows_canonical_sound_owner_not_harvest_host() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        schema::run_migrations(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO project (game_root, edition, active_language, generator_version, created_at) \
+             VALUES ('r', 'BG2EE', 'en_US', '0.1.0', 'now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO speaker (project_id, cre_resref, display_name, sex) VALUES \
+             (1, 'boyba1', 'Boy', 1), (1, 'jaheir7', 'Jaheira', 2)",
+            [],
+        )
+        .unwrap();
+        // Official Jaheira VO for this sound.
+        conn.execute(
+            "INSERT INTO line (project_id, speaker_id, strref, text, existing_sound_resref, is_voiced) \
+             VALUES (1, 2, 8822, 'It is a path of conscience.', 'jaheir62', 1)",
+            [],
+        )
+        .unwrap();
+        // Mis-harvested onto Boy, then bound.
+        conn.execute(
+            "INSERT INTO reference_sample (speaker_id, source_strref, source_sound_resref, provenance_json, \
+             decision, local_derivative_path) \
+             VALUES (1, 8822, 'jaheir62', '{\"origin\":\"dialogue_state\"}', 'approved', '/ws/j.wav')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO clone (speaker_id, primary_sample_id, binding_source, status) \
+             VALUES (1, 1, 'override', 'ready')",
+            [],
+        )
+        .unwrap();
+
+        let rows = effective_bindings_for_project(&conn, 1, Some(1)).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sample_voice_sex, Some(2)); // Jaheira / female
+        assert_eq!(rows[0].donor_speaker_id, Some(1)); // harvest host still Boy
     }
 
     #[test]

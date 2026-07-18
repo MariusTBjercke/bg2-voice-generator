@@ -56,9 +56,23 @@ COMMANDS:
   tag-rule remove --id <id>
   tag-rule test --text <sentence>
   tag-rule reset
+  binding progress --project <id>
+  binding list-personal --project <id> [--limit <n>] [--after <speaker-id>]
+  binding list-suspicious --project <id> [--limit <n>] [--after <speaker-id>]
+  binding list-flagged --project <id> [--limit <n>] [--after <speaker-id>]
+  binding list-reviewed --project <id> [--limit <n>] [--after <speaker-id>]
+  binding list-groups --project <id> [--limit <n>] [--after <key>]
+  binding show (--speaker <id>|--cre <resref>) --project <id>
+  binding flag (--speaker <id>|--cre <resref>) --project <id> --reason <text>
+  binding review (--speaker <id>|--cre <resref>) --project <id> [--reason <text>]
+  binding unreview (--speaker <id>|--cre <resref>) --project <id>
+  binding clear-flag (--speaker <id>|--cre <resref>) --project <id>
+  binding clear-personal (--speaker <id>|--cre <resref>) --project <id>
+  binding reject-sample --sample <id> --project <id>
 
 Overrides affect generated audio only. They never modify BG2 TLK text or exported subtitles.
 Presets only change line pacing. They cannot render, audition, or accept audio candidates.
+Binding audit covers personal clones only; skip demographic (generic) binds unless asked.
 "#;
 
 #[derive(Debug, Deserialize)]
@@ -912,6 +926,304 @@ fn tag_rule_command(conn: &mut Connection, args: &[String]) -> Result<(), AppErr
     }
 }
 
+fn require_project(args: &[String]) -> Result<i64, AppError> {
+    integer_after(args, "--project")?
+        .ok_or_else(|| AppError::Other("binding commands require --project <id>".into()))
+}
+
+fn speaker_or_cre(args: &[String]) -> Result<(Option<i64>, Option<String>), AppError> {
+    let speaker = integer_after(args, "--speaker")?;
+    let cre = value_after(args, "--cre");
+    if speaker.is_none() && cre.is_none() {
+        return Err(AppError::Other(
+            "provide --speaker <id> or --cre <resref>".into(),
+        ));
+    }
+    Ok((speaker, cre))
+}
+
+fn print_hints(hints: &[crate::models::BindingSuspiciousHint]) {
+    for hint in hints {
+        println!("  hint {}: {}", hint.code, hint.detail);
+    }
+}
+
+fn binding_command(conn: &mut Connection, args: &[String]) -> Result<(), AppError> {
+    let action = args
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| AppError::Other("binding requires a subcommand".into()))?;
+    let rest = &args[1..];
+    match action {
+        "progress" => {
+            let project = require_project(rest)?;
+            let p = crate::db::binding_audit::binding_progress(conn, project)?;
+            println!(
+                "personal_ready={} flagged={} reviewed={} remaining_personal={} \
+                 generic_skipped={} unbound={}",
+                p.personal_ready,
+                p.flagged,
+                p.reviewed,
+                p.remaining_personal,
+                p.generic_skipped,
+                p.unbound
+            );
+            Ok(())
+        }
+        "list-personal" => {
+            let project = require_project(rest)?;
+            let limit = integer_after::<i64>(rest, "--limit")?.unwrap_or(100).clamp(1, 500) as usize;
+            let after = integer_after::<i64>(rest, "--after")?;
+            let rows = crate::db::binding_audit::list_personal_bindings(
+                conn, project, after, limit, false,
+            )?;
+            println!("returned: {}", rows.len());
+            for row in &rows {
+                println!(
+                    "speaker={} cre={} name={:?} source={:?} sample={:?} sound={:?} review={:?} hints={}",
+                    row.speaker_id,
+                    row.cre_resref,
+                    row.display_name,
+                    row.binding_source,
+                    row.sample_id,
+                    row.sample_sound_resref,
+                    row.review_status,
+                    row.heuristic_hints.len()
+                );
+                print_hints(&row.heuristic_hints);
+                if !row.sample_text_excerpt.is_empty() {
+                    println!("  text: {}", row.sample_text_excerpt);
+                }
+            }
+            if let Some(last) = rows.last() {
+                println!("next: --after {}", last.speaker_id);
+            }
+            Ok(())
+        }
+        "list-suspicious" => {
+            let project = require_project(rest)?;
+            let limit = integer_after::<i64>(rest, "--limit")?.unwrap_or(100).clamp(1, 500) as usize;
+            let after = integer_after::<i64>(rest, "--after")?;
+            let rows =
+                crate::db::binding_audit::list_suspicious_bindings(conn, project, after, limit)?;
+            println!("returned: {}", rows.len());
+            for row in &rows {
+                println!(
+                    "speaker={} cre={} name={:?} sound={:?} review={:?} hints={}",
+                    row.speaker_id,
+                    row.cre_resref,
+                    row.display_name,
+                    row.sample_sound_resref,
+                    row.review_status,
+                    row.heuristic_hints.len()
+                );
+                print_hints(&row.heuristic_hints);
+                if !row.review_reason.is_empty() {
+                    println!("  reason: {}", row.review_reason);
+                }
+            }
+            if let Some(last) = rows.last() {
+                println!("next: --after {}", last.speaker_id);
+            }
+            Ok(())
+        }
+        "list-flagged" | "list-reviewed" => {
+            let project = require_project(rest)?;
+            let limit = integer_after::<i64>(rest, "--limit")?.unwrap_or(100).clamp(1, 500) as usize;
+            let after = integer_after::<i64>(rest, "--after")?;
+            let status = if action == "list-flagged" {
+                crate::models::BindingReviewStatus::Flagged
+            } else {
+                crate::models::BindingReviewStatus::Reviewed
+            };
+            let rows = crate::db::binding_audit::list_marked_bindings(
+                conn, project, status, after, limit,
+            )?;
+            println!("returned: {}", rows.len());
+            for row in &rows {
+                println!(
+                    "speaker={} cre={} name={:?} sound={:?} review={:?} reason={:?}",
+                    row.speaker_id,
+                    row.cre_resref,
+                    row.display_name,
+                    row.sample_sound_resref,
+                    row.review_status,
+                    row.review_reason
+                );
+                print_hints(&row.heuristic_hints);
+            }
+            if let Some(last) = rows.last() {
+                println!("next: --after {}", last.speaker_id);
+            }
+            Ok(())
+        }
+        "list-groups" => {
+            let project = require_project(rest)?;
+            let limit = integer_after::<i64>(rest, "--limit")?.unwrap_or(100).clamp(1, 500) as usize;
+            let after = value_after(rest, "--after");
+            let rows = crate::db::binding_audit::list_binding_groups(
+                conn,
+                project,
+                after.as_deref(),
+                limit,
+            )?;
+            println!("returned: {}", rows.len());
+            for row in &rows {
+                println!(
+                    "key={} name={:?} variants={} shares_voice={} shared_primary={} cres={}",
+                    row.identity_key,
+                    row.display_name,
+                    row.variant_count,
+                    row.shares_voice,
+                    row.shared_personal_primary_sample,
+                    row.member_cre_resrefs.join(",")
+                );
+            }
+            if let Some(last) = rows.last() {
+                println!("next: --after {}", last.identity_key);
+            }
+            Ok(())
+        }
+        "show" => {
+            let project = require_project(rest)?;
+            let (speaker, cre) = speaker_or_cre(rest)?;
+            let detail = crate::db::binding_audit::show_binding(
+                conn,
+                project,
+                speaker,
+                cre.as_deref(),
+            )?;
+            println!(
+                "speaker={} cre={} name={:?} display_key={} op_key={} source={:?} status={:?} \
+                 sample={:?} shares_display_group={}",
+                detail.speaker_id,
+                detail.cre_resref,
+                detail.display_name,
+                detail.display_identity_key,
+                detail.operational_identity_key,
+                detail.binding_source,
+                detail.clone_status,
+                detail.sample_id,
+                detail.shares_voice_with_display_group
+            );
+            if let Some(review) = &detail.review {
+                println!(
+                    "review status={:?} reason={:?} at={}",
+                    review.status, review.reason, review.updated_at
+                );
+            }
+            if let Some(personal) = &detail.personal {
+                print_hints(&personal.heuristic_hints);
+            }
+            println!("samples: {}", detail.samples.len());
+            for sample in &detail.samples {
+                println!(
+                    "  sample={} sound={:?} decision={:?} eligibility={} shared={} score={:?} text={:?}",
+                    sample.sample_id,
+                    sample.source_sound_resref,
+                    sample.decision,
+                    sample.eligibility,
+                    sample.shared_source_count,
+                    sample.overall_score,
+                    sample.source_text_excerpt
+                );
+            }
+            println!("siblings: {}", detail.display_group_siblings.len());
+            for sib in &detail.display_group_siblings {
+                println!(
+                    "  sibling speaker={} cre={} source={:?} sample={:?}",
+                    sib.speaker_id, sib.cre_resref, sib.binding_source, sib.sample_id
+                );
+            }
+            Ok(())
+        }
+        "flag" => {
+            let project = require_project(rest)?;
+            let (speaker, cre) = speaker_or_cre(rest)?;
+            let reason = value_after(rest, "--reason").unwrap_or_default();
+            let (_, cre_resref, _) = crate::db::binding_audit::resolve_speaker(
+                conn,
+                project,
+                speaker,
+                cre.as_deref(),
+            )?;
+            let marker = crate::db::binding_audit::set_binding_review(
+                conn,
+                project,
+                &cre_resref,
+                crate::models::BindingReviewStatus::Flagged,
+                &reason,
+            )?;
+            println!(
+                "flagged cre={} reason={:?}",
+                marker.cre_resref, marker.reason
+            );
+            Ok(())
+        }
+        "review" => {
+            let project = require_project(rest)?;
+            let (speaker, cre) = speaker_or_cre(rest)?;
+            let reason = value_after(rest, "--reason").unwrap_or_default();
+            let (_, cre_resref, _) = crate::db::binding_audit::resolve_speaker(
+                conn,
+                project,
+                speaker,
+                cre.as_deref(),
+            )?;
+            let marker = crate::db::binding_audit::set_binding_review(
+                conn,
+                project,
+                &cre_resref,
+                crate::models::BindingReviewStatus::Reviewed,
+                &reason,
+            )?;
+            println!("reviewed cre={}", marker.cre_resref);
+            Ok(())
+        }
+        "unreview" | "clear-flag" => {
+            let project = require_project(rest)?;
+            let (speaker, cre) = speaker_or_cre(rest)?;
+            let (_, cre_resref, _) = crate::db::binding_audit::resolve_speaker(
+                conn,
+                project,
+                speaker,
+                cre.as_deref(),
+            )?;
+            let cleared =
+                crate::db::binding_audit::clear_binding_review(conn, project, &cre_resref)?;
+            println!("cleared={cleared} cre={cre_resref}");
+            Ok(())
+        }
+        "clear-personal" => {
+            let project = require_project(rest)?;
+            let (speaker, cre) = speaker_or_cre(rest)?;
+            let cleared = crate::db::binding_audit::clear_personal_binding(
+                conn,
+                project,
+                speaker,
+                cre.as_deref(),
+            )?;
+            println!("cleared_personal={cleared}");
+            Ok(())
+        }
+        "reject-sample" => {
+            let project = require_project(rest)?;
+            let sample_id = integer_after::<i64>(rest, "--sample")?.ok_or_else(|| {
+                AppError::Other("reject-sample requires --sample <id>".into())
+            })?;
+            crate::db::binding_audit::reject_sample(conn, project, sample_id)?;
+            println!("rejected sample {sample_id}");
+            Ok(())
+        }
+        _ => Err(AppError::Other(
+            "binding requires progress, list-personal, list-suspicious, list-flagged, \
+             list-reviewed, list-groups, show, flag, review, unreview, clear-flag, \
+             clear-personal, or reject-sample"
+                .into(),
+        )),
+    }
+}
+
 fn execute(conn: &mut Connection, db_path: &Path, command: &str, args: &[String]) -> Result<(), AppError> {
     match command {
         "catalog" => {
@@ -1074,6 +1386,7 @@ fn execute(conn: &mut Connection, db_path: &Path, command: &str, args: &[String]
         "preset" => preset_command(conn, db_path, args),
         "dict" => dict_command(conn, args),
         "tag-rule" => tag_rule_command(conn, args),
+        "binding" => binding_command(conn, args),
         _ => Err(AppError::Other(format!("unknown command: {command}"))),
     }
 }

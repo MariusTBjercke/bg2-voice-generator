@@ -155,7 +155,7 @@ pub fn reference_sample_from_row(r: &Row<'_>) -> rusqlite::Result<ReferenceSampl
 }
 
 pub const CLONE_COLUMNS: &str =
-    "id, speaker_id, primary_sample_id, voice_profile_id, binding_source, status, render_settings_json";
+    "id, speaker_id, primary_sample_id, voice_profile_id, follow_speaker_id, binding_source, status, render_settings_json";
 
 pub fn clone_from_row(r: &Row<'_>) -> rusqlite::Result<Clone> {
     Ok(Clone {
@@ -163,9 +163,10 @@ pub fn clone_from_row(r: &Row<'_>) -> rusqlite::Result<Clone> {
         speaker_id: r.get(1)?,
         primary_sample_id: r.get(2)?,
         voice_profile_id: r.get(3)?,
-        binding_source: r.get(4)?,
-        status: r.get(5)?,
-        render_settings_json: r.get(6)?,
+        follow_speaker_id: r.get(4)?,
+        binding_source: r.get(5)?,
+        status: r.get(6)?,
+        render_settings_json: r.get(7)?,
     })
 }
 

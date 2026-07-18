@@ -89,6 +89,9 @@ function binding(speakerId: number, donorId: number, inherited: boolean): Effect
     donor_speaker_id: donorId,
     donor_display_name: donorId === 1 ? "Xzar" : "Montaron",
     inherited,
+    follow_speaker_id: null,
+    follow_display_name: null,
+    sample_voice_sex: null,
   };
 }
 

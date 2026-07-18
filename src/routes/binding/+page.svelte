@@ -35,6 +35,7 @@
     filterCache,
   } from "$lib/stores/filters";
   import {
+    findGroupByIdentityParam,
     identityHref,
     pathWithoutIdentity,
     readIdentityParam,
@@ -117,6 +118,7 @@
     audio_chunk_threshold: 30,
     seed: 42,
     peak_normalize_dbfs: -1,
+    peak_normalize_inherit: true,
   };
   type PreviewSettingsSource = "saved" | "edited";
   type PreviewSlot = {
@@ -174,6 +176,8 @@
   let tuningNotice = $state<string | null>(null);
   let savedSettings = $state<OmniVoiceRenderSettings | null>(null);
   let draftSettings = $state<OmniVoiceRenderSettings>(copySettings(DEFAULT_RENDER_SETTINGS));
+  /** Effective machine-wide peak default (`null` = off) for the Binding inherit UI. */
+  let globalPeakDefault = $state<number | null>(-1);
   let previewText = $state("A fine evening for a little adventure.");
   let previewA = $state<PreviewSlot>(freshPreviewSlot("saved", "single"));
   let previewB = $state<PreviewSlot>(freshPreviewSlot("edited", "composite"));
@@ -200,6 +204,7 @@
   let designWarning = $state<string | null>(null);
   let profilePoolPick = $state<number | "">("");
   let speakerProfilePick = $state<number | "">("");
+  let followSpeakerPick = $state<number | "">("");
   let metadataBindings = $state<MetadataBinding[]>([]);
   let loadingDemographics = $state(false);
   let demographicsLoaded = $state(false);
@@ -477,25 +482,41 @@
     return group ? identityHref("/harvest", group.identity_key) : "/harvest";
   }
 
-  /** Harvest deep-link for the clips that actually shape this speaker's voice. */
+  /** Harvest deep-link for reviewing samples for this character card.
+   * Same-sex demographic donors still deep-link to the donor's harvest clips;
+   * cross-sex donors (gender mismatch) stay on this character's sex-scoped card. */
   function reviewSamplesHref(
     group: SpeakerGroup,
     effective: EffectiveSpeakerBinding | undefined,
   ): string {
+    const ownHref = identityHref("/harvest", group.identity_key);
+    const ownSex = groupSexToken(group, speakersById);
+
+    const sameSexTarget = (target: SpeakerGroup | undefined): string | null => {
+      if (!target) return null;
+      if (ownSex && groupSexToken(target, speakersById) !== ownSex) return null;
+      return identityHref("/harvest", target.identity_key);
+    };
+
     const repId = representativeVariant(group).speaker_id;
     const sourceSpeakerId =
       effective?.donor_speaker_id != null && effective.donor_speaker_id !== repId
         ? effective.donor_speaker_id
         : null;
     if (sourceSpeakerId !== null) {
-      const donorGroup = groupForSpeaker(identityGroups, sourceSpeakerId);
-      if (donorGroup) return identityHref("/harvest", donorGroup.identity_key);
+      const donorHref = sameSexTarget(groupForSpeaker(identityGroups, sourceSpeakerId));
+      if (donorHref) return donorHref;
     }
     if (effective?.voice_profile_id != null) {
       const profile = profileById(effective.voice_profile_id);
-      if (profile?.origin === "harvested") return harvestedProfileHref(profile);
+      if (profile?.origin === "harvested" && profile.harvested_speaker_id !== null) {
+        const profileHref = sameSexTarget(
+          groupForSpeaker(identityGroups, profile.harvested_speaker_id),
+        );
+        if (profileHref) return profileHref;
+      }
     }
-    return identityHref("/harvest", group.identity_key);
+    return ownHref;
   }
 
   function profileIdentityKey(profile: VoiceProfile): string | null {
@@ -959,6 +980,7 @@
     if (!b?.clone_id) return "unbound";
     if (b.clone_status === "failed") return "failed";
     if (b.clone_status === "pending") return "pending";
+    if (b.binding_source === "follow") return "following";
     return b.inherited ? "demographic" : "personal";
   }
   // True when a speaker has a ready clone (real or fallback) yet no generatable line.
@@ -1008,6 +1030,7 @@
         value: groupCloneStatusOf,
         options: [
           { value: "personal", label: "personal override" },
+          { value: "following", label: "following character" },
           { value: "demographic", label: "demographic default" },
           { value: "pending", label: "pending" },
           { value: "failed", label: "failed" },
@@ -1174,7 +1197,7 @@
     if (readIdentityParam(page.url)) return;
     const preferredKey = selected?.identity_key ?? getInstallUiPreferences(dir).binding.selectedIdentityKey;
     if (preferredKey) {
-      const match = groups.find((group) => group.identity_key === preferredKey);
+      const match = findGroupByIdentityParam(groups, preferredKey);
       if (match && selected?.identity_key !== match.identity_key) {
         void selectGroup(match);
       } else if (!match) {
@@ -1301,10 +1324,12 @@
     tuningError = null;
     tuningNotice = null;
     try {
-      const settings = await invoke<OmniVoiceRenderSettings>("get_clone_render_settings", {
-        cloneId,
-      });
+      const [settings, peak] = await Promise.all([
+        invoke<OmniVoiceRenderSettings>("get_clone_render_settings", { cloneId }),
+        invoke<number | null>("get_peak_normalize_default", {}),
+      ]);
       if (tuningCloneId !== cloneId) return;
+      globalPeakDefault = peak;
       savedSettings = copySettings(settings);
       draftSettings = copySettings(settings);
     } catch (e) {
@@ -1328,15 +1353,39 @@
     };
   }
 
-  function setPeakNormalization(enabled: boolean) {
+  function setPeakInherit(inherit: boolean) {
     draftSettings = {
       ...draftSettings,
-      peak_normalize_dbfs: enabled ? (savedSettings?.peak_normalize_dbfs ?? -1) : null,
+      peak_normalize_inherit: inherit,
+      peak_normalize_dbfs: inherit
+        ? (globalPeakDefault ?? -1)
+        : (draftSettings.peak_normalize_dbfs ?? globalPeakDefault ?? -1),
     };
   }
 
-  function resetTuning() {
-    draftSettings = copySettings(DEFAULT_RENDER_SETTINGS);
+  function setPeakNormalization(enabled: boolean) {
+    draftSettings = {
+      ...draftSettings,
+      peak_normalize_inherit: false,
+      peak_normalize_dbfs: enabled
+        ? (draftSettings.peak_normalize_dbfs ?? savedSettings?.peak_normalize_dbfs ?? globalPeakDefault ?? -1)
+        : null,
+    };
+  }
+
+  async function resetTuning() {
+    let peak = globalPeakDefault;
+    try {
+      peak = await invoke<number | null>("get_peak_normalize_default", {});
+      globalPeakDefault = peak;
+    } catch {
+      /* keep cached global */
+    }
+    draftSettings = {
+      ...copySettings(DEFAULT_RENDER_SETTINGS),
+      peak_normalize_inherit: true,
+      peak_normalize_dbfs: peak ?? -1,
+    };
     tuningError = null;
     tuningNotice = "Defaults loaded for preview. Save tuning to apply them.";
   }
@@ -1737,6 +1786,29 @@
     }
   }
 
+  async function followSelectedCharacter() {
+    if (!dir || !selected || representativeSpeakerId === null || followSpeakerPick === "") return;
+    binding = true;
+    error = null;
+    try {
+      await invoke<EffectiveSpeakerBinding>("follow_speaker_voice", {
+        gameDir: dir,
+        speakerId: representativeSpeakerId,
+        followSpeakerId: followSpeakerPick,
+        identityKey: selected.identity_key,
+      });
+      reboundIds = new Set(reboundIds).add(representativeSpeakerId);
+      followSpeakerPick = "";
+      invalidateGeneration("metadata", "critical");
+      await Promise.all([loadClones(), loadSpeakersWithLines(), loadDemographics()]);
+    } catch (e) {
+      error = String(e);
+      await loadClones();
+    } finally {
+      binding = false;
+    }
+  }
+
   async function clearAllPools(clearGenericClones: boolean) {
     if (!dir) return;
     const detail = clearGenericClones
@@ -1812,7 +1884,7 @@
   $effect(() => {
     const deepKey = readIdentityParam(page.url);
     if (!deepKey || identityGroups.length === 0) return;
-    const match = identityGroups.find((group) => group.identity_key === deepKey);
+    const match = findGroupByIdentityParam(identityGroups, deepKey);
     if (!match) {
       void goto(pathWithoutIdentity(page.url), { replaceState: true, keepFocus: true });
       return;
@@ -2469,6 +2541,12 @@
                       <SpeakerGroupLabel group={g} />
                       {#if g.excluded}
                         <StatusBadge tone="neutral">Excluded</StatusBadge>
+                      {:else if effective?.binding_source === "follow"}
+                        <StatusBadge tone="info">Following character</StatusBadge>
+                        <span class="sub"
+                          >Voice: {effective.follow_display_name ?? "Unknown"}{#if effective.clone_status !== "ready"}
+                            {" "}(unbound){/if}</span
+                        >
                       {:else if effective?.inherited}
                         <StatusBadge tone="info">Demographic default</StatusBadge>
                         <span class="sub">Voice: {effective.voice_profile_name ?? effective.donor_display_name ?? "Unknown voice"}</span>
@@ -2574,8 +2652,15 @@
                 </p>
               {:else if effective?.clone_id}
                 <p>
-                  {effective.inherited ? "Demographic default" : "Personal override"}
-                  · {effective.voice_profile_name ?? effective.donor_display_name ?? "Unknown voice"}
+                  {#if effective.binding_source === "follow"}
+                    Following · {effective.follow_display_name ?? "Unknown"}{#if effective.clone_status !== "ready"}
+                      {" "}(unbound){/if}
+                    · {effective.voice_profile_name ?? effective.donor_display_name ?? "Unknown voice"}
+                  {:else if effective.inherited}
+                    Demographic default · {effective.voice_profile_name ?? effective.donor_display_name ?? "Unknown voice"}
+                  {:else}
+                    Personal override · {effective.voice_profile_name ?? effective.donor_display_name ?? "Unknown voice"}
+                  {/if}
                 </p>
                 {#if groupHasGenderMismatch(selected, effective, speakersById, profilesById)}
                   <p class="bind-warning">
@@ -2588,7 +2673,7 @@
                   </p>
                 {/if}
               {:else}
-                <p>Unbound — apply a demographic default or choose a personal sample.</p>
+                <p>Unbound — apply a demographic default, follow another character, or choose a personal sample.</p>
               {/if}
             </div>
             <div class="effective-actions">
@@ -2615,6 +2700,30 @@
                   Use demographic default
                 </Button>
               {/if}
+            </div>
+          </div>
+          <div class="profile-override">
+            <strong>Follow another character's voice</strong>
+            <p class="hint">
+              Live-link this character to another Binding card. Generation always uses that
+              character's current effective voice until you change it.
+            </p>
+            <div class="group-actions">
+              <select class="profile-select" bind:value={followSpeakerPick}>
+                <option value="">Choose character…</option>
+                {#each identityGroups.filter((g) => selected && g.identity_key !== selected.identity_key && !g.excluded) as g (g.identity_key)}
+                  {@const rep = repSpeakerForGroup(g)}
+                  {#if rep}
+                    <option value={rep.id}>{g.display_name}</option>
+                  {/if}
+                {/each}
+              </select>
+              <Button
+                onclick={followSelectedCharacter}
+                disabled={binding || followSpeakerPick === ""}
+              >
+                {binding ? "Binding…" : "Follow character"}
+              </Button>
             </div>
           </div>
           <div class="profile-override">
@@ -2867,9 +2976,34 @@
                       <label class="number-control">Audio chunk threshold<input type="number" min="10" max="60" step="1" bind:value={draftSettings.audio_chunk_threshold} /></label>
                       <fieldset class="control-group normalization">
                         <legend>Peak normalization</legend>
-                        <label class="check"><input type="checkbox" checked={draftSettings.peak_normalize_dbfs !== null} onchange={(event) => setPeakNormalization(event.currentTarget.checked)} />Enabled</label>
-                        {#if draftSettings.peak_normalize_dbfs !== null}
-                          <label class="number-control">Target dBFS<input type="number" min="-6" max="0" step="0.1" bind:value={draftSettings.peak_normalize_dbfs} /></label>
+                        <label class="check">
+                          <input
+                            type="radio"
+                            name={`peak-inherit-${selectedClone?.id ?? "none"}`}
+                            checked={draftSettings.peak_normalize_inherit}
+                            onchange={() => setPeakInherit(true)}
+                          />
+                          Use global
+                          {#if draftSettings.peak_normalize_inherit}
+                            <span class="peak-effective">
+                              ({globalPeakDefault === null ? "off" : `${globalPeakDefault} dBFS`})
+                            </span>
+                          {/if}
+                        </label>
+                        <label class="check">
+                          <input
+                            type="radio"
+                            name={`peak-inherit-${selectedClone?.id ?? "none"}`}
+                            checked={!draftSettings.peak_normalize_inherit}
+                            onchange={() => setPeakInherit(false)}
+                          />
+                          Override for this voice
+                        </label>
+                        {#if !draftSettings.peak_normalize_inherit}
+                          <label class="check"><input type="checkbox" checked={draftSettings.peak_normalize_dbfs !== null} onchange={(event) => setPeakNormalization(event.currentTarget.checked)} />Enabled</label>
+                          {#if draftSettings.peak_normalize_dbfs !== null}
+                            <label class="number-control">Target dBFS<input type="number" min="-6" max="0" step="0.1" bind:value={draftSettings.peak_normalize_dbfs} /></label>
+                          {/if}
                         {/if}
                       </fieldset>
                     </div>
@@ -3644,6 +3778,7 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-1);
+    flex: 1 1 auto;
     min-width: 0;
   }
   .pick-meta {
@@ -3663,8 +3798,8 @@
     display: flex;
     align-items: center;
     gap: var(--space-2);
-    flex: 0 1 auto;
-    flex-wrap: wrap;
+    flex: 0 0 auto;
+    flex-wrap: nowrap;
   }
   .overall {
     font-weight: 600;
@@ -3811,6 +3946,10 @@
   .normalization {
     background: var(--panel);
   }
+  .peak-effective {
+    color: var(--text-muted);
+    font-weight: normal;
+  }
   .advanced-checks,
   .tuning-actions {
     display: flex;
@@ -3876,11 +4015,14 @@
   }
   .reset-actions > *,
   .bulk > :global(.btn),
-  .effective-actions > :global(.btn),
-  .pick-actions > :global(.btn) {
+  .effective-actions > :global(.btn) {
     max-width: 100%;
     white-space: normal;
     overflow-wrap: anywhere;
+  }
+  .pick-actions > :global(.btn) {
+    flex: 0 0 auto;
+    white-space: nowrap;
   }
   .speaker :global(.badge),
   .head :global(.badge) {

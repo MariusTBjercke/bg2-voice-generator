@@ -27,29 +27,27 @@ pub fn list_export_candidates(
     conn: &Connection,
     project_id: i64,
 ) -> Result<Vec<Candidate>, AppError> {
-    let mut stmt = conn.prepare(
-        "SELECT l.id, l.strref, l.text, l.original_text, l.kind, l.is_voiced, l.has_tokens, l.speaker_id, \
+    let sql = format!(
+        "{cte} \
+         SELECT l.id, l.strref, l.text, l.original_text, l.kind, l.is_voiced, l.has_tokens, l.speaker_id, \
                 l.shared_group_id, l.existing_sound_resref, g.output_path, \
                 COALESCE(s.cre_resref, ''), \
                 COALESCE(g.binding_source_snapshot, c.binding_source, 'default'), \
                 COALESCE(grp.resolution, 'reuse_same_voice'), \
-                CASE WHEN c.id IS NULL OR c.status != 'ready' \
-                       OR g.render_settings_hash IS NULL \
-                       OR (c.voice_profile_id IS NOT NULL AND \
-                           NOT (g.voice_profile_id_snapshot IS c.voice_profile_id)) \
-                       OR (c.voice_profile_id IS NULL AND (g.reference_sample_id IS NULL \
-                           OR c.primary_sample_id IS NULL \
-                           OR g.reference_sample_id != c.primary_sample_id)) \
-                     THEN 1 ELSE 0 END, \
+                {voice_changed}, \
                 COALESCE(s.excluded, 0) \
          FROM generation g \
          JOIN line l ON l.id = g.line_id \
          LEFT JOIN speaker s ON s.id = l.speaker_id \
          LEFT JOIN clone c ON c.speaker_id = l.speaker_id \
+         LEFT JOIN resolved_voice rv ON rv.origin_speaker_id = l.speaker_id \
          LEFT JOIN shared_strref_group grp ON grp.id = l.shared_group_id \
          WHERE l.project_id = ?1 AND g.status = 'done' \
          ORDER BY l.strref",
-    )?;
+        cte = crate::db::follow_binding::RESOLVED_VOICE_CTE,
+        voice_changed = crate::db::follow_binding::VOICE_CHANGED_CASE,
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![project_id], |r| {
         let kind: LineKind = r.get(4)?;
         let output_path: Option<String> = r.get(10)?;

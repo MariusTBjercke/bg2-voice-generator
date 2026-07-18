@@ -188,8 +188,9 @@ pub struct BindCloneResult {
 /// Bind (or rebind) a speaker's voice clone from its approved reference clip.
 /// With `sample_id` the named approved sample is bound as an explicit `override`;
 /// without it the best approved sample in the group is bound as the factual `default`.
-/// When `identity_key` is set, the clone is attached to the sample owner and
-/// propagated to every variant in that display group (same as `auto_bind_all`).
+/// When `identity_key` is set (Binding card "Bind this"), the clone is attached to the
+/// sample owner and propagated to every same-sex variant on that display card — intentional
+/// human group bind. `auto_bind_all` stays per-CRE for non-companion display groups.
 #[tauri::command]
 pub async fn bind_clone(
     state: State<'_, AppState>,
@@ -262,19 +263,42 @@ pub async fn bind_clone(
         params![speaker_id],
         |row| row.get(0),
     )?;
-    let profile_id = crate::db::voice_profiles::ensure_harvested_profile(
-        &conn, project_id, &[sample_id],
-    )?;
+    apply_explicit_bind(
+        &conn,
+        project_id,
+        speaker_id,
+        sample_id,
+        source,
+        display_identity_key.as_deref(),
+        Path::new(&derivative),
+        validated.duration_secs,
+        duration_warning,
+    )
+}
+
+/// Persist an explicit Binding bind after the reference file has been validated.
+///
+/// When `display_identity_key` is set, Ready fans out to every CRE on that card
+/// (including non-companions). `auto_bind_all` keeps its own companion-only gate.
+fn apply_explicit_bind(
+    conn: &rusqlite::Connection,
+    project_id: i64,
+    speaker_id: i64,
+    sample_id: i64,
+    source: BindingSource,
+    display_identity_key: Option<&str>,
+    derivative: &Path,
+    duration_secs: f32,
+    duration_warning: Option<String>,
+) -> Result<BindCloneResult, AppError> {
+    let profile_id =
+        crate::db::voice_profiles::ensure_harvested_profile(conn, project_id, &[sample_id])?;
     crate::db::voice_profiles::bind_profile_to_group(
-        &conn, project_id, speaker_id, profile_id, source,
+        conn, project_id, speaker_id, profile_id, source,
     )?;
-    // Display groups (same long-name strref) list every variant's samples as
-    // interchangeable picks. Operational identity keeps non-companion CREs
-    // separate, so bind_profile_to_group alone only updates the sample owner —
-    // propagate so Binding's representative clone / bound badge stay in sync.
-    if let Some(ref key) = display_identity_key {
+    if let Some(key) = display_identity_key {
         crate::db::speaker_groups::propagate_clone_to_identity_key(
-            &conn,
+            conn,
             project_id,
             key,
             speaker_id,
@@ -284,17 +308,17 @@ pub async fn bind_clone(
         )?;
     }
     crate::generator::metadata_binding::refresh_generic_clones_for_donor(
-        &conn,
+        conn,
         project_id,
         speaker_id,
         sample_id,
-        Path::new(&derivative),
+        derivative,
     )?;
-    let clone = clone_for_speaker(&conn, speaker_id)?
+    let clone = clone_for_speaker(conn, speaker_id)?
         .ok_or_else(|| AppError::Other("clone vanished after upsert".into()))?;
     Ok(BindCloneResult {
         clone,
-        reference_duration_secs: validated.duration_secs,
+        reference_duration_secs: duration_secs,
         duration_warning,
     })
 }
@@ -335,6 +359,9 @@ pub async fn auto_bind_all(
     let Some(project_id) = project_id else {
         return Ok(AutoBindResult::default());
     };
+    // Soften cross-identity automatic samples before choosing a bind target.
+    // Does not clear existing Ready clones — those stay until the group is rebound.
+    let _ = crate::db::harvest::demote_cross_identity_automatic_samples(&conn, project_id)?;
     let mut result = AutoBindResult::default();
     let display_groups = crate::db::speaker_groups::list_speaker_groups(&conn, project_id)?;
     for group in display_groups {
@@ -348,98 +375,144 @@ pub async fn auto_bind_all(
             project_id,
             &identity_key,
         )?;
-        let member_count = member_ids.len();
+        let shares_voice =
+            crate::db::binding_audit::display_group_shares_voice(&conn, project_id, &identity_key)?;
 
-        // Preserve a deliberate per-speaker override. One override can safely become
-        // the companion's shared voice; conflicting overrides require human choice.
-        let mut override_samples = std::collections::BTreeSet::new();
-        for member_id in &member_ids {
-            if let Some(existing) = clone_for_speaker(&conn, *member_id)? {
-                if existing.status == CloneStatus::Ready
-                    && existing.binding_source == BindingSource::Override
-                {
-                    if let Some(sample_id) = existing.primary_sample_id {
-                        override_samples.insert(sample_id);
-                    }
-                }
-            }
-        }
-        if override_samples.len() > 1 {
-            result.speakers_skipped += member_count;
-            continue;
-        }
-
-        let chosen = if let Some(sample_id) = override_samples.iter().next().copied() {
-            conn.query_row(
-                "SELECT speaker_id, id, local_derivative_path FROM reference_sample \
-                 WHERE id=?1 AND decision='approved' AND local_derivative_path IS NOT NULL",
-                params![sample_id],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
-            )
-            .optional()?
-            .map(|(owner, sample, path)| (owner, sample, path, BindingSource::Override))
-        } else {
-            crate::db::speaker_groups::best_approved_sample_in_group(
-                &conn,
-                project_id,
-                &identity_key,
-            )?
-            .map(|(owner, sample, path)| (owner, sample, path, BindingSource::Default))
-        };
-        let Some((owner_speaker_id, sample_id, derivative, source)) = chosen else {
-            continue;
-        };
-
-        let mut already_consistent = true;
-        let mut shared_profile: Option<Option<i64>> = None;
-        for member_id in &member_ids {
-            let Some(existing) = clone_for_speaker(&conn, *member_id)? else {
-                already_consistent = false;
-                break;
-            };
-            if existing.status != CloneStatus::Ready
-                || existing.binding_source == BindingSource::Generic
-                || existing.primary_sample_id != Some(sample_id)
-            {
-                already_consistent = false;
-                break;
-            }
-            match shared_profile {
-                None => shared_profile = Some(existing.voice_profile_id),
-                Some(profile) if profile != existing.voice_profile_id => {
-                    already_consistent = false;
-                    break;
-                }
-                Some(_) => {}
-            }
-        }
-        if already_consistent {
-            result.speakers_skipped += member_count;
-            continue;
-        }
-
-        let clone_id = upsert_clone(&conn, owner_speaker_id, sample_id, source)?;
-        match validate_file(Path::new(&derivative)) {
-            Ok(_) => {
-                set_clone_status(&conn, clone_id, CloneStatus::Ready)?;
-                crate::db::speaker_groups::propagate_clone_to_identity_key(
+        // Non-companion display groups bind per CRE — never fan one clip across
+        // crowd-name variants (Boy, Guard, …).
+        if !shares_voice {
+            for member_id in member_ids {
+                let member_key = format!("ungrouped:{member_id}");
+                match auto_bind_one_group(
                     &conn,
                     project_id,
-                    &identity_key,
+                    &member_key,
+                    &[member_id],
+                    false,
+                )? {
+                    AutoBindOutcome::Bound => result.speakers_bound += 1,
+                    AutoBindOutcome::Skipped => result.speakers_skipped += 1,
+                    AutoBindOutcome::Failed => result.speakers_failed += 1,
+                    AutoBindOutcome::None => {}
+                }
+            }
+            continue;
+        }
+
+        let member_count = member_ids.len();
+        match auto_bind_one_group(&conn, project_id, &identity_key, &member_ids, true)? {
+            AutoBindOutcome::Bound => result.speakers_bound += member_count,
+            AutoBindOutcome::Skipped => result.speakers_skipped += member_count,
+            AutoBindOutcome::Failed => result.speakers_failed += member_count,
+            AutoBindOutcome::None => {}
+        }
+    }
+    Ok(result)
+}
+
+enum AutoBindOutcome {
+    Bound,
+    Skipped,
+    Failed,
+    None,
+}
+
+fn auto_bind_one_group(
+    conn: &rusqlite::Connection,
+    project_id: i64,
+    identity_key: &str,
+    member_ids: &[i64],
+    propagate: bool,
+) -> Result<AutoBindOutcome, AppError> {
+    let member_count = member_ids.len();
+    if member_count == 0 {
+        return Ok(AutoBindOutcome::None);
+    }
+
+    // Preserve a deliberate per-speaker override. One override can safely become
+    // the companion's shared voice; conflicting overrides require human choice.
+    let mut override_samples = std::collections::BTreeSet::new();
+    for member_id in member_ids {
+        if let Some(existing) = clone_for_speaker(conn, *member_id)? {
+            if existing.status == CloneStatus::Ready
+                && existing.binding_source == BindingSource::Override
+            {
+                if let Some(sample_id) = existing.primary_sample_id {
+                    override_samples.insert(sample_id);
+                }
+            }
+        }
+    }
+    if override_samples.len() > 1 {
+        return Ok(AutoBindOutcome::Skipped);
+    }
+
+    let chosen = if let Some(sample_id) = override_samples.iter().next().copied() {
+        conn.query_row(
+            "SELECT speaker_id, id, local_derivative_path FROM reference_sample \
+             WHERE id=?1 AND decision='approved' AND local_derivative_path IS NOT NULL",
+            params![sample_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
+        )
+        .optional()?
+        .map(|(owner, sample, path)| (owner, sample, path, BindingSource::Override))
+    } else {
+        crate::db::speaker_groups::best_approved_sample_in_group(conn, project_id, identity_key)?
+            .map(|(owner, sample, path)| (owner, sample, path, BindingSource::Default))
+    };
+    let Some((owner_speaker_id, sample_id, derivative, source)) = chosen else {
+        return Ok(AutoBindOutcome::None);
+    };
+
+    let mut already_consistent = true;
+    let mut shared_profile: Option<Option<i64>> = None;
+    for member_id in member_ids {
+        let Some(existing) = clone_for_speaker(conn, *member_id)? else {
+            already_consistent = false;
+            break;
+        };
+        if existing.status != CloneStatus::Ready
+            || existing.binding_source == BindingSource::Generic
+            || existing.primary_sample_id != Some(sample_id)
+        {
+            already_consistent = false;
+            break;
+        }
+        match shared_profile {
+            None => shared_profile = Some(existing.voice_profile_id),
+            Some(profile) if profile != existing.voice_profile_id => {
+                already_consistent = false;
+                break;
+            }
+            Some(_) => {}
+        }
+    }
+    if already_consistent {
+        return Ok(AutoBindOutcome::Skipped);
+    }
+
+    let clone_id = upsert_clone(conn, owner_speaker_id, sample_id, source)?;
+    match validate_file(Path::new(&derivative)) {
+        Ok(_) => {
+            set_clone_status(conn, clone_id, CloneStatus::Ready)?;
+            if propagate {
+                crate::db::speaker_groups::propagate_clone_to_identity_key(
+                    conn,
+                    project_id,
+                    identity_key,
                     owner_speaker_id,
                     sample_id,
                     source,
                     CloneStatus::Ready,
                 )?;
-                result.speakers_bound += member_count;
             }
-            Err(_) => {
-                set_clone_status(&conn, clone_id, CloneStatus::Failed)?;
-                result.speakers_failed += member_count;
-            }
+            Ok(AutoBindOutcome::Bound)
+        }
+        Err(_) => {
+            set_clone_status(conn, clone_id, CloneStatus::Failed)?;
+            Ok(AutoBindOutcome::Failed)
         }
     }
-    Ok(result)
 }
 
 /// Compatibility command retained for older frontends. Display-name groups no
@@ -593,7 +666,9 @@ pub async fn list_clones(
     }).await
 }
 
-/// Read one clone's validated, default-resolved OmniVoice settings.
+/// Read one clone's validated OmniVoice settings. When the clone inherits the
+/// machine-wide peak default, `peak_normalize_dbfs` is filled with the effective
+/// global value while `peak_normalize_inherit` stays true for the Binding UI.
 #[tauri::command]
 pub async fn get_clone_render_settings(
     state: State<'_, AppState>,
@@ -602,7 +677,12 @@ pub async fn get_clone_render_settings(
     let conn = state.db.lock().await;
     let clone = clone_by_id(&conn, clone_id)?
         .ok_or_else(|| AppError::Other(format!("no clone with id {clone_id}")))?;
-    render_settings_for_clone(&clone)
+    let mut settings = render_settings_for_clone(&clone)?;
+    if settings.peak_normalize_inherit {
+        settings.peak_normalize_dbfs =
+            crate::commands::settings::read_peak_normalize_default(&conn)?;
+    }
+    Ok(settings)
 }
 
 /// Save clone settings and soft-invalidate only generations rendered with that
@@ -613,6 +693,12 @@ pub async fn set_clone_render_settings(
     clone_id: i64,
     settings: OmniVoiceRenderSettings,
 ) -> Result<CloneRenderSettingsUpdate, AppError> {
+    // Canonicalize inherited peak so UI display of the global value does not
+    // dirty-compare against the stored placeholder and soft-invalidate for free.
+    let mut settings = settings;
+    if settings.peak_normalize_inherit {
+        settings.peak_normalize_dbfs = Some(-1.0);
+    }
     let change = {
         let mut conn = state.db.lock().await;
         let _: i64 = conn
@@ -730,25 +816,36 @@ pub async fn preview_clone_voice(
             "sample_id is only valid for a single-reference preview".into(),
         ));
     }
-    let settings_fingerprint = settings.fingerprint().map_err(AppError::Other)?;
-    let resolved = {
+    let (settings, resolved) = {
         let conn = state.db.lock().await;
+        let global = crate::commands::settings::read_peak_normalize_default(&conn)?;
+        let settings = settings.with_resolved_peak(global);
+        settings.validate().map_err(AppError::Other)?;
         let clone = clone_by_id(&conn, clone_id)?
             .ok_or_else(|| AppError::Other(format!("no clone with id {clone_id}")))?;
+        if clone.status != CloneStatus::Ready
+            || (clone.voice_profile_id.is_none() && clone.primary_sample_id.is_none())
+        {
+            return Err(AppError::Other(
+                "clone is not ready — bind an approved sample first".into(),
+            ));
+        }
         let project_id: i64 = conn.query_row(
             "SELECT project_id FROM speaker WHERE id=?1",
             [clone.speaker_id],
             |row| row.get(0),
         )?;
         let workspace = workspace_dir(&state.db_path, project_id);
-        resolve_binding_preview_reference(
+        let resolved = resolve_binding_preview_reference(
             &conn,
             &clone,
             &workspace,
             reference,
             sample_id,
-        )?
+        )?;
+        (settings, resolved)
     };
+    let settings_fingerprint = settings.fingerprint().map_err(AppError::Other)?;
 
     configure_engine_device(&state).await?;
     let health = state.omnivoice.ensure_ready().await?;
@@ -1143,7 +1240,7 @@ pub async fn accept_render_candidate(
         let generation = get_or_create_generation(&conn, line_id, job.clone_id)?;
         let state_json = serde_json::json!({"accepted_candidate": true, "candidate_state": candidate.state_json}).to_string();
         mark_done(&conn, generation.id, job.clone_id, job.reference_sample_id, job.binding_source,
-            &final_path.to_string_lossy(), &state_json, &job.render_settings, &job.reference_fingerprint)
+            &final_path.to_string_lossy(), &state_json, &job.render_settings, &job.reference_fingerprint, job.voice_profile_id)
             .and_then(|_| {
                 if let Some(value) = serde_json::from_str::<serde_json::Value>(&candidate.state_json).ok().and_then(|v| v.get("diagnostics").cloned()) {
                     let diagnostics = serde_json::from_value(value)?;
@@ -1183,7 +1280,7 @@ fn clone_settings_for_line(conn: &rusqlite::Connection, line_id: i64) -> Result<
     let speaker_id: Option<i64> = conn.query_row("SELECT speaker_id FROM line WHERE id=?1", [line_id], |r| r.get(0)).optional()?.flatten();
     let speaker_id = speaker_id.ok_or_else(|| AppError::Other(format!("line {line_id} has no attributed speaker")))?;
     let clone = clone_for_speaker(conn, speaker_id)?.ok_or_else(|| AppError::Other(format!("speaker {speaker_id} has no bound clone")))?;
-    render_settings_for_clone(&clone)
+    crate::db::generation::resolved_render_settings_for_clone(conn, &clone)
 }
 
 fn remove_if_expected(stored: Option<&str>, expected: &Path) {
@@ -1541,6 +1638,7 @@ async fn apply_batch_outcomes(
                 &state_json,
                 &job.render_settings,
                 &job.reference_fingerprint,
+                job.voice_profile_id,
             )?;
             record_outcome(
                 result,
@@ -1840,23 +1938,36 @@ fn resolve_job(
         )));
     }
 
-    let clone = clone_for_speaker(conn, speaker_id)?.ok_or_else(|| {
+    let local_clone = clone_for_speaker(conn, speaker_id)?.ok_or_else(|| {
         AppError::Other(format!("speaker {speaker_id} has no bound clone; bind it first"))
     })?;
-    if clone.status != CloneStatus::Ready {
+    if local_clone.status != CloneStatus::Ready {
         return Err(AppError::Other(format!(
             "clone for speaker {speaker_id} is not ready ({:?})",
-            clone.status
+            local_clone.status
         )));
     }
 
+    let voice_clone = if local_clone.binding_source == BindingSource::Follow {
+        let resolved = crate::db::follow_binding::resolve_effective_clone(conn, speaker_id)?;
+        if resolved.status != CloneStatus::Ready {
+            return Err(AppError::Other(format!(
+                "followed speaker {} has no ready voice",
+                local_clone.follow_speaker_id.unwrap_or_default()
+            )));
+        }
+        resolved
+    } else {
+        local_clone.clone()
+    };
+
     let workspace = workspace_dir(db_path, project_id);
-    let resolved_reference = if let Some(profile_id) = clone.voice_profile_id {
+    let resolved_reference = if let Some(profile_id) = voice_clone.voice_profile_id {
         crate::db::voice_profiles::resolve_for_generation(conn, profile_id, &workspace)?
     } else {
         crate::generator::reference::resolve_for_generation(
             conn,
-            &clone,
+            &voice_clone,
             &workspace,
             |sample_id| reference_of(conn, sample_id),
         )?
@@ -1869,20 +1980,22 @@ fn resolve_job(
         )));
     }
 
-    // Precedence is application defaults (inside clone deserialization) -> clone
+    // Precedence is machine-wide peak default (when inheriting) -> clone
     // settings -> sparse line override. Unlike synthesis text, this is line-ID
-    // scoped, so same-text siblings remain isolated.
-    let clone_settings = render_settings_for_clone(&clone)?;
+    // scoped, so same-text siblings remain isolated. Follow bindings keep the
+    // follower's own tuning; only the voice sample/profile comes from the target.
+    let clone_settings =
+        crate::db::generation::resolved_render_settings_for_clone(conn, &local_clone)?;
     let render_settings = line_render_override_for(conn, line_id, &clone_settings)?
         .map(|state| state.resolved_settings)
         .unwrap_or(clone_settings);
     let render_settings_fingerprint = render_settings.fingerprint().map_err(AppError::Other)?;
     let job = LineJob {
         line_id,
-        clone_id: clone.id,
-        voice_profile_id: clone.voice_profile_id,
+        clone_id: local_clone.id,
+        voice_profile_id: voice_clone.voice_profile_id,
         reference_sample_id: resolved_reference.primary_sample_id,
-        binding_source: clone.binding_source,
+        binding_source: local_clone.binding_source,
         text: spoken,
         reference_path: resolved_reference.path,
         reference_text: resolved_reference.transcript,
@@ -1908,12 +2021,17 @@ fn reference_of(
     conn: &rusqlite::Connection,
     sample_id: i64,
 ) -> Result<(String, String), AppError> {
-    let (path, source_strref, provenance_json): (Option<String>, Option<i64>, String) = conn.query_row(
-        "SELECT local_derivative_path, source_strref, provenance_json \
-         FROM reference_sample WHERE id = ?1",
-        params![sample_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )?;
+    let row: Option<(Option<String>, Option<i64>, String)> = conn
+        .query_row(
+            "SELECT local_derivative_path, source_strref, provenance_json \
+             FROM reference_sample WHERE id = ?1",
+            params![sample_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let (path, source_strref, provenance_json) = row.ok_or_else(|| {
+        AppError::Other(format!("reference sample {sample_id} not found"))
+    })?;
     let path = path.ok_or_else(|| {
         AppError::Other(format!("reference sample {sample_id} has no local derivative"))
     })?;
@@ -2362,5 +2480,103 @@ mod tests {
             .and_then(|value| value.to_str())
             .unwrap()
             .starts_with("bg2-voice-generator-preview-"));
+    }
+
+    #[test]
+    fn explicit_identity_key_bind_propagates_to_non_companion_display_group() {
+        use crate::audio::wav::build_pcm_wav;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("oghma01.wav");
+        let samples: Vec<i16> = (0..REFERENCE_SAMPLE_RATE).map(|_| 8_000).collect();
+        std::fs::write(&wav, build_pcm_wav(REFERENCE_SAMPLE_RATE, &samples)).unwrap();
+
+        let conn = mem_db();
+        let pid = insert_project(&conn);
+        // Priest of Oghma-style crowd: same long-name strref, no companion proof.
+        for cre in ["oghma1", "oghma2", "oghma3"] {
+            conn.execute(
+                "INSERT INTO speaker (project_id, cre_resref, display_name, long_name_strref, sex, provenance_json) \
+                 VALUES (?1, ?2, 'Priest of Oghma', 4242, 1, '{}')",
+                params![pid, cre],
+            )
+            .unwrap();
+        }
+        let owner: i64 = conn
+            .query_row(
+                "SELECT id FROM speaker WHERE cre_resref='oghma2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let sibling: i64 = conn
+            .query_row(
+                "SELECT id FROM speaker WHERE cre_resref='oghma1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Pending shells left after a rejected sample (rep still pending).
+        for sid in [owner, sibling] {
+            conn.execute(
+                "INSERT INTO clone (speaker_id, primary_sample_id, binding_source, status) \
+                 VALUES (?1, NULL, 'default', 'pending')",
+                params![sid],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO reference_sample (speaker_id, decision, local_derivative_path, provenance_json, scores_json) \
+             VALUES (?1, 'approved', ?2, '{}', '{}')",
+            params![owner, wav.to_string_lossy()],
+        )
+        .unwrap();
+        let sample_id = conn.last_insert_rowid();
+
+        let identity_key = "4242:1";
+        assert!(
+            !crate::db::binding_audit::display_group_shares_voice(&conn, pid, identity_key)
+                .unwrap(),
+            "crowd names must not auto-share voice"
+        );
+
+        let validated = validate_file(&wav).unwrap();
+        let result = apply_explicit_bind(
+            &conn,
+            pid,
+            owner,
+            sample_id,
+            BindingSource::Override,
+            Some(identity_key),
+            &wav,
+            validated.duration_secs,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.clone.status, CloneStatus::Ready);
+        assert_eq!(result.clone.primary_sample_id, Some(sample_id));
+
+        for cre in ["oghma1", "oghma2", "oghma3"] {
+            let sid: i64 = conn
+                .query_row(
+                    "SELECT id FROM speaker WHERE cre_resref=?1",
+                    params![cre],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let clone = clone_for_speaker(&conn, sid).unwrap().unwrap();
+            assert_eq!(clone.status, CloneStatus::Ready, "{cre} should be Ready");
+            assert_eq!(clone.primary_sample_id, Some(sample_id));
+        }
+    }
+
+    #[test]
+    fn reference_of_reports_missing_sample_clearly() {
+        let conn = mem_db();
+        let err = reference_of(&conn, 999_999).unwrap_err().to_string();
+        assert!(
+            err.contains("reference sample 999999 not found"),
+            "got: {err}"
+        );
     }
 }

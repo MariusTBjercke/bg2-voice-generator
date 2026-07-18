@@ -66,6 +66,9 @@ function binding(
     donor_speaker_id: null,
     donor_display_name: null,
     inherited: true,
+    follow_speaker_id: null,
+    follow_display_name: null,
+    sample_voice_sex: null,
     ...partial,
   };
 }
@@ -121,6 +124,36 @@ describe("boundVoiceSexToken", () => {
       {},
     );
     expect(token).toBe("male");
+  });
+
+  it("uses sample_voice_sex when the bound clip's sound belongs to another sex", () => {
+    const speakers = { 1: speaker({ id: 1, sex: 1 }) };
+    const token = boundVoiceSexToken(
+      binding({
+        speaker_id: 1,
+        donor_speaker_id: 1,
+        sample_voice_sex: 2,
+        binding_source: "override",
+        inherited: false,
+      }),
+      speakers,
+      {},
+    );
+    expect(token).toBe("female");
+    expect(
+      groupHasGenderMismatch(
+        group(1),
+        binding({
+          speaker_id: 1,
+          donor_speaker_id: 1,
+          sample_voice_sex: 2,
+          binding_source: "override",
+          inherited: false,
+        }),
+        speakers,
+        {},
+      ),
+    ).toBe(true);
   });
 
   it("prefers designed profile gender over donor when origin is designed", () => {

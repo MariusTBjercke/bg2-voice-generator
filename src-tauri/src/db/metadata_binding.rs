@@ -456,7 +456,7 @@ pub fn clear_speaker_clones(
 ) -> Result<usize, AppError> {
     let source_predicate = match scope {
         "generic" => "c.binding_source = 'generic'",
-        "manual" => "c.binding_source IN ('default', 'override')",
+        "manual" => "c.binding_source IN ('default', 'override', 'follow')",
         "all" => "1 = 1",
         _ => return Err(AppError::Other(format!("unknown clone clear scope {scope:?}"))),
     };
@@ -487,7 +487,7 @@ pub fn metadata_apply_targets(
            AND s.excluded = 0 \
            AND NOT EXISTS ( \
                SELECT 1 FROM clone c WHERE c.speaker_id = s.id \
-                 AND c.binding_source IN ('default', 'override')) \
+                 AND c.binding_source IN ('default', 'override', 'follow')) \
          ORDER BY s.id";
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt

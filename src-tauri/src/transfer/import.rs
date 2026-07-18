@@ -354,8 +354,9 @@ fn insert_clones(
     profile_ids: &HashMap<String, i64>,
 ) -> Result<i64, AppError> {
     let mut stmt = tx.prepare(
-        "INSERT INTO clone (speaker_id, primary_sample_id,voice_profile_id, binding_source, status, \
-             render_settings_json) VALUES (?1, NULL, ?2, ?3, 'pending', ?4)",
+        "INSERT INTO clone (speaker_id, primary_sample_id, voice_profile_id, follow_speaker_id, \
+             binding_source, status, render_settings_json) \
+         VALUES (?1, NULL, ?2, ?3, ?4, 'pending', ?5)",
     )?;
     let mut count = 0i64;
     for c in &bundle.clones {
@@ -365,7 +366,28 @@ fn insert_clones(
         c.render_settings.validate().map_err(AppError::Other)?;
         let render_settings_json = serde_json::to_string(&c.render_settings)?;
         let profile_id = c.voice_profile_key.as_ref().and_then(|key| profile_ids.get(key)).copied();
-        stmt.execute(params![sid,profile_id, c.binding_source, render_settings_json])?;
+        let follow_id = c
+            .follow_speaker_cre_resref
+            .as_ref()
+            .and_then(|cre| speaker_ids.get(cre))
+            .copied();
+        // Drop follow edges whose target CRE is missing on the destination project.
+        let (binding_source, follow_id) = if c.binding_source == "follow" {
+            if follow_id.is_some() {
+                (c.binding_source.as_str(), follow_id)
+            } else {
+                continue;
+            }
+        } else {
+            (c.binding_source.as_str(), None)
+        };
+        stmt.execute(params![
+            sid,
+            profile_id,
+            follow_id,
+            binding_source,
+            render_settings_json
+        ])?;
         let clone_id = tx.last_insert_rowid();
         let project_id: i64 = tx.query_row(
             "SELECT project_id FROM speaker WHERE id=?1",

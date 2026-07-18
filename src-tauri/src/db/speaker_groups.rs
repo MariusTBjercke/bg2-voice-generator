@@ -2,6 +2,10 @@
 //!
 //! The UI may collect same-name CRE rows for review, but voice decisions only cross
 //! variants when Attribution recorded stronger companion/side-dialogue evidence.
+//!
+//! Display groups further split by CRE sex (`{strref}:{sex}`) so mixed-sex crowds that
+//! share a TLK name (Beggar, Guard, Slave, …) get separate Binding cards and do not
+//! inherit each other's harvested voice.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -10,11 +14,23 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::error::AppError;
 use crate::models::{BindingSource, CloneStatus, ReconcileGroupBindingsResult, SpeakerGroup, SpeakerVariant};
 
-/// User-facing identity key for a speaker row.
-pub fn identity_key(long_name_strref: Option<i64>, speaker_id: i64) -> String {
+/// User-facing display identity key for a speaker row.
+///
+/// Named CREs bucket by `(long_name_strref, sex)` so male and female variants of the
+/// same crowd name stay separate. Speakers without a long name stay singletons.
+pub fn identity_key(long_name_strref: Option<i64>, sex: i64, speaker_id: i64) -> String {
     match long_name_strref {
-        Some(s) => s.to_string(),
+        Some(s) => format!("{s}:{sex}"),
         None => format!("ungrouped:{speaker_id}"),
+    }
+}
+
+/// Sex glyph for disambiguating same-name display groups (♂ / ♀).
+fn sex_glyph(sex: i64) -> &'static str {
+    match sex {
+        1 => "♂",
+        2 => "♀",
+        _ => "?",
     }
 }
 
@@ -40,18 +56,54 @@ mod player_identity_tests {
     }
 }
 
-/// Parse an identity key back into `(long_name_strref, optional singleton speaker_id)`.
-pub fn parse_identity_key(key: &str) -> Result<(Option<i64>, Option<i64>), AppError> {
+/// Parsed identity key: ungrouped singleton, or named strref with optional sex filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedIdentityKey {
+    pub long_name_strref: Option<i64>,
+    /// When set, only members with this CRE sex byte. `None` means all sexes
+    /// (companion operational keys and legacy plain-strref keys).
+    pub sex: Option<i64>,
+    pub singleton_speaker_id: Option<i64>,
+}
+
+/// Parse an identity key back into strref / optional sex / optional singleton id.
+///
+/// Accepted forms:
+/// - `ungrouped:{speaker_id}` — singleton
+/// - `{strref}:{sex}` — display group (sex-scoped)
+/// - `{strref}` — all sexes for that name (companion operational + legacy deep links)
+pub fn parse_identity_key(key: &str) -> Result<ParsedIdentityKey, AppError> {
     if let Some(rest) = key.strip_prefix("ungrouped:") {
         let id = rest
             .parse::<i64>()
             .map_err(|_| AppError::Other(format!("invalid identity key {key:?}")))?;
-        return Ok((None, Some(id)));
+        return Ok(ParsedIdentityKey {
+            long_name_strref: None,
+            sex: None,
+            singleton_speaker_id: Some(id),
+        });
+    }
+    if let Some((strref_s, sex_s)) = key.split_once(':') {
+        let strref = strref_s
+            .parse::<i64>()
+            .map_err(|_| AppError::Other(format!("invalid identity key {key:?}")))?;
+        let sex = sex_s
+            .parse::<i64>()
+            .map_err(|_| AppError::Other(format!("invalid identity key {key:?}")))?;
+        return Ok(ParsedIdentityKey {
+            long_name_strref: Some(strref),
+            sex: Some(sex),
+            singleton_speaker_id: None,
+        });
     }
     let strref = key
         .parse::<i64>()
         .map_err(|_| AppError::Other(format!("invalid identity key {key:?}")))?;
-    Ok((Some(strref), None))
+    Ok(ParsedIdentityKey {
+        long_name_strref: Some(strref),
+        sex: None,
+        singleton_speaker_id: None,
+    })
 }
 
 /// All `speaker_id` values in one identity group for `project_id`.
@@ -60,9 +112,9 @@ pub fn speaker_ids_in_group(
     project_id: i64,
     identity_key: &str,
 ) -> Result<Vec<i64>, AppError> {
-    let (strref, singleton) = parse_identity_key(identity_key)?;
+    let parsed = parse_identity_key(identity_key)?;
     let mut out = Vec::new();
-    if let Some(sid) = singleton {
+    if let Some(sid) = parsed.singleton_speaker_id {
         let exists: Option<i64> = conn
             .query_row(
                 "SELECT id FROM speaker WHERE project_id=?1 AND id=?2",
@@ -75,14 +127,24 @@ pub fn speaker_ids_in_group(
         }
         return Ok(out);
     }
-    let Some(strref) = strref else {
+    let Some(strref) = parsed.long_name_strref else {
         return Ok(out);
     };
-    let mut stmt = conn.prepare(
-        "SELECT id FROM speaker WHERE project_id=?1 AND long_name_strref=?2 ORDER BY id",
-    )?;
-    for row in stmt.query_map(params![project_id, strref], |r| r.get(0))? {
-        out.push(row?);
+    if let Some(sex) = parsed.sex {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM speaker WHERE project_id=?1 AND long_name_strref=?2 AND sex=?3 \
+             ORDER BY id",
+        )?;
+        for row in stmt.query_map(params![project_id, strref, sex], |r| r.get(0))? {
+            out.push(row?);
+        }
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM speaker WHERE project_id=?1 AND long_name_strref=?2 ORDER BY id",
+        )?;
+        for row in stmt.query_map(params![project_id, strref], |r| r.get(0))? {
+            out.push(row?);
+        }
     }
     Ok(out)
 }
@@ -140,17 +202,17 @@ pub fn identity_key_for_speaker(conn: &Connection, speaker_id: i64) -> Result<St
     Ok(format!("ungrouped:{exists}"))
 }
 
-/// UI display-group key for one speaker (same long-name strref merges variants).
+/// UI display-group key for one speaker (same long-name strref + sex merges variants).
 pub fn display_identity_key_for_speaker(
     conn: &Connection,
     speaker_id: i64,
 ) -> Result<String, AppError> {
-    let (id, long_name_strref): (i64, Option<i64>) = conn.query_row(
-        "SELECT id, long_name_strref FROM speaker WHERE id=?1",
+    let (id, long_name_strref, sex): (i64, Option<i64>, i64) = conn.query_row(
+        "SELECT id, long_name_strref, sex FROM speaker WHERE id=?1",
         params![speaker_id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
-    Ok(identity_key(long_name_strref, id))
+    Ok(identity_key(long_name_strref, sex, id))
 }
 
 /// List every user-facing speaker group for a project.
@@ -194,7 +256,7 @@ pub fn list_speaker_groups(conn: &Connection, project_id: i64) -> Result<Vec<Spe
              SELECT speaker_id, COUNT(*) AS sample_count FROM reference_sample \
              GROUP BY speaker_id \
          ), speaker_rows AS ( \
-             SELECT s.id, s.cre_resref, s.display_name, s.long_name_strref, \
+             SELECT s.id, s.cre_resref, s.display_name, s.long_name_strref, s.sex, \
                     COALESCE(lc.line_count, 0) AS line_count, \
                     COALESCE(sc.approved_count, 0) AS approved_count, \
                     COALESCE(ac.sample_count, 0) AS sample_count, \
@@ -207,7 +269,7 @@ pub fn list_speaker_groups(conn: &Connection, project_id: i64) -> Result<Vec<Spe
              LEFT JOIN clone c ON c.speaker_id = s.id \
              WHERE s.project_id=?1 \
          ) \
-         SELECT id, cre_resref, display_name, long_name_strref, line_count, approved_count, \
+         SELECT id, cre_resref, display_name, long_name_strref, sex, line_count, approved_count, \
                 sample_count, binding_source, clone_status, excluded \
          FROM speaker_rows ORDER BY id",
     )?;
@@ -216,6 +278,7 @@ pub fn list_speaker_groups(conn: &Connection, project_id: i64) -> Result<Vec<Spe
         String,
         Option<String>,
         Option<i64>,
+        i64,
         i64,
         i64,
         i64,
@@ -232,16 +295,18 @@ pub fn list_speaker_groups(conn: &Connection, project_id: i64) -> Result<Vec<Spe
                 r.get(4)?,
                 r.get(5)?,
                 r.get(6)?,
-                r.get::<_, Option<BindingSource>>(7)?,
-                r.get::<_, Option<CloneStatus>>(8)?,
-                r.get::<_, i64>(9)? != 0,
+                r.get(7)?,
+                r.get::<_, Option<BindingSource>>(8)?,
+                r.get::<_, Option<CloneStatus>>(9)?,
+                r.get::<_, i64>(10)? != 0,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let mut buckets: BTreeMap<String, SpeakerGroup> = BTreeMap::new();
     let mut sounds_by_group: BTreeMap<String, HashSet<String>> = BTreeMap::new();
-    for (id, cre, display, strref, line_count, approved, sample_count, binding, clone_status, excluded) in rows {
+    let mut sex_by_key: HashMap<String, i64> = HashMap::new();
+    for (id, cre, display, strref, sex, line_count, approved, sample_count, binding, clone_status, excluded) in rows {
         let group_display = display
             .clone()
             .filter(|n| !n.trim().is_empty())
@@ -249,7 +314,8 @@ pub fn list_speaker_groups(conn: &Connection, project_id: i64) -> Result<Vec<Spe
         if is_player_prototype_identity(Some(group_display.as_str())) {
             continue;
         }
-        let key = identity_key(strref, id);
+        let key = identity_key(strref, sex, id);
+        sex_by_key.entry(key.clone()).or_insert(sex);
         let entry = buckets.entry(key.clone()).or_insert_with(|| SpeakerGroup {
             identity_key: key.clone(),
             display_name: group_display.clone(),
@@ -297,6 +363,33 @@ pub fn list_speaker_groups(conn: &Connection, project_id: i64) -> Result<Vec<Spe
             .get(key)
             .map(|s| s.len() as i64)
             .unwrap_or(0);
+    }
+
+    // Same TLK name can now yield multiple sex-scoped cards — disambiguate labels.
+    // Singleton sex-siblings also show their CRE resref so misnamed game files
+    // (e.g. BADLUCK.CRE labeled "Jariel") are obvious in the Binding list.
+    let mut name_counts: HashMap<String, usize> = HashMap::new();
+    for group in buckets.values() {
+        *name_counts
+            .entry(group.display_name.to_ascii_lowercase())
+            .or_insert(0) += 1;
+    }
+    for (key, group) in buckets.iter_mut() {
+        let collisions = name_counts
+            .get(&group.display_name.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(0);
+        if collisions > 1 {
+            if let Some(&sex) = sex_by_key.get(key) {
+                if group.variant_count == 1 {
+                    let cre = &group.variants[0].cre_resref;
+                    group.display_name =
+                        format!("{} {} · {}", group.display_name, sex_glyph(sex), cre);
+                } else {
+                    group.display_name = format!("{} {}", group.display_name, sex_glyph(sex));
+                }
+            }
+        }
     }
 
     let mut groups: Vec<SpeakerGroup> = buckets.into_values().collect();
@@ -386,10 +479,15 @@ fn rollup_clone(
             group.clone_status = Some(status);
             group.binding_source = binding;
         }
-        (Some(CloneStatus::Ready), Some(BindingSource::Override | BindingSource::Default)) => {
-            // Personal bind wins; keep existing.
+        (Some(CloneStatus::Ready), Some(BindingSource::Override | BindingSource::Default | BindingSource::Follow)) => {
+            // Personal / follow bind wins; keep existing.
         }
-        (Some(CloneStatus::Ready), _) if matches!(binding, Some(BindingSource::Override | BindingSource::Default)) => {
+        (Some(CloneStatus::Ready), _)
+            if matches!(
+                binding,
+                Some(BindingSource::Override | BindingSource::Default | BindingSource::Follow)
+            ) =>
+        {
             group.clone_status = Some(status);
             group.binding_source = binding;
         }
@@ -443,7 +541,7 @@ fn propagate_clone_to_members(
             // siblings must inherit the profile or they keep synthesizing the old voice.
             conn.execute(
                 "UPDATE clone SET primary_sample_id=?2, voice_profile_id=?3, binding_source=?4, \
-                 status=?5 WHERE id=?1",
+                 status=?5, follow_speaker_id=NULL WHERE id=?1",
                 params![
                     existing.id,
                     primary_sample_id,
@@ -522,14 +620,18 @@ pub fn propagate_clone_to_identity_key(
     )
 }
 
-/// Whether any variant in the speaker's identity group has a personal (`default`/`override`) clone.
+/// Whether any variant in the speaker's identity group has a personal (`default`/`override`)
+/// or follow clone (protected from demographic apply).
 pub fn group_has_personal_clone(conn: &Connection, project_id: i64, speaker_id: i64) -> Result<bool, AppError> {
     let key = identity_key_for_speaker(conn, speaker_id)?;
     let ids = speaker_ids_in_group(conn, project_id, &key)?;
     for sid in ids {
         if let Some(c) = crate::db::generation::clone_for_speaker(conn, sid)? {
             if c.status == CloneStatus::Ready
-                && matches!(c.binding_source, BindingSource::Default | BindingSource::Override)
+                && matches!(
+                    c.binding_source,
+                    BindingSource::Default | BindingSource::Override | BindingSource::Follow
+                )
             {
                 return Ok(true);
             }
@@ -539,17 +641,30 @@ pub fn group_has_personal_clone(conn: &Connection, project_id: i64, speaker_id: 
 }
 
 /// Best approved sample across all variants in a verified group. Automatic-safe
-/// dialogue outranks manual-only material, then overall score and stable id.
+/// dialogue outranks manual-only material, then clips whose sound stem matches a
+/// group CRE (same-identity VO), then overall score and stable id.
 pub fn best_approved_sample_in_group(
     conn: &Connection,
     project_id: i64,
     identity_key: &str,
 ) -> Result<Option<(i64, i64, String)>, AppError> {
     let ids = speaker_ids_in_group(conn, project_id, identity_key)?;
-    let mut best: Option<(bool, f64, i64, i64, String)> = None;
+    let mut group_stems: HashSet<String> = HashSet::new();
+    {
+        let mut stmt = conn.prepare("SELECT cre_resref FROM speaker WHERE id = ?1")?;
+        for &sid in &ids {
+            let cre: String = stmt.query_row(params![sid], |r| r.get(0))?;
+            let stem = crate::voices::harvest::resref_stem(&cre);
+            if stem.len() >= 4 {
+                group_stems.insert(stem);
+            }
+        }
+    }
+    // Rank tuple: automatic, local_stem_fit, overall, -sample_id (lower id wins ties)
+    let mut best: Option<(bool, bool, f64, i64, i64, String)> = None;
     for sid in ids {
         let mut stmt = conn.prepare(
-            "SELECT id, local_derivative_path, provenance_json, scores_json \
+            "SELECT id, local_derivative_path, provenance_json, scores_json, source_sound_resref \
              FROM reference_sample WHERE speaker_id=?1 AND decision='approved' \
                AND local_derivative_path IS NOT NULL ORDER BY id",
         )?;
@@ -560,26 +675,36 @@ pub fn best_approved_sample_in_group(
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (sample_id, path, provenance, scores) in samples {
+        for (sample_id, path, provenance, scores, sound) in samples {
             let automatic = crate::voices::harvest::provenance_is_automatic(&provenance);
+            let local_fit = sound
+                .as_deref()
+                .map(|s| {
+                    let stem = crate::voices::harvest::resref_stem(s);
+                    stem.len() >= 4 && group_stems.contains(&stem)
+                })
+                .unwrap_or(false);
             let overall = serde_json::from_str::<crate::audio::scoring::SampleScore>(&scores)
                 .map(|score| score.overall)
                 .unwrap_or(0.0);
             let better = best.as_ref().map_or(true, |current| {
                 automatic > current.0
+                    || (automatic == current.0 && local_fit > current.1)
                     || (automatic == current.0
-                        && (overall > current.1
-                            || (overall == current.1 && sample_id < current.2)))
+                        && local_fit == current.1
+                        && (overall > current.2
+                            || (overall == current.2 && sample_id < current.3)))
             });
             if better {
-                best = Some((automatic, overall, sample_id, sid, path));
+                best = Some((automatic, local_fit, overall, sample_id, sid, path));
             }
         }
     }
-    Ok(best.map(|(_, _, sample_id, sid, path)| (sid, sample_id, path)))
+    Ok(best.map(|(_, _, _, sample_id, sid, path)| (sid, sample_id, path)))
 }
 
 /// Speaker id to use in a metadata donor pool: the variant that owns the approved clip.
@@ -654,8 +779,37 @@ mod tests {
 
     #[test]
     fn identity_key_named_and_singleton() {
-        assert_eq!(identity_key(Some(42), 7), "42");
-        assert_eq!(identity_key(None, 7), "ungrouped:7");
+        assert_eq!(identity_key(Some(42), 1, 7), "42:1");
+        assert_eq!(identity_key(Some(42), 2, 7), "42:2");
+        assert_eq!(identity_key(None, 1, 7), "ungrouped:7");
+    }
+
+    #[test]
+    fn parse_identity_key_sex_scoped_and_legacy() {
+        assert_eq!(
+            parse_identity_key("42:2").unwrap(),
+            ParsedIdentityKey {
+                long_name_strref: Some(42),
+                sex: Some(2),
+                singleton_speaker_id: None,
+            }
+        );
+        assert_eq!(
+            parse_identity_key("42").unwrap(),
+            ParsedIdentityKey {
+                long_name_strref: Some(42),
+                sex: None,
+                singleton_speaker_id: None,
+            }
+        );
+        assert_eq!(
+            parse_identity_key("ungrouped:9").unwrap(),
+            ParsedIdentityKey {
+                long_name_strref: None,
+                sex: None,
+                singleton_speaker_id: Some(9),
+            }
+        );
     }
 
     #[test]
@@ -697,6 +851,58 @@ mod tests {
     }
 
     #[test]
+    fn list_groups_splits_same_name_by_sex() {
+        let conn = mem_db();
+        let pid = insert_project(&conn);
+        let male = insert_speaker(&conn, pid, "beggar1", Some(15855), Some("Beggar"));
+        let female = insert_speaker(&conn, pid, "beggar3", Some(15855), Some("Beggar"));
+        conn.execute("UPDATE speaker SET sex=1 WHERE id=?1", params![male])
+            .unwrap();
+        conn.execute("UPDATE speaker SET sex=2 WHERE id=?1", params![female])
+            .unwrap();
+        let groups = list_speaker_groups(&conn, pid).unwrap();
+        assert_eq!(groups.len(), 2);
+        let male_g = groups.iter().find(|g| g.identity_key == "15855:1").unwrap();
+        let female_g = groups.iter().find(|g| g.identity_key == "15855:2").unwrap();
+        assert_eq!(male_g.display_name, "Beggar ♂ · beggar1");
+        assert_eq!(female_g.display_name, "Beggar ♀ · beggar3");
+        assert_eq!(male_g.variant_count, 1);
+        assert_eq!(female_g.variant_count, 1);
+        assert_eq!(
+            speaker_ids_in_group(&conn, pid, "15855:1").unwrap(),
+            vec![male]
+        );
+        assert_eq!(
+            speaker_ids_in_group(&conn, pid, "15855:2").unwrap(),
+            vec![female]
+        );
+        // Legacy plain-strref key still expands to both sexes (companion / deep-link).
+        assert_eq!(
+            speaker_ids_in_group(&conn, pid, "15855").unwrap(),
+            vec![male, female]
+        );
+    }
+
+    #[test]
+    fn list_groups_sex_split_multi_variant_keeps_glyph_only() {
+        let conn = mem_db();
+        let pid = insert_project(&conn);
+        let m1 = insert_speaker(&conn, pid, "beggar1", Some(15855), Some("Beggar"));
+        let m2 = insert_speaker(&conn, pid, "beggar2", Some(15855), Some("Beggar"));
+        let female = insert_speaker(&conn, pid, "beggar3", Some(15855), Some("Beggar"));
+        conn.execute("UPDATE speaker SET sex=1 WHERE id IN (?1, ?2)", params![m1, m2])
+            .unwrap();
+        conn.execute("UPDATE speaker SET sex=2 WHERE id=?1", params![female])
+            .unwrap();
+        let groups = list_speaker_groups(&conn, pid).unwrap();
+        let male_g = groups.iter().find(|g| g.identity_key == "15855:1").unwrap();
+        let female_g = groups.iter().find(|g| g.identity_key == "15855:2").unwrap();
+        assert_eq!(male_g.display_name, "Beggar ♂");
+        assert_eq!(female_g.display_name, "Beggar ♀ · beggar3");
+        assert_eq!(male_g.variant_count, 2);
+    }
+
+    #[test]
     fn list_groups_counts_distinct_approved_sounds_across_variants() {
         let conn = mem_db();
         let pid = insert_project(&conn);
@@ -729,9 +935,9 @@ mod tests {
         let pid = insert_project(&conn);
         let s1 = insert_speaker(&conn, pid, "bear1", Some(200), Some("Grizzly Bear"));
         let s2 = insert_speaker(&conn, pid, "bear2", Some(200), Some("Grizzly Bear"));
-        assert_eq!(set_speakers_excluded(&conn, pid, "200", true).unwrap(), 2);
+        assert_eq!(set_speakers_excluded(&conn, pid, "200:0", true).unwrap(), 2);
         let groups = list_speaker_groups(&conn, pid).unwrap();
-        let bear = groups.iter().find(|g| g.identity_key == "200").unwrap();
+        let bear = groups.iter().find(|g| g.identity_key == "200:0").unwrap();
         assert!(bear.excluded);
         for sid in [s1, s2] {
             let excluded: i64 = conn
@@ -739,7 +945,7 @@ mod tests {
                 .unwrap();
             assert_eq!(excluded, 1);
         }
-        assert_eq!(count_speaker_group_generations(&conn, pid, "200").unwrap(), 0);
+        assert_eq!(count_speaker_group_generations(&conn, pid, "200:0").unwrap(), 0);
 
         conn.execute(
             "INSERT INTO line (project_id, strref, text, speaker_id, status) VALUES (?1, 1, 'Roar.', ?2, 'ready')",
@@ -752,9 +958,9 @@ mod tests {
             params![line_id],
         )
         .unwrap();
-        assert_eq!(count_speaker_group_generations(&conn, pid, "200").unwrap(), 1);
+        assert_eq!(count_speaker_group_generations(&conn, pid, "200:0").unwrap(), 1);
         assert_eq!(
-            generation_line_ids_for_group(&conn, pid, "200").unwrap(),
+            generation_line_ids_for_group(&conn, pid, "200:0").unwrap(),
             vec![line_id]
         );
     }
@@ -777,7 +983,7 @@ mod tests {
         let n = propagate_clone_to_identity_key(
             &conn,
             pid,
-            "100",
+            "100:0",
             s2,
             sample_id,
             BindingSource::Override,
@@ -837,7 +1043,7 @@ mod tests {
         let n = propagate_clone_to_identity_key(
             &conn,
             pid,
-            "15065",
+            "15065:0",
             s1,
             sample_id,
             BindingSource::Override,
@@ -994,5 +1200,43 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(best, (s2, automatic_id, "automatic.wav".to_string()));
+    }
+
+    #[test]
+    fn group_best_sample_prefers_matching_sound_stem_over_foreign() {
+        let conn = mem_db();
+        let pid = insert_project(&conn);
+        let boy = insert_speaker(&conn, pid, "boyba1", Some(8822), Some("Boy"));
+        let score = |overall: f64| {
+            serde_json::json!({
+                "overall": overall,
+                "provenance": 1.0,
+                "attribution": 1.0,
+                "duration": 1.0,
+                "loudness": 1.0,
+                "cleanliness": 1.0
+            })
+            .to_string()
+        };
+        conn.execute(
+            "INSERT INTO reference_sample \
+             (speaker_id, decision, local_derivative_path, provenance_json, scores_json, source_sound_resref) \
+             VALUES (?1, 'approved', 'foreign.wav', ?2, ?3, 'jaheir62')",
+            params![boy, r#"{"eligibility":"automatic"}"#, score(0.95)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO reference_sample \
+             (speaker_id, decision, local_derivative_path, provenance_json, scores_json, source_sound_resref) \
+             VALUES (?1, 'approved', 'local.wav', ?2, ?3, 'boyba01')",
+            params![boy, r#"{"eligibility":"automatic"}"#, score(0.80)],
+        )
+        .unwrap();
+        let local_id = conn.last_insert_rowid();
+
+        let best = best_approved_sample_in_group(&conn, pid, "8822:0")
+            .unwrap()
+            .unwrap();
+        assert_eq!(best, (boy, local_id, "local.wav".to_string()));
     }
 }

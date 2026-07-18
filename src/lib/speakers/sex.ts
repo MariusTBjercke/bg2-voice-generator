@@ -62,8 +62,9 @@ export function groupSexToken(group: SpeakerGroup, speakersById: SpeakerLookup):
 
 /**
  * Gender of the voice currently bound to a speaker.
- * Designed profiles use `design.gender`; sample-backed bindings use the donor
- * speaker's CRE sex (or the profile's harvested speaker when no donor row).
+ * Designed profiles use `design.gender`. Sample-backed bindings prefer the sex
+ * inferred from the bound clip's canonical sound owner (so Boy+`jaheir62` counts
+ * as female), then fall back to donor / harvested speaker CRE sex.
  */
 export function boundVoiceSexToken(
   binding: EffectiveSpeakerBinding | undefined,
@@ -76,6 +77,10 @@ export function boundVoiceSexToken(
     const profile = lookupProfile(profilesById, binding.voice_profile_id);
     const designed = sexTokenFromDesignGender(profile?.design?.gender);
     if (designed) return designed;
+  }
+
+  if (binding.sample_voice_sex !== null && binding.sample_voice_sex !== undefined) {
+    return sexTokenFromIds(binding.sample_voice_sex);
   }
 
   if (binding.donor_speaker_id !== null) {

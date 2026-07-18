@@ -23,6 +23,9 @@
   } from "$lib/stores/filters";
   import type {
     AutoReviewPlainResult,
+    BindingAuditProgress,
+    BindingPersonalRow,
+    BindingSuspiciousRow,
     ListSynthesisDecisionsResult,
     ListSynthesisFlaggedResult,
     ListSynthesisReviewResult,
@@ -43,6 +46,8 @@
   import SearchFilterBar from "$lib/components/SearchFilterBar.svelte";
   import StatusBadge from "$lib/components/StatusBadge.svelte";
   import SynthesisTextEditor from "$lib/components/SynthesisTextEditor.svelte";
+  import type { BindingAuditTab } from "$lib/stores/uiPreferences";
+  import { identityHref } from "$lib/navigation/speakerDeepLink";
 
   const PAGE_SIZE = 50;
   const REVIEWED_DEFER_THRESHOLD = 1000;
@@ -111,6 +116,19 @@
   let viewPreferencesDir = $state<string | null>(null);
   let searchDebounce: ReturnType<typeof setTimeout> | null = null;
   let skipFilterReload = false;
+
+  let aiAssistedOpen = $state(true);
+  let progressOpen = $state(true);
+  let queueOpen = $state(true);
+  let corpusAuditOpen = $state(true);
+  let voiceBindingsOpen = $state(true);
+  let bindingTab = $state<BindingAuditTab>("suspicious");
+  let bindingProgress = $state<BindingAuditProgress | null>(null);
+  let bindingRows = $state<Array<BindingPersonalRow | BindingSuspiciousRow>>([]);
+  let bindingLoading = $state(false);
+  let bindingError = $state<string | null>(null);
+  let bindingAfter = $state(0);
+  let bindingActionCre = $state<string | null>(null);
 
   const dir = $derived($project.gameDir);
   const kindTotal = $derived.by(() => {
@@ -296,7 +314,136 @@
   }
 
   async function refreshAgentData(resetPage = false) {
-    await Promise.all([refreshAllStats(), loadDecisions(resetPage)]);
+    await Promise.all([refreshAllStats(), loadDecisions(resetPage), loadBindingAudit(resetPage)]);
+  }
+
+  async function loadBindingAudit(resetPage = false) {
+    if (!dir) {
+      bindingProgress = null;
+      bindingRows = [];
+      return;
+    }
+    if (resetPage) bindingAfter = 0;
+    bindingLoading = true;
+    bindingError = null;
+    try {
+      bindingProgress = await invoke<BindingAuditProgress>("binding_audit_progress", {
+        gameDir: dir,
+      });
+      if (bindingTab === "suspicious") {
+        bindingRows = await invoke<BindingSuspiciousRow[]>("list_suspicious_bindings", {
+          gameDir: dir,
+          afterSpeakerId: bindingAfter || null,
+          limit: 50,
+        });
+      } else if (bindingTab === "flagged" || bindingTab === "reviewed") {
+        bindingRows = await invoke<BindingSuspiciousRow[]>("list_marked_bindings", {
+          gameDir: dir,
+          status: bindingTab,
+          afterSpeakerId: bindingAfter || null,
+          limit: 50,
+        });
+      } else {
+        bindingRows = await invoke<BindingPersonalRow[]>("list_personal_bindings", {
+          gameDir: dir,
+          afterSpeakerId: bindingAfter || null,
+          limit: 50,
+          excludeReviewed: true,
+        });
+      }
+    } catch (e) {
+      bindingError = String(e);
+    } finally {
+      bindingLoading = false;
+    }
+  }
+
+  function selectBindingTab(tab: BindingAuditTab) {
+    if (bindingTab === tab) return;
+    bindingTab = tab;
+    bindingAfter = 0;
+    void loadBindingAudit(true);
+  }
+
+  async function markBindingOk(cre: string) {
+    if (!dir) return;
+    bindingActionCre = cre;
+    try {
+      await invoke("mark_binding_reviewed", {
+        gameDir: dir,
+        creResref: cre,
+        reason: null,
+      });
+      await loadBindingAudit();
+    } catch (e) {
+      bindingError = String(e);
+    } finally {
+      bindingActionCre = null;
+    }
+  }
+
+  async function flagBindingRow(cre: string) {
+    if (!dir) return;
+    bindingActionCre = cre;
+    try {
+      await invoke("flag_binding_review", {
+        gameDir: dir,
+        creResref: cre,
+        reason: "flagged from Review UI",
+      });
+      await loadBindingAudit();
+    } catch (e) {
+      bindingError = String(e);
+    } finally {
+      bindingActionCre = null;
+    }
+  }
+
+  async function clearBindingMarker(cre: string) {
+    if (!dir) return;
+    bindingActionCre = cre;
+    try {
+      await invoke("clear_binding_review_marker", {
+        gameDir: dir,
+        creResref: cre,
+      });
+      await loadBindingAudit();
+    } catch (e) {
+      bindingError = String(e);
+    } finally {
+      bindingActionCre = null;
+    }
+  }
+
+  async function clearPersonalBind(cre: string) {
+    if (!dir) return;
+    bindingActionCre = cre;
+    try {
+      await invoke("clear_personal_binding", { gameDir: dir, creResref: cre });
+      await loadBindingAudit();
+    } catch (e) {
+      bindingError = String(e);
+    } finally {
+      bindingActionCre = null;
+    }
+  }
+
+  function sexGlyph(sex: number): string {
+    if (sex === 1) return "♂";
+    if (sex === 2) return "♀";
+    return "";
+  }
+
+  function bindingRowTitle(row: BindingPersonalRow | BindingSuspiciousRow): string {
+    const glyph = sexGlyph(row.sex);
+    return glyph ? `${row.display_name} ${glyph}` : row.display_name;
+  }
+
+  function bindingIdentityKey(row: BindingPersonalRow | BindingSuspiciousRow): string {
+    if ("display_identity_key" in row && row.display_identity_key) {
+      return row.display_identity_key;
+    }
+    return `ungrouped:${row.speaker_id}`;
   }
 
   function selectKind(kind: ReviewTab) {
@@ -552,6 +699,13 @@
       filterValues = emptyValues(queueFilter);
     }
     decisionKind = getInstallUiPreferences(gameDir).reviewTab;
+    const reviewPrefs = getInstallUiPreferences(gameDir).review;
+    aiAssistedOpen = reviewPrefs.aiAssistedOpen;
+    progressOpen = reviewPrefs.progressOpen;
+    queueOpen = reviewPrefs.queueOpen;
+    corpusAuditOpen = reviewPrefs.corpusAuditOpen;
+    voiceBindingsOpen = reviewPrefs.voiceBindingsOpen;
+    bindingTab = reviewPrefs.bindingTab;
     const cached = get(results).review;
     summary = cached.summary;
     auditSummary = cached.auditSummary;
@@ -594,6 +748,23 @@
   });
 
   $effect(() => {
+    const gameDir = dir;
+    if (!gameDir || viewPreferencesDir !== gameDir) return;
+    const snapshot = {
+      aiAssistedOpen,
+      progressOpen,
+      queueOpen,
+      corpusAuditOpen,
+      voiceBindingsOpen,
+      bindingTab,
+    };
+    updateInstallUiPreferences(gameDir, (current) => ({
+      ...current,
+      review: { ...current.review, ...snapshot },
+    }));
+  });
+
+  $effect(() => {
     void filterValues.search;
     void JSON.stringify(filterValues.facets);
     if (!filtersHydrated || skipFilterReload || !dir) return;
@@ -611,7 +782,7 @@
 
 <Section
   title="Dialogue Review"
-  description="Review and correct generation-only OmniVoice text yourself. Original game text and exported subtitles never change. Optional AI assistants can help later on this page."
+  description="Review generation-only OmniVoice text and optional personal voice bindings. Original game text and exported subtitles never change."
 >
   {#if !dir}
     <Card>
@@ -619,8 +790,67 @@
     </Card>
   {:else}
     <Card>
-      <div class="heading">
-        <h3>Review progress</h3>
+      <div class="panel-head">
+        <button
+          type="button"
+          class="panel-toggle"
+          aria-expanded={aiAssistedOpen}
+          aria-controls="ai-assisted-panel"
+          onclick={() => (aiAssistedOpen = !aiAssistedOpen)}
+        >
+          <span class="chevron" class:collapsed={!aiAssistedOpen} aria-hidden="true">▼</span>
+          <h3>AI-assisted review</h3>
+        </button>
+      </div>
+      {#if aiAssistedOpen}
+        <div id="ai-assisted-panel">
+          <p class="hint">
+            Optional. Stages a workspace with <code>AGENTS.md</code> / <code>CLAUDE.md</code>, the
+            <code>set-synthesis</code> and <code>audit-bindings</code> skills, and the
+            <code>bg2-synthesis</code> CLI so an agent can record synthesis overrides or audit
+            personal voice bindings without editing the database directly.
+          </p>
+          <label class="yolo">
+            <input type="checkbox" bind:checked={yolo} />
+            Allow unattended mode (skip agent confirmation prompts)
+          </label>
+          <div class="actions">
+            <Button onclick={() => launch("codex")} disabled={launching !== null}>
+              {launching === "codex" ? "Launching Codex…" : "Launch Codex"}
+            </Button>
+            <Button onclick={() => launch("claude")} disabled={launching !== null}>
+              {launching === "claude" ? "Launching Claude…" : "Launch Claude"}
+            </Button>
+            <Button variant="ghost" onclick={reveal} disabled={revealing}>
+              {revealing ? "Opening…" : "Reveal workspace"}
+            </Button>
+          </div>
+        </div>
+      {/if}
+      <p class="hint">
+        You can make every decision in the queues below. Agents cannot render, audition, or accept
+        candidate audio.
+      </p>
+    </Card>
+
+    <Card>
+      <div class="panel-head">
+        <button
+          type="button"
+          class="panel-toggle"
+          aria-expanded={progressOpen}
+          aria-controls="review-progress-panel"
+          onclick={() => (progressOpen = !progressOpen)}
+        >
+          <span class="chevron" class:collapsed={!progressOpen} aria-hidden="true">▼</span>
+          <h3>Review progress</h3>
+          {#if summary}
+            <span class="panel-summary"
+              >{summary.remaining} remaining{#if auditSummary}
+                · {auditSummary.flagged_undecided} flagged{/if}</span
+            >
+          {/if}
+        </button>
         <Button
           variant="ghost"
           onclick={() => refreshAgentData()}
@@ -629,26 +859,40 @@
           {statsLoading || decisionLoading ? "Updating…" : "Refresh"}
         </Button>
       </div>
-      {#if summary}
-        <div class="stats">
-          <div><strong>{summary.unique_strings}</strong><span>unique strings</span></div>
-          <div><strong>{summary.overridden}</strong><span>overridden</span></div>
-          <div><strong>{summary.reviewed}</strong><span>reviewed</span></div>
-          <div><strong>{summary.remaining}</strong><span>remaining</span></div>
-          <div><strong>{summary.suspicious}</strong><span>suspicious</span></div>
+      {#if progressOpen}
+        <div id="review-progress-panel">
+          {#if summary}
+            <div class="stats">
+              <div><strong>{summary.unique_strings}</strong><span>unique strings</span></div>
+              <div><strong>{summary.overridden}</strong><span>overridden</span></div>
+              <div><strong>{summary.reviewed}</strong><span>reviewed</span></div>
+              <div><strong>{summary.remaining}</strong><span>remaining</span></div>
+              <div><strong>{summary.suspicious}</strong><span>suspicious</span></div>
+            </div>
+            {#if statsLoading}
+              <p class="hint">Updating…</p>
+            {/if}
+          {:else if loading}
+            <p class="hint">Loading synthesis review progress…</p>
+          {/if}
+          <ErrorNotice message={error} />
         </div>
-        {#if statsLoading}
-          <p class="hint">Updating…</p>
-        {/if}
-      {:else if loading}
-        <p class="hint">Loading synthesis review progress…</p>
       {/if}
-      <ErrorNotice message={error} />
     </Card>
 
     <Card>
-      <div class="heading">
-        <h3>Review queue and decisions</h3>
+      <div class="panel-head">
+        <button
+          type="button"
+          class="panel-toggle"
+          aria-expanded={queueOpen}
+          aria-controls="review-queue-panel"
+          onclick={() => (queueOpen = !queueOpen)}
+        >
+          <span class="chevron" class:collapsed={!queueOpen} aria-hidden="true">▼</span>
+          <h3>Review queue and decisions</h3>
+          <span class="panel-summary">{kindTotal} in tab</span>
+        </button>
         <Button
           variant="ghost"
           onclick={() => refreshAgentData()}
@@ -657,6 +901,8 @@
           {decisionLoading || statsLoading ? "Refreshing…" : "Refresh list"}
         </Button>
       </div>
+      {#if queueOpen}
+        <div id="review-queue-panel">
       <p class="hint">
         Start with flagged strings, or page through remaining unique strings. Accept the current
         mapper output or write a generation-only override. Search covers the whole corpus, not
@@ -938,11 +1184,22 @@
           {resetting ? "Resetting…" : "Reset all review state"}
         </Button>
       </div>
+        </div>
+      {/if}
     </Card>
 
     <Card>
-      <div class="heading">
-        <h3>Corpus audit</h3>
+      <div class="panel-head">
+        <button
+          type="button"
+          class="panel-toggle"
+          aria-expanded={corpusAuditOpen}
+          aria-controls="corpus-audit-panel"
+          onclick={() => (corpusAuditOpen = !corpusAuditOpen)}
+        >
+          <span class="chevron" class:collapsed={!corpusAuditOpen} aria-hidden="true">▼</span>
+          <h3>Corpus audit</h3>
+        </button>
         <Button
           variant="ghost"
           onclick={() => refreshAllStats()}
@@ -951,6 +1208,8 @@
           {auditLoading || statsLoading ? "Refreshing…" : "Refresh audit"}
         </Button>
       </div>
+      {#if corpusAuditOpen}
+        <div id="corpus-audit-panel">
       <p class="hint">
         Deterministic flags show which unique strings deserve attention. Plain dialogue can be
         bulk-reviewed; phonetic screams and stutters that remain after Dictionary rules go to the
@@ -982,34 +1241,185 @@
         <p class="hint">Running corpus audit…</p>
       {/if}
       <ErrorNotice message={auditError} />
+        </div>
+      {/if}
     </Card>
 
     <Card>
-      <h3>AI-assisted review</h3>
-      <p class="hint">
-        Optional. Stages a workspace with <code>AGENTS.md</code> / <code>CLAUDE.md</code>, the
-        <code>set-synthesis</code> skill, and the <code>bg2-synthesis</code> CLI so an agent can
-        record overrides without editing the database directly.
-      </p>
-      <label class="yolo">
-        <input type="checkbox" bind:checked={yolo} />
-        Allow unattended mode (skip agent confirmation prompts)
-      </label>
-      <div class="actions">
-        <Button onclick={() => launch("codex")} disabled={launching !== null}>
-          {launching === "codex" ? "Launching Codex…" : "Launch Codex"}
-        </Button>
-        <Button onclick={() => launch("claude")} disabled={launching !== null}>
-          {launching === "claude" ? "Launching Claude…" : "Launch Claude"}
-        </Button>
-        <Button variant="ghost" onclick={reveal} disabled={revealing}>
-          {revealing ? "Opening…" : "Reveal workspace"}
+      <div class="panel-head">
+        <button
+          type="button"
+          class="panel-toggle"
+          aria-expanded={voiceBindingsOpen}
+          aria-controls="voice-bindings-panel"
+          onclick={() => (voiceBindingsOpen = !voiceBindingsOpen)}
+        >
+          <span class="chevron" class:collapsed={!voiceBindingsOpen} aria-hidden="true">▼</span>
+          <h3>Voice bindings</h3>
+          {#if bindingProgress}
+            <span class="panel-summary"
+              >{bindingProgress.remaining_personal} remaining · {bindingProgress.flagged} flagged</span
+            >
+          {/if}
+        </button>
+        <Button
+          variant="ghost"
+          onclick={() => loadBindingAudit(true)}
+          disabled={bindingLoading || !dir}
+        >
+          {bindingLoading ? "Refreshing…" : "Refresh"}
         </Button>
       </div>
-      <p class="hint">
-        You can make every decision in the queue above. Agents cannot render, audition, or accept
-        candidate audio.
-      </p>
+      {#if voiceBindingsOpen}
+        <div id="voice-bindings-panel">
+          <p class="hint">
+            Audit personal clones for wrong-character reference clips (metadata only — use Harvest
+            to audition). Each row is one <strong>CRE</strong> (game creature file). Binding groups
+            several CREs that share a display name; the sound resref is the VO clip currently bound
+            to that CRE, which may come from a sibling CRE. Demographic fallbacks are skipped here.
+          </p>
+          {#if bindingProgress}
+            <div class="stats">
+              <div><strong>{bindingProgress.personal_ready}</strong><span>personal ready</span></div>
+              <div><strong>{bindingProgress.flagged}</strong><span>flagged</span></div>
+              <div><strong>{bindingProgress.reviewed}</strong><span>reviewed</span></div>
+              <div><strong>{bindingProgress.remaining_personal}</strong><span>remaining</span></div>
+              <div><strong>{bindingProgress.generic_skipped}</strong><span>demographic</span></div>
+              <div><strong>{bindingProgress.unbound}</strong><span>unbound</span></div>
+            </div>
+          {/if}
+          <div class="tabs" role="tablist" aria-label="Voice binding filters">
+            <button
+              type="button"
+              class="tab"
+              class:active={bindingTab === "suspicious"}
+              role="tab"
+              aria-selected={bindingTab === "suspicious"}
+              onclick={() => selectBindingTab("suspicious")}
+            >Suspicious</button>
+            <button
+              type="button"
+              class="tab"
+              class:active={bindingTab === "flagged"}
+              role="tab"
+              aria-selected={bindingTab === "flagged"}
+              onclick={() => selectBindingTab("flagged")}
+            >
+              Flagged
+              {#if bindingProgress && bindingProgress.flagged > 0}
+                <span class="tab-count warn">{bindingProgress.flagged}</span>
+              {/if}
+            </button>
+            <button
+              type="button"
+              class="tab"
+              class:active={bindingTab === "remaining"}
+              role="tab"
+              aria-selected={bindingTab === "remaining"}
+              onclick={() => selectBindingTab("remaining")}
+            >Remaining personal</button>
+            <button
+              type="button"
+              class="tab"
+              class:active={bindingTab === "reviewed"}
+              role="tab"
+              aria-selected={bindingTab === "reviewed"}
+              onclick={() => selectBindingTab("reviewed")}
+            >Reviewed</button>
+          </div>
+          <ErrorNotice message={bindingError} />
+          {#if bindingLoading && bindingRows.length === 0}
+            <p class="hint">Loading binding audit…</p>
+          {:else if bindingRows.length === 0}
+            <p class="hint">No rows in this tab.</p>
+          {:else}
+            <ul class="decision-list">
+              {#each bindingRows as row (row.speaker_id)}
+                {@const identityKey = bindingIdentityKey(row)}
+                <li class="decision-row">
+                  <div class="row-meta">
+                    <strong>{bindingRowTitle(row)}</strong>
+                    {#if row.review_status}
+                      <StatusBadge tone={row.review_status === "flagged" ? "warn" : "success"}
+                        >{row.review_status}</StatusBadge
+                      >
+                    {/if}
+                  </div>
+                  <p class="binding-id-line">
+                    <span><span class="id-label">CRE</span> <code>{row.cre_resref}</code></span>
+                    {#if row.sample_sound_resref}
+                      <span
+                        ><span class="id-label">Sound</span>
+                        <code>{row.sample_sound_resref}</code></span
+                      >
+                    {/if}
+                    {#if row.sample_owner_cre_resref && row.sample_owner_cre_resref.toUpperCase() !== row.cre_resref.toUpperCase()}
+                      <span
+                        ><span class="id-label">Sample owner</span>
+                        <code>{row.sample_owner_cre_resref}</code></span
+                      >
+                    {/if}
+                  </p>
+                  <div class="cross-links">
+                    <a class="cross-link" href={identityHref("/harvest", identityKey)}
+                      >Open on Harvest</a
+                    >
+                    <a class="cross-link" href={identityHref("/binding", identityKey)}
+                      >Open on Binding</a
+                    >
+                  </div>
+                  {#if row.sample_text_excerpt}
+                    <p class="hint">{row.sample_text_excerpt}</p>
+                  {/if}
+                  {#if row.heuristic_hints?.length}
+                    <ul class="hint-list">
+                      {#each row.heuristic_hints as hint}
+                        <li><code>{hint.code}</code> — {hint.detail}</li>
+                      {/each}
+                    </ul>
+                  {/if}
+                  <div class="row-actions">
+                    {#if row.review_status !== "reviewed"}
+                      <Button
+                        variant="ghost"
+                        disabled={bindingActionCre === row.cre_resref}
+                        onclick={() => markBindingOk(row.cre_resref)}
+                      >Mark reviewed</Button>
+                    {/if}
+                    {#if row.review_status !== "flagged"}
+                      <Button
+                        variant="ghost"
+                        disabled={bindingActionCre === row.cre_resref}
+                        onclick={() => flagBindingRow(row.cre_resref)}
+                      >Flag</Button>
+                    {/if}
+                    {#if row.review_status === "flagged"}
+                      <Button
+                        variant="ghost"
+                        disabled={bindingActionCre === row.cre_resref}
+                        onclick={() => clearBindingMarker(row.cre_resref)}
+                      >Clear flag</Button>
+                    {:else if row.review_status === "reviewed"}
+                      <Button
+                        variant="ghost"
+                        disabled={bindingActionCre === row.cre_resref}
+                        onclick={() => clearBindingMarker(row.cre_resref)}
+                      >Clear review</Button>
+                    {/if}
+                    {#if row.binding_source === "default" || row.binding_source === "override"}
+                      <Button
+                        variant="danger"
+                        disabled={bindingActionCre === row.cre_resref}
+                        onclick={() => clearPersonalBind(row.cre_resref)}
+                      >Clear personal bind</Button>
+                    {/if}
+                  </div>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </div>
+      {/if}
     </Card>
   {/if}
 </Section>
@@ -1020,7 +1430,6 @@
   p {
     margin-top: 0;
   }
-  .heading,
   .actions,
   .yolo,
   .tabs,
@@ -1033,9 +1442,73 @@
     gap: var(--space-3);
     flex-wrap: wrap;
   }
-  .heading {
+  .panel-head {
+    display: flex;
+    align-items: center;
     justify-content: space-between;
+    gap: var(--space-3);
+    flex-wrap: wrap;
     margin-bottom: var(--space-2);
+  }
+  .panel-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    background: none;
+    border: none;
+    color: inherit;
+    padding: 0;
+    cursor: pointer;
+    text-align: left;
+    flex: 1;
+    min-width: 0;
+  }
+  .panel-toggle h3 {
+    margin: 0;
+  }
+  .panel-summary {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    white-space: nowrap;
+  }
+  .chevron {
+    display: inline-block;
+    transition: transform 0.15s ease;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+  }
+  .chevron.collapsed {
+    transform: rotate(-90deg);
+  }
+  .hint-list {
+    margin: var(--space-2) 0;
+    padding-left: 1.25rem;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+  }
+  .binding-id-line {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2) var(--space-4);
+    margin: var(--space-1) 0 var(--space-2);
+    font-size: 0.85rem;
+    color: var(--text-muted);
+  }
+  .id-label {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-right: var(--space-1);
+    opacity: 0.8;
+  }
+  .cross-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+    margin-bottom: var(--space-2);
+  }
+  .cross-link {
+    font-size: 0.85rem;
   }
   .stats {
     display: grid;

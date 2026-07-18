@@ -38,16 +38,75 @@ pub struct CloneSettingsChange {
 
 /// Deserialize and validate a clone's persisted settings. `#[serde(default)]` on the
 /// contract makes old/partial JSON blobs resolve over current application defaults.
+/// Legacy blobs without `peak_normalize_inherit` treat peak `Some(-1.0)` as inherit
+/// and any other peak (including off) as an explicit override.
 pub fn render_settings_for_clone(clone: &Clone) -> Result<OmniVoiceRenderSettings, AppError> {
-    let settings: OmniVoiceRenderSettings = serde_json::from_str(&clone.render_settings_json)
-        .map_err(|e| {
-            AppError::Other(format!(
-                "clone {} has invalid render settings JSON: {e}",
-                clone.id
-            ))
-        })?;
+    parse_clone_render_settings_json(&clone.render_settings_json, clone.id)
+}
+
+/// Parse clone render-settings JSON with legacy peak-inherit migration.
+pub fn parse_clone_render_settings_json(
+    json: &str,
+    clone_id: i64,
+) -> Result<OmniVoiceRenderSettings, AppError> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|e| {
+        AppError::Other(format!(
+            "clone {clone_id} has invalid render settings JSON: {e}"
+        ))
+    })?;
+    let mut settings: OmniVoiceRenderSettings = serde_json::from_value(value.clone()).map_err(|e| {
+        AppError::Other(format!(
+            "clone {clone_id} has invalid render settings JSON: {e}"
+        ))
+    })?;
+    if value.get("peak_normalize_inherit").is_none() {
+        settings.peak_normalize_inherit = match settings.peak_normalize_dbfs {
+            Some(v) if (v - (-1.0)).abs() < 1e-3 => true,
+            _ => false,
+        };
+    }
     settings.validate().map_err(AppError::Other)?;
     Ok(settings)
+}
+
+/// Clone settings with the machine-wide peak default applied when inheriting.
+pub fn resolved_render_settings_for_clone(
+    conn: &Connection,
+    clone: &Clone,
+) -> Result<OmniVoiceRenderSettings, AppError> {
+    let stored = render_settings_for_clone(clone)?;
+    let global = crate::commands::settings::read_peak_normalize_default(conn)?;
+    let resolved = stored.with_resolved_peak(global);
+    resolved.validate().map_err(AppError::Other)?;
+    Ok(resolved)
+}
+
+/// Soft-invalidate done generations whose clone still inherits the machine-wide
+/// peak default (clear `render_settings_hash` so they surface as voice-changed).
+pub fn invalidate_inheriting_peak_generations(
+    conn: &mut Connection,
+) -> Result<usize, AppError> {
+    let clones: Vec<Clone> = {
+        let mut stmt = conn.prepare(&format!("SELECT {CLONE_COLUMNS} FROM clone"))?;
+        let rows = stmt.query_map([], clone_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let tx = conn.transaction()?;
+    let mut reset = 0usize;
+    for clone in clones {
+        let settings = render_settings_for_clone(&clone)?;
+        if !settings.peak_normalize_inherit {
+            continue;
+        }
+        reset += tx.execute(
+            "UPDATE generation SET render_settings_hash=NULL \
+             WHERE clone_id=?1 AND status='done' AND output_path IS NOT NULL \
+               AND render_settings_hash IS NOT NULL",
+            [clone.id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(reset)
 }
 
 pub fn line_render_override_for(
@@ -399,8 +458,8 @@ pub fn clones_for_project(
     // Qualify every column with the `c` alias: joining `speaker` makes bare `id`
     // and `speaker_id` ambiguous. Order matches `clone_from_row`'s index reads.
     let mut stmt = conn.prepare(
-        "SELECT c.id, c.speaker_id, c.primary_sample_id, c.voice_profile_id, c.binding_source, c.status, \
-                c.render_settings_json \
+        "SELECT c.id, c.speaker_id, c.primary_sample_id, c.voice_profile_id, c.follow_speaker_id, \
+                c.binding_source, c.status, c.render_settings_json \
          FROM clone c JOIN speaker s ON s.id = c.speaker_id \
          WHERE s.project_id = ?1 ORDER BY c.speaker_id",
     )?;
@@ -522,6 +581,7 @@ pub fn upsert_clone(
     if let Some(existing) = clone_for_speaker(conn, speaker_id)? {
         if existing.primary_sample_id == Some(primary_sample_id)
             && existing.binding_source == binding_source
+            && existing.follow_speaker_id.is_none()
         {
             conn.execute("UPDATE clone SET voice_profile_id=?2 WHERE id=?1", params![existing.id,voice_profile_id])?;
             conn.execute(
@@ -533,7 +593,8 @@ pub fn upsert_clone(
         }
         conn.execute("DELETE FROM clone_reference WHERE clone_id=?1", [existing.id])?;
         conn.execute(
-            "UPDATE clone SET primary_sample_id = ?2, binding_source = ?3, status = 'pending', voice_profile_id=?4 \
+            "UPDATE clone SET primary_sample_id = ?2, binding_source = ?3, status = 'pending', \
+             voice_profile_id=?4, follow_speaker_id=NULL \
              WHERE id = ?1",
             params![existing.id, primary_sample_id, binding_source, voice_profile_id],
         )?;
@@ -619,22 +680,20 @@ pub fn completed_generations_for_project(
     conn: &Connection,
     project_id: i64,
 ) -> Result<Vec<(i64, String, bool, bool)>, AppError> {
-    let mut stmt = conn.prepare(
-        "SELECT g.line_id, g.output_path, \
-                CASE WHEN c.id IS NULL OR c.status != 'ready' \
-                       OR g.render_settings_hash IS NULL \
-                       OR (c.voice_profile_id IS NOT NULL AND \
-                           NOT (g.voice_profile_id_snapshot IS c.voice_profile_id)) \
-                       OR (c.voice_profile_id IS NULL AND (g.reference_sample_id IS NULL \
-                           OR c.primary_sample_id IS NULL \
-                           OR g.reference_sample_id != c.primary_sample_id)) \
-                     THEN 1 ELSE 0 END AS voice_changed, \
+    let sql = format!(
+        "{cte} \
+         SELECT g.line_id, g.output_path, \
+                {voice_changed} AS voice_changed, \
                 CASE WHEN g.synthesis_stale != 0 THEN 1 ELSE 0 END AS text_changed \
          FROM generation g JOIN line l ON l.id = g.line_id \
          LEFT JOIN clone c ON c.speaker_id = l.speaker_id \
+         LEFT JOIN resolved_voice rv ON rv.origin_speaker_id = l.speaker_id \
          WHERE l.project_id = ?1 AND g.status = 'done' AND g.output_path IS NOT NULL \
          ORDER BY g.line_id",
-    )?;
+        cte = crate::db::follow_binding::RESOLVED_VOICE_CTE,
+        voice_changed = crate::db::follow_binding::VOICE_CHANGED_CASE,
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map(params![project_id], |r| {
             Ok((
@@ -739,7 +798,8 @@ pub fn mark_running(
 }
 
 /// Record a successful render: `done` with the output derivative PATH and the last
-/// resumable state hint.
+/// resumable state hint. `voice_profile_id_snapshot` is the effective voice used
+/// for the render (resolved through follow edges when applicable).
 pub fn mark_done(
     conn: &Connection,
     generation_id: i64,
@@ -750,19 +810,32 @@ pub fn mark_done(
     resumable_state_json: &str,
     render_settings: &OmniVoiceRenderSettings,
     reference_fingerprint: &str,
+    voice_profile_id_snapshot: Option<i64>,
 ) -> Result<(), AppError> {
     render_settings.validate().map_err(AppError::Other)?;
     let render_settings_json = serde_json::to_string(render_settings)?;
     let render_settings_hash = render_settings.fingerprint().map_err(AppError::Other)?;
     conn.execute(
         "UPDATE generation SET status = 'done', clone_id = ?2, \
-             voice_profile_id_snapshot=(SELECT voice_profile_id FROM clone WHERE id=?2), \
+             voice_profile_id_snapshot = COALESCE(?10, \
+               (SELECT voice_profile_id FROM clone WHERE id=?2 AND binding_source != 'follow')), \
              reference_sample_id = ?3, \
              binding_source_snapshot = ?4, output_path = ?5, resumable_state_json = ?6, \
              render_settings_json = ?7, render_settings_hash = ?8, reference_fingerprint = ?9, \
              synthesis_stale = 0 \
          WHERE id = ?1",
-        params![generation_id, clone_id, reference_sample_id, binding_source, output_path, resumable_state_json, render_settings_json, render_settings_hash, reference_fingerprint],
+        params![
+            generation_id,
+            clone_id,
+            reference_sample_id,
+            binding_source,
+            output_path,
+            resumable_state_json,
+            render_settings_json,
+            render_settings_hash,
+            reference_fingerprint,
+            voice_profile_id_snapshot
+        ],
     )?;
     Ok(())
 }
@@ -893,7 +966,7 @@ mod tests {
         let clone = upsert_clone(&conn, speaker, sample, BindingSource::Default).unwrap();
         for (line, path) in [(line_a, "a.ogg"), (line_b, "b.ogg")] {
             let generation = get_or_create_generation(&conn, line, clone).unwrap();
-            mark_done(&conn, generation.id, clone, sample, BindingSource::Default, path, "{}", &OmniVoiceRenderSettings::default(), "ref").unwrap();
+            mark_done(&conn, generation.id, clone, sample, BindingSource::Default, path, "{}", &OmniVoiceRenderSettings::default(), "ref", None).unwrap();
         }
         conn.execute(
             "INSERT INTO render_candidate(line_id,status,output_path,text_snapshot,clone_id,reference_sample_id,reference_fingerprint,render_settings_json,render_settings_hash) VALUES(?1,'done','candidate.ogg','text',?2,?3,'ref','{}','hash')",
@@ -931,7 +1004,7 @@ mod tests {
         let clone = upsert_clone(&conn, speaker, sample, BindingSource::Default).unwrap();
         for (line, path) in [(line_a, "a.ogg"), (line_b, "b.ogg")] {
             let generation = get_or_create_generation(&conn, line, clone).unwrap();
-            mark_done(&conn, generation.id, clone, sample, BindingSource::Default, path, "{}", &OmniVoiceRenderSettings::default(), "ref").unwrap();
+            mark_done(&conn, generation.id, clone, sample, BindingSource::Default, path, "{}", &OmniVoiceRenderSettings::default(), "ref", None).unwrap();
         }
         let manual = OmniVoiceRenderSettingsPatch {
             num_steps: Some(48),
@@ -939,7 +1012,7 @@ mod tests {
         };
         write_line_render_override(&mut conn, line_a, Some(&manual), &OmniVoiceRenderSettings::default()).unwrap();
         let generation = get_or_create_generation(&conn, line_a, clone).unwrap();
-        mark_done(&conn, generation.id, clone, sample, BindingSource::Default, "a2.ogg", "{}", &OmniVoiceRenderSettings::default(), "ref").unwrap();
+        mark_done(&conn, generation.id, clone, sample, BindingSource::Default, "a2.ogg", "{}", &OmniVoiceRenderSettings::default(), "ref", None).unwrap();
         conn.execute(
             "INSERT INTO render_candidate(line_id,status,output_path,text_snapshot,clone_id,reference_sample_id,reference_fingerprint,render_settings_json,render_settings_hash) VALUES(?1,'done','candidate.ogg','text',?2,?3,'ref','{}','hash')",
             params![line_a, clone, sample],
@@ -1163,6 +1236,7 @@ mod tests {
                 "{}",
                 &OmniVoiceRenderSettings::default(),
                 "reference",
+                None,
             )
             .unwrap();
         }
@@ -1232,6 +1306,7 @@ mod tests {
             "{}",
             &OmniVoiceRenderSettings::default(),
             "reference",
+            None,
         )
         .unwrap();
 
@@ -1301,6 +1376,7 @@ mod tests {
             "{}",
             &OmniVoiceRenderSettings::default(),
             "reference",
+            None,
         )
         .unwrap();
 
@@ -1452,5 +1528,146 @@ mod tests {
         assert_eq!(pool_ids, vec![donor]);
         assert_eq!(unvoiced_ids, vec![bare]);
         assert!(pool_ids.iter().all(|d| !unvoiced_ids.contains(d)));
+    }
+
+    #[test]
+    fn legacy_clone_json_without_inherit_flag_migrates_peak_minus_one() {
+        let inherit = parse_clone_render_settings_json(
+            r#"{"speed":null,"num_steps":32,"guidance_scale":2.0,"t_shift":0.1,"layer_penalty_factor":5.0,"position_temperature":5.0,"class_temperature":0.0,"prompt_denoise":true,"preprocess_prompt":true,"postprocess_output":true,"audio_chunk_duration":10.0,"audio_chunk_threshold":30.0,"seed":42,"peak_normalize_dbfs":-1.0}"#,
+            1,
+        )
+        .unwrap();
+        assert!(inherit.peak_normalize_inherit);
+
+        let override_peak = parse_clone_render_settings_json(
+            r#"{"speed":null,"num_steps":32,"guidance_scale":2.0,"t_shift":0.1,"layer_penalty_factor":5.0,"position_temperature":5.0,"class_temperature":0.0,"prompt_denoise":true,"preprocess_prompt":true,"postprocess_output":true,"audio_chunk_duration":10.0,"audio_chunk_threshold":30.0,"seed":42,"peak_normalize_dbfs":-3.0}"#,
+            2,
+        )
+        .unwrap();
+        assert!(!override_peak.peak_normalize_inherit);
+        assert_eq!(override_peak.peak_normalize_dbfs, Some(-3.0));
+
+        let off = parse_clone_render_settings_json(
+            r#"{"speed":null,"num_steps":32,"guidance_scale":2.0,"t_shift":0.1,"layer_penalty_factor":5.0,"position_temperature":5.0,"class_temperature":0.0,"prompt_denoise":true,"preprocess_prompt":true,"postprocess_output":true,"audio_chunk_duration":10.0,"audio_chunk_threshold":30.0,"seed":42,"peak_normalize_dbfs":null}"#,
+            3,
+        )
+        .unwrap();
+        assert!(!off.peak_normalize_inherit);
+        assert_eq!(off.peak_normalize_dbfs, None);
+    }
+
+    #[test]
+    fn resolved_peak_uses_global_when_inheriting() {
+        let conn = mem_db();
+        let (sid, _lid) = speaker_with_line(&conn);
+        approve_sample(&conn, sid, "/ws/ref.wav");
+        let sample: i64 = conn
+            .query_row(
+                "SELECT id FROM reference_sample WHERE speaker_id=?1",
+                [sid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let cid = upsert_clone(&conn, sid, sample, BindingSource::Default).unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('omnivoice_peak_normalize_dbfs', '-3')",
+            [],
+        )
+        .unwrap();
+        let clone = conn
+            .query_row(
+                &format!("SELECT {CLONE_COLUMNS} FROM clone WHERE id=?1"),
+                [cid],
+                clone_from_row,
+            )
+            .unwrap();
+        let resolved = resolved_render_settings_for_clone(&conn, &clone).unwrap();
+        assert!(!resolved.peak_normalize_inherit);
+        assert_eq!(resolved.peak_normalize_dbfs, Some(-3.0));
+    }
+
+    #[test]
+    fn changing_global_peak_soft_invalidates_only_inheriting_clones() {
+        let mut conn = mem_db();
+        let (sid_a, lid_a) = speaker_with_line(&conn);
+        conn.execute("UPDATE line SET speaker_id=?1 WHERE id=?2", params![sid_a, lid_a])
+            .unwrap();
+        approve_sample(&conn, sid_a, "a.wav");
+        let sample_a: i64 = conn
+            .query_row(
+                "SELECT id FROM reference_sample WHERE speaker_id=?1",
+                [sid_a],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let cid_a = upsert_clone(&conn, sid_a, sample_a, BindingSource::Default).unwrap();
+
+        conn.execute(
+            "INSERT INTO speaker (project_id, cre_resref) VALUES (1, 'OTHER')",
+            [],
+        )
+        .unwrap();
+        let sid_b = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO line (project_id, strref, speaker_id) VALUES (1, 8, ?1)",
+            [sid_b],
+        )
+        .unwrap();
+        let lid_b = conn.last_insert_rowid();
+        approve_sample(&conn, sid_b, "b.wav");
+        let sample_b: i64 = conn
+            .query_row(
+                "SELECT id FROM reference_sample WHERE speaker_id=?1",
+                [sid_b],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let cid_b = upsert_clone(&conn, sid_b, sample_b, BindingSource::Default).unwrap();
+        let override_settings = OmniVoiceRenderSettings {
+            peak_normalize_inherit: false,
+            peak_normalize_dbfs: Some(-4.0),
+            ..Default::default()
+        };
+        update_clone_render_settings(&mut conn, cid_b, &override_settings).unwrap();
+
+        let resolved = OmniVoiceRenderSettings::default().with_resolved_peak(Some(-1.0));
+        for (line, clone, sample, path) in [
+            (lid_a, cid_a, sample_a, "a.ogg"),
+            (lid_b, cid_b, sample_b, "b.ogg"),
+        ] {
+            let generation = get_or_create_generation(&conn, line, clone).unwrap();
+            mark_done(
+                &conn,
+                generation.id,
+                clone,
+                sample,
+                BindingSource::Default,
+                path,
+                "{}",
+                &resolved,
+                "ref",
+                None,
+            )
+            .unwrap();
+        }
+
+        let reset = invalidate_inheriting_peak_generations(&mut conn).unwrap();
+        assert_eq!(reset, 1);
+        let hash_a: Option<String> = conn
+            .query_row(
+                "SELECT render_settings_hash FROM generation WHERE line_id=?1",
+                [lid_a],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let hash_b: Option<String> = conn
+            .query_row(
+                "SELECT render_settings_hash FROM generation WHERE line_id=?1",
+                [lid_b],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(hash_a.is_none());
+        assert!(hash_b.is_some());
     }
 }

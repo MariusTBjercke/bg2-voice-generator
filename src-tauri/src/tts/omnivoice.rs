@@ -393,6 +393,7 @@ mod tests {
             audio_chunk_threshold: 25.0,
             seed: 7,
             peak_normalize_dbfs: Some(-2.0),
+            peak_normalize_inherit: false,
         };
         let body = SynthReq::build(
             "hail",

@@ -7,6 +7,7 @@ export const LEGACY_BINDING_PREFERENCES_KEY = "bg2vg.binding-view.v1";
 
 export type DictionaryTab = "placeholders" | "rules" | "tags";
 export type ReviewPreferenceTab = "flagged" | "override" | "remaining" | "reviewed" | "suspicious";
+export type BindingAuditTab = "flagged" | "suspicious" | "remaining" | "reviewed";
 export type PreviewSettingsSource = "saved" | "edited";
 export type PreviewReference = "current" | "single" | "composite";
 
@@ -24,6 +25,15 @@ export interface BindingPreviewPreferences {
   reference: PreviewReference;
 }
 
+export interface ReviewUiPreferences {
+  aiAssistedOpen: boolean;
+  progressOpen: boolean;
+  queueOpen: boolean;
+  corpusAuditOpen: boolean;
+  voiceBindingsOpen: boolean;
+  bindingTab: BindingAuditTab;
+}
+
 export interface InstallUiPreferences {
   locale: string | null;
   harvestSelectedIdentityKey: string | null;
@@ -39,6 +49,7 @@ export interface InstallUiPreferences {
   };
   generationMoreFiltersOpen: boolean;
   reviewTab: ReviewPreferenceTab;
+  review: ReviewUiPreferences;
   exportPackName: string;
 }
 
@@ -56,6 +67,15 @@ export const defaultDictionaryUiPreferences = (): DictionaryUiPreferences => ({
   placeholderAdvancedOpen: false,
 });
 
+export const defaultReviewUiPreferences = (): ReviewUiPreferences => ({
+  aiAssistedOpen: true,
+  progressOpen: true,
+  queueOpen: true,
+  corpusAuditOpen: true,
+  voiceBindingsOpen: true,
+  bindingTab: "suspicious",
+});
+
 export const defaultInstallUiPreferences = (): InstallUiPreferences => ({
   locale: null,
   harvestSelectedIdentityKey: null,
@@ -71,6 +91,7 @@ export const defaultInstallUiPreferences = (): InstallUiPreferences => ({
   },
   generationMoreFiltersOpen: false,
   reviewTab: "flagged",
+  review: defaultReviewUiPreferences(),
   exportPackName: "",
 });
 
@@ -109,6 +130,31 @@ export function normalizeDictionaryUiPreferences(value: unknown): DictionaryUiPr
   };
 }
 
+export function normalizeReviewUiPreferences(value: unknown): ReviewUiPreferences {
+  const defaults = defaultReviewUiPreferences();
+  const source = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  return {
+    aiAssistedOpen: typeof source.aiAssistedOpen === "boolean"
+      ? source.aiAssistedOpen
+      : defaults.aiAssistedOpen,
+    progressOpen: typeof source.progressOpen === "boolean"
+      ? source.progressOpen
+      : defaults.progressOpen,
+    queueOpen: typeof source.queueOpen === "boolean" ? source.queueOpen : defaults.queueOpen,
+    corpusAuditOpen: typeof source.corpusAuditOpen === "boolean"
+      ? source.corpusAuditOpen
+      : defaults.corpusAuditOpen,
+    voiceBindingsOpen: typeof source.voiceBindingsOpen === "boolean"
+      ? source.voiceBindingsOpen
+      : defaults.voiceBindingsOpen,
+    bindingTab: oneOf(
+      source.bindingTab,
+      ["flagged", "suspicious", "remaining", "reviewed"] as const,
+      defaults.bindingTab,
+    ),
+  };
+}
+
 export function normalizeInstallUiPreferences(value: unknown): InstallUiPreferences {
   const defaults = defaultInstallUiPreferences();
   const source = value && typeof value === "object" ? value as Record<string, unknown> : {};
@@ -140,6 +186,7 @@ export function normalizeInstallUiPreferences(value: unknown): InstallUiPreferen
       ["flagged", "override", "remaining", "reviewed", "suspicious"] as const,
       defaults.reviewTab,
     ),
+    review: normalizeReviewUiPreferences(source.review),
     exportPackName: string(source.exportPackName),
   };
 }

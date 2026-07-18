@@ -121,6 +121,9 @@ describe("character sex + gender-mismatch facets", () => {
       donor_speaker_id: 9,
       donor_display_name: "Male donor",
       inherited: true,
+      follow_speaker_id: null,
+      follow_display_name: null,
+      sample_voice_sex: null,
     },
     2: {
       speaker_id: 2,
@@ -136,6 +139,9 @@ describe("character sex + gender-mismatch facets", () => {
       donor_speaker_id: 2,
       donor_display_name: "Male",
       inherited: false,
+      follow_speaker_id: null,
+      follow_display_name: null,
+      sample_voice_sex: null,
     },
   };
 

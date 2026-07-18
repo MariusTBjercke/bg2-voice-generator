@@ -258,13 +258,34 @@ fn resolved_paths(
     profile.references.iter().map(|reference| {
         let path = match (&reference.managed_path, reference.reference_sample_id) {
             (Some(path), _) => PathBuf::from(path),
-            (None, Some(sample_id)) => conn.query_row(
-                "SELECT local_derivative_path FROM reference_sample WHERE id=?1 AND decision='approved'",
-                [sample_id], |r| r.get::<_, Option<String>>(0),
-            )?.map(PathBuf::from).ok_or_else(|| AppError::Other(format!("harvested reference {sample_id} has no local audio")))?,
-            _ => return Err(AppError::Other("voice profile reference is missing local audio".into())),
+            (None, Some(sample_id)) => {
+                let path: Option<String> = conn
+                    .query_row(
+                        "SELECT local_derivative_path FROM reference_sample \
+                         WHERE id=?1 AND decision='approved'",
+                        [sample_id],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .flatten();
+                path.map(PathBuf::from).ok_or_else(|| {
+                    AppError::Other(format!(
+                        "voice profile reference sample {sample_id} is missing or not approved"
+                    ))
+                })?
+            }
+            _ => {
+                return Err(AppError::Other(
+                    "voice profile reference is missing local audio".into(),
+                ))
+            }
         };
-        Ok((reference.id, reference.reference_sample_id, path, reference.transcript.clone()))
+        Ok((
+            reference.id,
+            reference.reference_sample_id,
+            path,
+            reference.transcript.clone(),
+        ))
     }).collect()
 }
 
@@ -380,7 +401,8 @@ pub fn bind_profile_to_group(
             .optional()?;
         let clone_id = if let Some(clone_id) = existing {
             conn.execute(
-                "UPDATE clone SET primary_sample_id=?2,voice_profile_id=?3,binding_source=?4,status='ready' WHERE id=?1",
+                "UPDATE clone SET primary_sample_id=?2,voice_profile_id=?3,binding_source=?4,\
+                 status='ready',follow_speaker_id=NULL WHERE id=?1",
                 params![clone_id,primary_sample_id,profile_id,source],
             )?;
             clone_id
@@ -665,5 +687,38 @@ mod tests {
         let rows = crate::db::generation::completed_generations_for_project(&conn, 1).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].2, "unbound speaker marks prior clip voice_changed");
+    }
+
+    #[test]
+    fn resolved_paths_reports_missing_or_unapproved_sample_clearly() {
+        let conn = db();
+        conn.execute(
+            "INSERT INTO reference_sample(speaker_id,source_strref,source_sound_resref,decision,local_derivative_path,provenance_json) \
+             VALUES(1,42,'A01','rejected','a.wav','{\"source_text\":\"A\"}')",
+            [],
+        )
+        .unwrap();
+        let sample_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO voice_profile(project_id,display_name,origin,availability,created_at,updated_at) \
+             VALUES(1,'Harvested','harvested','available','now','now')",
+            [],
+        )
+        .unwrap();
+        let profile_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO voice_profile_reference(voice_profile_id,reference_sample_id,transcript,sort_order) \
+             VALUES(?1,?2,'A',0)",
+            params![profile_id, sample_id],
+        )
+        .unwrap();
+        let profile = profile_by_id(&conn, profile_id).unwrap().unwrap();
+        let err = resolved_paths(&conn, &profile).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!(
+                "voice profile reference sample {sample_id} is missing or not approved"
+            )),
+            "got: {err}"
+        );
     }
 }

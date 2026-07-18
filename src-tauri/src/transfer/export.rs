@@ -170,6 +170,9 @@ pub(crate) struct BundleClone {
     pub references: Vec<BundleCloneReference>,
     #[serde(default)]
     pub voice_profile_key: Option<String>,
+    /// When `binding_source` is `follow`, the target speaker's CRE resref.
+    #[serde(default)]
+    pub follow_speaker_cre_resref: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -471,9 +474,11 @@ fn gather_sample_decisions(
 /// re-harvests and rebinds locally.
 fn gather_clones(conn: &Connection, project_id: i64) -> Result<Vec<BundleClone>, AppError> {
     let mut stmt = conn.prepare(
-        "SELECT s.cre_resref, c.binding_source, c.status, c.render_settings_json, c.voice_profile_id \
+        "SELECT s.cre_resref, c.binding_source, c.status, c.render_settings_json, c.voice_profile_id, \
+                follow.cre_resref \
          FROM clone c \
          JOIN speaker s ON s.id = c.speaker_id \
+         LEFT JOIN speaker follow ON follow.id = c.follow_speaker_id \
          WHERE s.project_id = ?1 ORDER BY s.cre_resref",
     )?;
     let rows = stmt
@@ -494,6 +499,7 @@ fn gather_clones(conn: &Connection, project_id: i64) -> Result<Vec<BundleClone>,
                 render_settings,
                 references: Vec::new(),
                 voice_profile_key: r.get::<_,Option<i64>>(4)?.map(|id| format!("profile-{id}")),
+                follow_speaker_cre_resref: r.get(5)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

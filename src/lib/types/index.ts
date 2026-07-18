@@ -103,7 +103,10 @@ export type LineStatus = 'pending' | 'ready' | 'blocked' | 'exported' | 'skipped
 export type SampleDecision = 'pending' | 'approved' | 'rejected';
 
 /** Mirror of `models::BindingSource`. */
-export type BindingSource = 'override' | 'default' | 'generic';
+export type BindingSource = 'override' | 'default' | 'generic' | 'follow';
+
+/** Mirror of `models::BindingReviewStatus`. */
+export type BindingReviewStatus = 'flagged' | 'reviewed';
 
 /** Mirror of `models::CloneStatus`. */
 export type CloneStatus = 'pending' | 'ready' | 'failed';
@@ -170,6 +173,8 @@ export interface OmniVoiceRenderSettings {
   audio_chunk_threshold: number;
   seed: number;
   peak_normalize_dbfs: number | null;
+  /** When true, use the machine-wide peak default instead of `peak_normalize_dbfs`. */
+  peak_normalize_inherit: boolean;
 }
 
 /** Sparse, local-only layer over a clone's render settings. Omitted fields inherit. */
@@ -365,6 +370,7 @@ export interface Clone {
   speaker_id: number;
   primary_sample_id: number | null;
   voice_profile_id: number | null;
+  follow_speaker_id: number | null;
   binding_source: BindingSource;
   status: CloneStatus;
   render_settings_json: string;
@@ -668,6 +674,10 @@ export interface EffectiveSpeakerBinding {
   donor_speaker_id: number | null;
   donor_display_name: string | null;
   inherited: boolean;
+  follow_speaker_id: number | null;
+  follow_display_name: string | null;
+  /** CRE sex IDS byte inferred from the bound sample's sound owner, when known. */
+  sample_voice_sex: number | null;
 }
 
 /** Mirror of `commands::metadata_binding::MetadataAssignment`. */
@@ -701,6 +711,109 @@ export interface AutoConfigureMetadataPoolsResult {
 /** Mirror of `commands::metadata_binding::ClearBindingsResult`. */
 export interface ClearBindingsResult {
   cleared: number;
+}
+
+/** Mirror of `models::BindingAuditProgress`. */
+export interface BindingAuditProgress {
+  personal_ready: number;
+  flagged: number;
+  reviewed: number;
+  remaining_personal: number;
+  generic_skipped: number;
+  unbound: number;
+}
+
+/** Mirror of `models::BindingSuspiciousHint`. */
+export interface BindingSuspiciousHint {
+  code: string;
+  detail: string;
+}
+
+/** Mirror of `models::BindingReviewMarker`. */
+export interface BindingReviewMarker {
+  project_id: number;
+  cre_resref: string;
+  status: BindingReviewStatus;
+  reason: string;
+  updated_at: string;
+}
+
+/** Mirror of `models::BindingPersonalRow`. */
+export interface BindingPersonalRow {
+  speaker_id: number;
+  display_name: string;
+  cre_resref: string;
+  sex: number;
+  display_identity_key: string;
+  operational_identity_key: string;
+  binding_source: BindingSource;
+  clone_status: CloneStatus;
+  sample_id: number | null;
+  sample_sound_resref: string | null;
+  sample_owner_cre_resref: string | null;
+  sample_eligibility: string | null;
+  sample_shared_source_count: number;
+  sample_text_excerpt: string;
+  review_status: BindingReviewStatus | null;
+  review_reason: string;
+  heuristic_hints: BindingSuspiciousHint[];
+}
+
+/** Mirror of `models::BindingSuspiciousRow`. */
+export interface BindingSuspiciousRow {
+  speaker_id: number;
+  display_name: string;
+  cre_resref: string;
+  sex: number;
+  display_identity_key: string;
+  binding_source: BindingSource | null;
+  sample_id: number | null;
+  sample_sound_resref: string | null;
+  sample_owner_cre_resref: string | null;
+  sample_text_excerpt: string;
+  review_status: BindingReviewStatus | null;
+  review_reason: string;
+  heuristic_hints: BindingSuspiciousHint[];
+}
+
+/** Mirror of `models::BindingSampleSummary`. */
+export interface BindingSampleSummary {
+  sample_id: number;
+  source_sound_resref: string | null;
+  decision: SampleDecision;
+  eligibility: string;
+  shared_source_count: number;
+  overall_score: number | null;
+  source_text_excerpt: string;
+  has_local_derivative: boolean;
+}
+
+/** Mirror of `models::BindingShowDetail`. */
+export interface BindingShowDetail {
+  speaker_id: number;
+  display_name: string;
+  cre_resref: string;
+  sex: number;
+  display_identity_key: string;
+  operational_identity_key: string;
+  binding_source: BindingSource | null;
+  clone_status: CloneStatus | null;
+  sample_id: number | null;
+  review: BindingReviewMarker | null;
+  personal: BindingPersonalRow | null;
+  samples: BindingSampleSummary[];
+  display_group_siblings: BindingPersonalRow[];
+  shares_voice_with_display_group: boolean;
+}
+
+/** Mirror of `models::BindingGroupSummary`. */
+export interface BindingGroupSummary {
+  identity_key: string;
+  display_name: string;
+  variant_count: number;
+  member_cre_resrefs: string[];
+  shares_voice: boolean;
+  shared_personal_primary_sample: boolean;
 }
 
 /**

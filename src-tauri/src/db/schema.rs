@@ -48,7 +48,22 @@ const MIGRATIONS: &[Migration] = &[
         version: 7,
         sql: V7_SAME_SOUND_DECISION_REPAIR_GATE,
     },
+    Migration {
+        version: 8,
+        sql: V8_BINDING_REVIEW,
+    },
+    Migration {
+        version: 9,
+        sql: V9_FOLLOW_BINDING_GATE,
+    },
 ];
+
+/// v9 — live “follow character” bindings. DDL runs in a Rust hook so foreign keys
+/// can be disabled for the clone/generation table rebuilds (CHECK cannot be widened
+/// with ALTER TABLE).
+const V9_FOLLOW_BINDING_GATE: &str = r#"
+SELECT 1;
+"#;
 
 /// v6 — per-speaker exclude-from-generate/export flag (Binding identity-group toggle).
 const V6_SPEAKER_EXCLUDED: &str = r#"
@@ -61,6 +76,20 @@ ALTER TABLE speaker ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0
 /// display identity group after partial legacy approvals.
 const V7_SAME_SOUND_DECISION_REPAIR_GATE: &str = r#"
 SELECT 1;
+"#;
+
+/// v8 — local agent/human markers for personal voice-binding audit (CRE-stable keys).
+const V8_BINDING_REVIEW: &str = r#"
+CREATE TABLE binding_review (
+    project_id  INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+    cre_resref  TEXT NOT NULL,
+    status      TEXT NOT NULL CHECK (status IN ('flagged', 'reviewed')),
+    reason      TEXT NOT NULL DEFAULT '',
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (project_id, cre_resref)
+);
+CREATE INDEX idx_binding_review_project_status
+    ON binding_review(project_id, status);
 "#;
 
 /// v5 — reusable project voice profiles. Legacy sample columns and donor rows stay
@@ -387,7 +416,7 @@ CREATE TABLE IF NOT EXISTS clone (
     status            TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'ready', 'failed')),
     render_settings_json TEXT NOT NULL DEFAULT
-'{"speed":null,"num_steps":32,"guidance_scale":2.0,"t_shift":0.1,"layer_penalty_factor":5.0,"position_temperature":5.0,"class_temperature":0.0,"prompt_denoise":true,"preprocess_prompt":true,"postprocess_output":true,"audio_chunk_duration":10.0,"audio_chunk_threshold":30.0,"seed":42,"peak_normalize_dbfs":-1.0}'
+'{"speed":null,"num_steps":32,"guidance_scale":2.0,"t_shift":0.1,"layer_penalty_factor":5.0,"position_temperature":5.0,"class_temperature":0.0,"prompt_denoise":true,"preprocess_prompt":true,"postprocess_output":true,"audio_chunk_duration":10.0,"audio_chunk_threshold":30.0,"seed":42,"peak_normalize_dbfs":-1.0,"peak_normalize_inherit":true}'
 );
 CREATE INDEX IF NOT EXISTS ix_clone_speaker ON clone(speaker_id);
 
@@ -523,6 +552,9 @@ pub fn run_migrations(conn: &mut Connection) -> Result<(), AppError> {
             7 => {
                 crate::db::harvest::repair_same_sound_sample_decisions(&tx)?;
             }
+            9 => {
+                migrate_v9_follow_binding(&tx)?;
+            }
             _ => {}
         }
         // PRAGMA user_version doesn't accept bound params - the value is our own
@@ -531,6 +563,153 @@ pub fn run_migrations(conn: &mut Connection) -> Result<(), AppError> {
         tx.commit()?;
         log::info!("applied schema migration v{}", m.version);
     }
+    Ok(())
+}
+
+/// Rebuild `clone` / `generation` so `binding_source` may be `'follow'` and clones
+/// may store `follow_speaker_id`. Existing rows keep their data; follow column is NULL.
+fn migrate_v9_follow_binding(tx: &rusqlite::Transaction<'_>) -> Result<(), AppError> {
+    // FK pragma is a no-op inside a transaction on some SQLite builds; recreate via
+    // backup tables so CASCADE drops do not wipe clone_reference prematurely.
+    tx.execute_batch(
+        r#"
+CREATE TABLE clone_v9 (
+    id                INTEGER PRIMARY KEY,
+    speaker_id        INTEGER NOT NULL REFERENCES speaker(id) ON DELETE CASCADE,
+    primary_sample_id INTEGER REFERENCES reference_sample(id) ON DELETE SET NULL,
+    voice_profile_id  INTEGER REFERENCES voice_profile(id) ON DELETE SET NULL,
+    follow_speaker_id INTEGER REFERENCES speaker(id) ON DELETE SET NULL,
+    binding_source    TEXT NOT NULL DEFAULT 'default'
+        CHECK (binding_source IN ('override', 'default', 'generic', 'follow')),
+    status            TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'ready', 'failed')),
+    render_settings_json TEXT NOT NULL DEFAULT
+'{"speed":null,"num_steps":32,"guidance_scale":2.0,"t_shift":0.1,"layer_penalty_factor":5.0,"position_temperature":5.0,"class_temperature":0.0,"prompt_denoise":true,"preprocess_prompt":true,"postprocess_output":true,"audio_chunk_duration":10.0,"audio_chunk_threshold":30.0,"seed":42,"peak_normalize_dbfs":-1.0,"peak_normalize_inherit":true}',
+    CHECK (
+      (binding_source = 'follow' AND follow_speaker_id IS NOT NULL AND follow_speaker_id != speaker_id)
+      OR (binding_source != 'follow' AND follow_speaker_id IS NULL)
+    )
+);
+INSERT INTO clone_v9 (
+    id, speaker_id, primary_sample_id, voice_profile_id, follow_speaker_id,
+    binding_source, status, render_settings_json
+)
+SELECT id, speaker_id, primary_sample_id, voice_profile_id, NULL,
+       binding_source, status, render_settings_json
+FROM clone;
+
+CREATE TABLE clone_reference_v9 AS SELECT * FROM clone_reference;
+
+CREATE TABLE generation_v9 (
+    id                   INTEGER PRIMARY KEY,
+    line_id              INTEGER NOT NULL REFERENCES line(id) ON DELETE CASCADE,
+    clone_id             INTEGER,
+    status               TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'running', 'done', 'failed')),
+    output_path          TEXT,
+    attempts             INTEGER NOT NULL DEFAULT 0,
+    resumable_state_json TEXT NOT NULL DEFAULT '{}',
+    reference_sample_id  INTEGER,
+    binding_source_snapshot TEXT
+        CHECK (binding_source_snapshot IS NULL OR binding_source_snapshot IN ('override','default','generic','follow')),
+    render_settings_json TEXT,
+    render_settings_hash TEXT,
+    reference_fingerprint TEXT,
+    diagnostics_json     TEXT,
+    voice_profile_id_snapshot INTEGER,
+    synthesis_stale      INTEGER NOT NULL DEFAULT 0
+);
+"#,
+    )?;
+
+    // Copy generation columns that exist (synthesis_stale / voice_profile_id_snapshot
+    // were added in later migrations; probe via pragma).
+    let gen_cols: Vec<String> = {
+        let mut stmt = tx.prepare("PRAGMA table_info(generation)")?;
+        let cols = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        cols
+    };
+    let has = |name: &str| gen_cols.iter().any(|c| c == name);
+    let select_vp = if has("voice_profile_id_snapshot") {
+        "voice_profile_id_snapshot"
+    } else {
+        "NULL"
+    };
+    let select_stale = if has("synthesis_stale") {
+        "synthesis_stale"
+    } else {
+        "0"
+    };
+    tx.execute(
+        &format!(
+            "INSERT INTO generation_v9 (\
+                id, line_id, clone_id, status, output_path, attempts, resumable_state_json, \
+                reference_sample_id, binding_source_snapshot, render_settings_json, \
+                render_settings_hash, reference_fingerprint, diagnostics_json, \
+                voice_profile_id_snapshot, synthesis_stale) \
+             SELECT id, line_id, clone_id, status, output_path, attempts, resumable_state_json, \
+                reference_sample_id, binding_source_snapshot, render_settings_json, \
+                render_settings_hash, reference_fingerprint, diagnostics_json, \
+                {select_vp}, {select_stale} \
+             FROM generation"
+        ),
+        [],
+    )?;
+
+    tx.execute_batch(
+        r#"
+DROP TABLE generation;
+DROP TABLE clone_reference;
+DROP TABLE clone;
+
+ALTER TABLE clone_v9 RENAME TO clone;
+CREATE INDEX IF NOT EXISTS ix_clone_speaker ON clone(speaker_id);
+CREATE INDEX IF NOT EXISTS ix_clone_voice_profile ON clone(voice_profile_id);
+CREATE INDEX IF NOT EXISTS ix_clone_follow_speaker ON clone(follow_speaker_id);
+CREATE INDEX IF NOT EXISTS ix_clone_status_speaker ON clone(status, speaker_id);
+
+CREATE TABLE clone_reference (
+    clone_id   INTEGER NOT NULL REFERENCES clone(id) ON DELETE CASCADE,
+    sample_id  INTEGER NOT NULL REFERENCES reference_sample(id) ON DELETE CASCADE,
+    sort_order INTEGER NOT NULL CHECK (sort_order >= 0),
+    PRIMARY KEY (clone_id, sample_id),
+    UNIQUE (clone_id, sort_order)
+);
+INSERT INTO clone_reference SELECT * FROM clone_reference_v9;
+DROP TABLE clone_reference_v9;
+CREATE INDEX IF NOT EXISTS ix_clone_reference_sample ON clone_reference(sample_id);
+
+ALTER TABLE generation_v9 RENAME TO generation;
+-- Re-attach clone FK now that `clone` has its final name (SQLite cannot ALTER FK).
+CREATE TABLE generation_v9b (
+    id                   INTEGER PRIMARY KEY,
+    line_id              INTEGER NOT NULL REFERENCES line(id) ON DELETE CASCADE,
+    clone_id             INTEGER REFERENCES clone(id) ON DELETE SET NULL,
+    status               TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'running', 'done', 'failed')),
+    output_path          TEXT,
+    attempts             INTEGER NOT NULL DEFAULT 0,
+    resumable_state_json TEXT NOT NULL DEFAULT '{}',
+    reference_sample_id  INTEGER,
+    binding_source_snapshot TEXT
+        CHECK (binding_source_snapshot IS NULL OR binding_source_snapshot IN ('override','default','generic','follow')),
+    render_settings_json TEXT,
+    render_settings_hash TEXT,
+    reference_fingerprint TEXT,
+    diagnostics_json     TEXT,
+    voice_profile_id_snapshot INTEGER,
+    synthesis_stale      INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO generation_v9b SELECT * FROM generation;
+DROP TABLE generation;
+ALTER TABLE generation_v9b RENAME TO generation;
+CREATE INDEX IF NOT EXISTS ix_generation_line ON generation(line_id);
+CREATE INDEX IF NOT EXISTS ix_generation_done_line
+    ON generation(status, line_id) WHERE output_path IS NOT NULL;
+"#,
+    )?;
     Ok(())
 }
 
@@ -591,6 +770,7 @@ mod tests {
             "voice_profile",
             "voice_profile_reference",
             "metadata_binding_profile",
+            "binding_review",
         ] {
             let n: i64 = conn
                 .query_row(

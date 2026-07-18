@@ -25,3 +25,22 @@ export function pathWithoutIdentity(url: URL): string {
   const search = next.searchParams.toString();
   return `${next.pathname}${search ? `?${search}` : ""}${next.hash}`;
 }
+
+type IdentityGroup = { identity_key: string; long_name_strref: number | null };
+
+/**
+ * Resolve a deep-link / saved identity key against current speaker groups.
+ * Accepts sex-scoped keys (`15855:2`) and legacy plain strrefs (`15855`).
+ */
+export function findGroupByIdentityParam<T extends IdentityGroup>(
+  groups: T[],
+  key: string,
+): T | undefined {
+  const exact = groups.find((g) => g.identity_key === key);
+  if (exact) return exact;
+  if (/^\d+$/.test(key)) {
+    const strref = Number(key);
+    return groups.find((g) => g.long_name_strref === strref);
+  }
+  return undefined;
+}

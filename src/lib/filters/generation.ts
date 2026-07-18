@@ -1,4 +1,5 @@
 import type { DemographicGroup, EffectiveSpeakerBinding, GeneratableLine, Speaker } from "$lib/types";
+import { identityKey } from "$lib/speakers/groups";
 
 export type GenerationRenderState =
   | "missing"
@@ -7,7 +8,7 @@ export type GenerationRenderState =
   | "text_changed"
   | "running"
   | "failed";
-export type GenerationBindingMode = "demographic" | "personal";
+export type GenerationBindingMode = "demographic" | "personal" | "following";
 export type GenerationPackAudio = "absent" | "present";
 
 /** Frontend-only filter state for the Generation screen. */
@@ -155,11 +156,10 @@ function matchesSelected(selected: readonly string[], actual: string | null): bo
   return selected.length === 0 || (actual !== null && selected.includes(actual));
 }
 
-/** Identity key for speaker filter facets (named strref or singleton). */
+/** Identity key for speaker filter facets (named strref+sex or singleton). */
 export function speakerIdentityKey(speaker: Speaker | null): string | null {
   if (!speaker) return null;
-  if (speaker.long_name_strref !== null) return String(speaker.long_name_strref);
-  return `ungrouped:${speaker.id}`;
+  return identityKey(speaker);
 }
 
 function matchesSpeakerFilter(
@@ -171,6 +171,13 @@ function matchesSpeakerFilter(
   if (lineSpeakerId === null || !speaker) return false;
   const key = speakerIdentityKey(speaker);
   if (key !== null && selected.includes(key)) return true;
+  // Legacy plain-strref filters (pre sex-scoped keys).
+  if (
+    speaker.long_name_strref !== null &&
+    selected.includes(String(speaker.long_name_strref))
+  ) {
+    return true;
+  }
   // Legacy persisted filters may still store raw speaker ids.
   return selected.includes(String(lineSpeakerId));
 }
@@ -215,7 +222,7 @@ export function matchesGenerationScope(item: GenerationScopeItem, scope: Generat
   if (!matchesSelected(scope.sexes, speaker === null ? null : String(speaker.sex))) return false;
   if (!matchesSelected(scope.races, speaker === null ? null : String(speaker.race))) return false;
   if (!matchesSelected(scope.creatureCategories, speaker === null ? null : String(speaker.creature_category))) return false;
-  if (!matchesSelected(scope.bindingModes, binding?.clone_id ? (binding.inherited ? "demographic" : "personal") : null)) return false;
+  if (!matchesSelected(scope.bindingModes, binding?.clone_id ? (binding.binding_source === "follow" ? "following" : binding.inherited ? "demographic" : "personal") : null)) return false;
   if (!matchesSelected(scope.donors, donorToken(item))) return false;
   if (!matchesSelected(scope.dlgs, line.dlg_resref)) return false;
   if (scope.renderStates.length > 0

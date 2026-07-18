@@ -8,8 +8,8 @@ use tauri::{AppHandle, State};
 use tauri_plugin_opener::OpenerExt;
 
 use crate::agent_templates::{
-    render_workspace_docs, WorkspaceContext, AGENTS_SKILL_PATH, CLAUDE_SKILL_PATH,
-    SET_SYNTHESIS_SKILL,
+    render_workspace_docs, WorkspaceContext, AGENTS_BINDING_SKILL_PATH, AGENTS_SKILL_PATH,
+    AUDIT_BINDINGS_SKILL, CLAUDE_BINDING_SKILL_PATH, CLAUDE_SKILL_PATH, SET_SYNTHESIS_SKILL,
 };
 use crate::error::AppError;
 use crate::AppState;
@@ -53,14 +53,12 @@ fn workspace_dir(data_dir: &Path, project_id: i64) -> PathBuf {
         .join(project_id.to_string())
 }
 
-fn stage_skill(workspace: &Path, content: &str) -> Result<(), AppError> {
-    for relative in [AGENTS_SKILL_PATH, CLAUDE_SKILL_PATH] {
-        let path = workspace.join(relative);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, content)?;
+fn stage_skill(workspace: &Path, relative: &str, content: &str) -> Result<(), AppError> {
+    let path = workspace.join(relative);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+    std::fs::write(path, content)?;
     Ok(())
 }
 
@@ -71,6 +69,7 @@ fn stage_workspace(
 ) -> Result<PathBuf, AppError> {
     let (project_id, game_root) = project_for_game_dir(conn, game_dir)?;
     let summary = crate::synthesis::tagging_summary(conn, Some(project_id), true)?;
+    let binding = crate::db::binding_audit::binding_progress(conn, project_id)?;
     let context = WorkspaceContext {
         cli_path: cli_path(),
         db_path: db_path.to_string_lossy().into_owned(),
@@ -80,10 +79,17 @@ fn stage_workspace(
         overridden: summary.overridden,
         reviewed: summary.reviewed,
         remaining: summary.remaining,
+        personal_ready: binding.personal_ready as usize,
+        binding_flagged: binding.flagged as usize,
+        binding_reviewed: binding.reviewed as usize,
+        binding_remaining: binding.remaining_personal as usize,
     };
     let (claude, agents) = render_workspace_docs(&context);
     let workspace = workspace_dir(data_dir(db_path)?, project_id);
-    stage_skill(&workspace, SET_SYNTHESIS_SKILL)?;
+    stage_skill(&workspace, AGENTS_SKILL_PATH, SET_SYNTHESIS_SKILL)?;
+    stage_skill(&workspace, CLAUDE_SKILL_PATH, SET_SYNTHESIS_SKILL)?;
+    stage_skill(&workspace, AGENTS_BINDING_SKILL_PATH, AUDIT_BINDINGS_SKILL)?;
+    stage_skill(&workspace, CLAUDE_BINDING_SKILL_PATH, AUDIT_BINDINGS_SKILL)?;
     std::fs::write(workspace.join("CLAUDE.md"), claude)?;
     std::fs::write(workspace.join("AGENTS.md"), agents)?;
     Ok(workspace)

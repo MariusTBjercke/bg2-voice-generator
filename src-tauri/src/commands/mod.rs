@@ -8,6 +8,7 @@
 
 pub mod agent;
 pub mod attribution;
+pub mod binding_audit;
 pub mod dictionary;
 pub mod export;
 pub mod extractor;

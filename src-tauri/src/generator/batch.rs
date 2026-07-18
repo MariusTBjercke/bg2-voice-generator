@@ -254,6 +254,7 @@ pub async fn generate_batch(
                                 &state,
                                 &p.job.render_settings,
                                 &p.job.reference_fingerprint,
+                                p.job.voice_profile_id,
                             ) {
                                 Ok(()) => {
                                     if let Err(e) = store_generation_diagnostics(&conn, p.generation_id, &diagnostics) { results[p.index] = Some(Err(e)); continue; }
@@ -352,6 +353,7 @@ async fn finish_unresolved_pending(
                         &state,
                         &p.job.render_settings,
                         &p.job.reference_fingerprint,
+                        p.job.voice_profile_id,
                     ) {
                         Ok(()) => {
                             if let Err(e) = store_generation_diagnostics(&conn, p.generation_id, &diagnostics) { results[p.index] = Some(Err(e)); continue; }

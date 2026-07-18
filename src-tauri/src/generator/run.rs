@@ -188,6 +188,7 @@ pub async fn generate_line(
                 &state,
                 &job.render_settings,
                 &job.reference_fingerprint,
+                job.voice_profile_id,
             )?;
             store_generation_diagnostics(&conn, generation_id, &diagnostics)?;
             Ok(LineResult {

@@ -21,6 +21,15 @@ import type {
   LineStatus,
   SampleDecision,
   BindingSource,
+  BindingReviewStatus,
+  BindingAuditProgress,
+  BindingPersonalRow,
+  BindingSuspiciousRow,
+  BindingSuspiciousHint,
+  BindingReviewMarker,
+  BindingSampleSummary,
+  BindingShowDetail,
+  BindingGroupSummary,
   CloneStatus,
   GenerationStatus,
   OmniVoiceRenderSettings,
@@ -147,12 +156,12 @@ describe('TS<->Rust model contract (mirror of models.rs contract_tests)', () => 
       layer_penalty_factor: 5, position_temperature: 5, class_temperature: 0,
       prompt_denoise: true, preprocess_prompt: true, postprocess_output: true,
       audio_chunk_duration: 10, audio_chunk_threshold: 30, seed: 42,
-      peak_normalize_dbfs: -1,
+      peak_normalize_dbfs: -1, peak_normalize_inherit: true,
     }))).toEqual(want(
       'speed', 'num_steps', 'guidance_scale', 't_shift', 'layer_penalty_factor',
       'position_temperature', 'class_temperature', 'prompt_denoise',
       'preprocess_prompt', 'postprocess_output', 'audio_chunk_duration',
-      'audio_chunk_threshold', 'seed', 'peak_normalize_dbfs',
+      'audio_chunk_threshold', 'seed', 'peak_normalize_dbfs', 'peak_normalize_inherit',
     ));
     expect(keys(s<OmniVoiceRenderSettingsPatch>({ speed: null, num_steps: 32 })))
       .toEqual(want('speed', 'num_steps'));
@@ -183,8 +192,8 @@ describe('TS<->Rust model contract (mirror of models.rs contract_tests)', () => 
       .toEqual(want('rows', 'total', 'token_total'));
     expect(keys(s<ReferenceSample>({ id: 0, speaker_id: 0, source_strref: null, source_sound_resref: null, provenance_json: '', scores_json: '', decision: 'pending', local_derivative_path: null })))
       .toEqual(want('id', 'speaker_id', 'source_strref', 'source_sound_resref', 'provenance_json', 'scores_json', 'decision', 'local_derivative_path'));
-    expect(keys(s<Clone>({ id: 0, speaker_id: 0, primary_sample_id: null, voice_profile_id: null, binding_source: 'default', status: 'pending', render_settings_json: '' })))
-      .toEqual(want('id', 'speaker_id', 'primary_sample_id', 'voice_profile_id', 'binding_source', 'status', 'render_settings_json'));
+    expect(keys(s<Clone>({ id: 0, speaker_id: 0, primary_sample_id: null, voice_profile_id: null, follow_speaker_id: null, binding_source: 'default', status: 'pending', render_settings_json: '' })))
+      .toEqual(want('id', 'speaker_id', 'primary_sample_id', 'voice_profile_id', 'follow_speaker_id', 'binding_source', 'status', 'render_settings_json'));
     expect(keys(s<CloneReference>({ clone_id: 0, sample_id: 0, sort_order: 0 })))
       .toEqual(want('clone_id', 'sample_id', 'sort_order'));
     expect(keys(s<BindingPreview>({ output_path: '', reference: 'single', sample_ids: [], reference_duration_secs: 0, settings_fingerprint: '' })))
@@ -234,8 +243,8 @@ describe('TS<->Rust model contract (mirror of models.rs contract_tests)', () => 
       .toEqual(want('sex', 'race', 'creature_category', 'sex_label', 'race_label', 'creature_category_label', 'speaker_count', 'line_count', 'pool_size', 'configured', 'unvoiced_count', 'ready_clone_count'));
     expect(keys(s<MetadataBinding>({ sex: 0, race: 0, creature_category: 0, sex_label: '', race_label: '', creature_category_label: '', donor_speaker_ids: [], voice_profile_ids: [] })))
       .toEqual(want('sex', 'race', 'creature_category', 'sex_label', 'race_label', 'creature_category_label', 'donor_speaker_ids', 'voice_profile_ids'));
-    expect(keys(s<EffectiveSpeakerBinding>({ speaker_id: 0, line_count: 0, clone_id: null, binding_source: null, clone_status: null, sample_id: null, sample_path: null, voice_profile_id: null, voice_profile_name: null, voice_profile_origin: null, donor_speaker_id: null, donor_display_name: null, inherited: false })))
-      .toEqual(want('speaker_id', 'line_count', 'clone_id', 'binding_source', 'clone_status', 'sample_id', 'sample_path', 'voice_profile_id', 'voice_profile_name', 'voice_profile_origin', 'donor_speaker_id', 'donor_display_name', 'inherited'));
+    expect(keys(s<EffectiveSpeakerBinding>({ speaker_id: 0, line_count: 0, clone_id: null, binding_source: null, clone_status: null, sample_id: null, sample_path: null, voice_profile_id: null, voice_profile_name: null, voice_profile_origin: null, donor_speaker_id: null, donor_display_name: null, inherited: false, follow_speaker_id: null, follow_display_name: null, sample_voice_sex: null })))
+      .toEqual(want('speaker_id', 'line_count', 'clone_id', 'binding_source', 'clone_status', 'sample_id', 'sample_path', 'voice_profile_id', 'voice_profile_name', 'voice_profile_origin', 'donor_speaker_id', 'donor_display_name', 'inherited', 'follow_speaker_id', 'follow_display_name', 'sample_voice_sex'));
     expect(keys(s<MetadataAssignment>({ speaker_id: 0, donor_speaker_id: 0, voice_profile_id: null, matched_sex: false, matched_creature_category: false, matched_race: false, matched_class: false, from_pool: false })))
       .toEqual(want('speaker_id', 'donor_speaker_id', 'voice_profile_id', 'matched_sex', 'matched_creature_category', 'matched_race', 'matched_class', 'from_pool'));
     expect(keys(s<ApplyMetadataResult>({ speakers_pool_bound: 0, speakers_auto_bound: 0, speakers_failed: 0, speakers_skipped: 0, assignments: [] })))
@@ -250,7 +259,7 @@ describe('TS<->Rust model contract (mirror of models.rs contract_tests)', () => 
       .toEqual(want('overall', 'provenance', 'attribution', 'duration', 'loudness', 'cleanliness', 'naturalness', 'pitch', 'speech', 'text_richness', 'ordinary_speech', 'duration_secs'));
     expect(keys(s<EngineStatus>({ running: false, ready: false, base_url: '', model_id: null, load_error: null, owned: false, installed: false, device: null, cuda_name: null, fork: null, voice_design: false })))
       .toEqual(want('running', 'ready', 'base_url', 'model_id', 'load_error', 'owned', 'installed', 'device', 'cuda_name', 'fork', 'voice_design'));
-    expect(keys(s<BindCloneResult>({ clone: { id: 0, speaker_id: 0, primary_sample_id: null, voice_profile_id: null, binding_source: 'default', status: 'ready', render_settings_json: '' }, reference_duration_secs: 0, duration_warning: null })))
+    expect(keys(s<BindCloneResult>({ clone: { id: 0, speaker_id: 0, primary_sample_id: null, voice_profile_id: null, follow_speaker_id: null, binding_source: 'default', status: 'ready', render_settings_json: '' }, reference_duration_secs: 0, duration_warning: null })))
       .toEqual(want('clone', 'reference_duration_secs', 'duration_warning'));
     expect(keys(s<LineResult>({ generation_id: 0, output_path: '', resumed: false })))
       .toEqual(want('generation_id', 'output_path', 'resumed'));
@@ -318,6 +327,63 @@ describe('TS<->Rust model contract (mirror of models.rs contract_tests)', () => 
     expect(keys(s<ExportResult>({ export_id: 0, pack_dir: '', pack_zip: null, patched_lines: 0, deferred_lines: 0, voice_changed_lines: 0, edition: '', mod_state_hash: '' })))
       .toEqual(want('export_id', 'pack_dir', 'pack_zip', 'patched_lines', 'deferred_lines', 'voice_changed_lines', 'edition', 'mod_state_hash'));
 
+    expect(keys(s<BindingAuditProgress>({
+      personal_ready: 0, flagged: 0, reviewed: 0, remaining_personal: 0, generic_skipped: 0, unbound: 0,
+    }))).toEqual(want(
+      'personal_ready', 'flagged', 'reviewed', 'remaining_personal', 'generic_skipped', 'unbound',
+    ));
+    expect(keys(s<BindingSuspiciousHint>({ code: '', detail: '' })))
+      .toEqual(want('code', 'detail'));
+    expect(keys(s<BindingReviewMarker>({
+      project_id: 0, cre_resref: '', status: 'flagged', reason: '', updated_at: '',
+    }))).toEqual(want('project_id', 'cre_resref', 'status', 'reason', 'updated_at'));
+    expect(keys(s<BindingPersonalRow>({
+      speaker_id: 0, display_name: '', cre_resref: '', sex: 0, display_identity_key: '',
+      operational_identity_key: '', binding_source: 'default', clone_status: 'ready', sample_id: null,
+      sample_sound_resref: null, sample_owner_cre_resref: null, sample_eligibility: null,
+      sample_shared_source_count: 0, sample_text_excerpt: '', review_status: null, review_reason: '',
+      heuristic_hints: [],
+    }))).toEqual(want(
+      'speaker_id', 'display_name', 'cre_resref', 'sex', 'display_identity_key',
+      'operational_identity_key', 'binding_source', 'clone_status', 'sample_id',
+      'sample_sound_resref', 'sample_owner_cre_resref', 'sample_eligibility',
+      'sample_shared_source_count', 'sample_text_excerpt', 'review_status', 'review_reason',
+      'heuristic_hints',
+    ));
+    expect(keys(s<BindingSuspiciousRow>({
+      speaker_id: 0, display_name: '', cre_resref: '', sex: 0, display_identity_key: '',
+      binding_source: null, sample_id: null, sample_sound_resref: null,
+      sample_owner_cre_resref: null, sample_text_excerpt: '', review_status: null,
+      review_reason: '', heuristic_hints: [],
+    }))).toEqual(want(
+      'speaker_id', 'display_name', 'cre_resref', 'sex', 'display_identity_key', 'binding_source',
+      'sample_id', 'sample_sound_resref', 'sample_owner_cre_resref', 'sample_text_excerpt',
+      'review_status', 'review_reason', 'heuristic_hints',
+    ));
+    expect(keys(s<BindingSampleSummary>({
+      sample_id: 0, source_sound_resref: null, decision: 'pending', eligibility: '',
+      shared_source_count: 0, overall_score: null, source_text_excerpt: '', has_local_derivative: false,
+    }))).toEqual(want(
+      'sample_id', 'source_sound_resref', 'decision', 'eligibility', 'shared_source_count',
+      'overall_score', 'source_text_excerpt', 'has_local_derivative',
+    ));
+    expect(keys(s<BindingShowDetail>({
+      speaker_id: 0, display_name: '', cre_resref: '', sex: 0, display_identity_key: '',
+      operational_identity_key: '', binding_source: null, clone_status: null, sample_id: null,
+      review: null, personal: null, samples: [], display_group_siblings: [],
+      shares_voice_with_display_group: false,
+    }))).toEqual(want(
+      'speaker_id', 'display_name', 'cre_resref', 'sex', 'display_identity_key',
+      'operational_identity_key', 'binding_source', 'clone_status', 'sample_id', 'review',
+      'personal', 'samples', 'display_group_siblings', 'shares_voice_with_display_group',
+    ));
+    expect(keys(s<BindingGroupSummary>({
+      identity_key: '', display_name: '', variant_count: 0, member_cre_resrefs: [],
+      shares_voice: false, shared_personal_primary_sample: false,
+    }))).toEqual(want(
+      'identity_key', 'display_name', 'variant_count', 'member_cre_resrefs',
+      'shares_voice', 'shared_personal_primary_sample',
+    ));
     expect(keys(s<OperationProgress>({ op: '', phase: '', done: 0, total: null, message: null })))
       .toEqual(want('op', 'phase', 'done', 'total', 'message'));
   });
@@ -328,13 +394,14 @@ describe('TS<->Rust model contract (mirror of models.rs contract_tests)', () => 
     const kind: LineKind[] = ['state', 'transition', 'script', 'token'];
     const status: LineStatus[] = ['pending', 'ready', 'blocked', 'exported', 'skipped'];
     const decision: SampleDecision[] = ['pending', 'approved', 'rejected'];
-    const binding: BindingSource[] = ['override', 'default', 'generic'];
+    const binding: BindingSource[] = ['override', 'default', 'generic', 'follow'];
+    const bindingReview: BindingReviewStatus[] = ['flagged', 'reviewed'];
     const previewReference: BindingPreviewReference[] = ['current', 'single', 'composite'];
     const clone: CloneStatus[] = ['pending', 'ready', 'failed'];
     const gen: GenerationStatus[] = ['pending', 'running', 'done', 'failed'];
     const candidate: RenderCandidateStatus[] = ['pending', 'running', 'done', 'failed'];
     const preset: AgentRenderPreset[] = ['inherit', 'auto_pace', 'deliberate', 'natural', 'brisk', 'very_brisk'];
     const synthesisKind: SynthesisDecisionKind[] = ['override', 'reviewed', 'suspicious'];
-    expect([shared, kind, status, decision, binding, previewReference, clone, gen, candidate, preset, synthesisKind].every((a) => a.length > 0)).toBe(true);
+    expect([shared, kind, status, decision, binding, bindingReview, previewReference, clone, gen, candidate, preset, synthesisKind].every((a) => a.length > 0)).toBe(true);
   });
 });

@@ -3,7 +3,9 @@
 //! into the `models::*` contracts (item-05) live in `queries.rs`.
 
 pub mod attribution;
+pub mod binding_audit;
 pub mod export;
+pub mod follow_binding;
 pub mod generation;
 pub mod harvest;
 pub mod metadata_binding;
