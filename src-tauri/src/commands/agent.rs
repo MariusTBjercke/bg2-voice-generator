@@ -133,7 +133,7 @@ pub async fn prepare_agent_workspace(
     game_dir: String,
 ) -> Result<String, AppError> {
     let conn = state.db.lock().await;
-    Ok(stage_workspace(&conn, &state.db_path, &game_dir)?
+    Ok(stage_workspace(&conn, &state.db_path(), &game_dir)?
         .to_string_lossy()
         .into_owned())
 }
@@ -227,7 +227,7 @@ pub async fn launch_agent(
         )));
     }
     let conn = state.db.lock().await;
-    let workspace = stage_workspace(&conn, &state.db_path, &game_dir)?;
+    let workspace = stage_workspace(&conn, &state.db_path(), &game_dir)?;
     drop(conn);
     spawn_terminal(&agent, yolo, &workspace)
 }

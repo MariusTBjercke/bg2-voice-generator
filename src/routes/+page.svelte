@@ -95,7 +95,7 @@
 
 <Section
   title="Setup"
-  description="Choose your Baldur's Gate II: Enhanced Edition install folder to begin."
+  description="Choose your Baldur's Gate II: Enhanced Edition install folder for the active profile. Use the Profile control in the header to create a demo sandbox without losing your main work."
 >
   <Card>
     <div class="row">

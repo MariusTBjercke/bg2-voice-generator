@@ -9,6 +9,7 @@
 pub mod error;
 pub mod models;
 pub mod paths;
+pub mod profile;
 
 pub mod audio;
 pub mod agent_templates;
@@ -30,13 +31,14 @@ pub mod tag_rule_defaults;
 pub mod tag_rules;
 pub mod tts_spelling;
 pub mod transfer;
+pub mod profile_transfer;
 pub mod tts;
 pub mod voices;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-use tauri::Manager;
+use tauri::{LogicalSize, Manager};
 use tokio::sync::Mutex;
 
 pub use error::AppError;
@@ -46,10 +48,18 @@ use tts::OmniVoiceEngine;
 
 /// Shared application state, managed by Tauri and injected into every command.
 pub struct AppState {
+    /// Tauri app-data root (holds `profiles.json`, shared engine runtime, `profiles/`).
+    pub app_data_dir: PathBuf,
+    /// Active profile id (folder name under `profiles/`).
+    pub profile_id: RwLock<String>,
+    /// Active profile display name.
+    pub profile_name: RwLock<String>,
+    /// Absolute path to the active profile directory.
+    pub profile_dir: RwLock<PathBuf>,
     /// The single writer connection, guarded for async command access.
     pub db: Arc<Mutex<rusqlite::Connection>>,
-    /// Absolute path to the SQLite file (surfaced by `health_check`).
-    pub db_path: PathBuf,
+    /// Absolute path to the active profile's SQLite file (surfaced by `health_check`).
+    pub(crate) db_path_slot: RwLock<PathBuf>,
     /// Shared HTTP client (reused by the OmniVoice subprocess client).
     pub http: reqwest::Client,
     /// Resolved portable vs. dev tool/engine layout.
@@ -60,6 +70,28 @@ pub struct AppState {
     /// Per-operation cooperative-cancel flags (item-06b), flipped by
     /// `cancel_operation` and polled by the long-running loops.
     pub cancels: Arc<CancelRegistry>,
+}
+
+impl AppState {
+    /// Absolute path to the active profile database.
+    pub fn db_path(&self) -> PathBuf {
+        self.db_path_slot
+            .read()
+            .expect("db_path lock")
+            .clone()
+    }
+
+    pub fn active_profile_id(&self) -> String {
+        self.profile_id.read().expect("profile_id lock").clone()
+    }
+
+    pub fn active_profile_name(&self) -> String {
+        self.profile_name.read().expect("profile_name lock").clone()
+    }
+
+    pub fn active_profile_dir(&self) -> PathBuf {
+        self.profile_dir.read().expect("profile_dir lock").clone()
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -87,11 +119,18 @@ pub fn run() {
                 tools.runtime_root.display()
             );
 
-            // Open + migrate the DB synchronously. The scaffold's schema is tiny, so
-            // (unlike the reference's minute-long migrations) this is fast; a later
-            // item moves it to a background thread with a splash if it ever grows.
-            let conn = db::open_db(&data_dir).expect("failed to open database");
-            let db_path = data_dir.join(db::DB_FILE_NAME);
+            let resolved = profile::ensure_profile_layout(&data_dir)
+                .expect("failed to resolve profile layout");
+            log::info!(
+                "Active profile: {} ({}) at {}",
+                resolved.info.name,
+                resolved.info.id,
+                resolved.profile_dir.display()
+            );
+
+            // Open + migrate the active profile DB. Engine runtime stays at data_dir.
+            let conn = db::open_db(&resolved.profile_dir).expect("failed to open database");
+            let db_path = resolved.profile_dir.join(db::DB_FILE_NAME);
             log::info!("Database ready at {}", db_path.display());
             commands::agent::refresh_all_agent_workspaces(&conn, &db_path);
             commands::voice_profiles::cleanup_abandoned_design_previews(&conn, &db_path);
@@ -100,18 +139,37 @@ pub fn run() {
             let omnivoice = Arc::new(OmniVoiceEngine::new(&tools, http.clone()));
 
             app.manage(AppState {
+                app_data_dir: data_dir,
+                profile_id: RwLock::new(resolved.info.id),
+                profile_name: RwLock::new(resolved.info.name),
+                profile_dir: RwLock::new(resolved.profile_dir),
                 db: Arc::new(Mutex::new(conn)),
-                db_path,
+                db_path_slot: RwLock::new(db_path),
                 http,
                 tools,
                 omnivoice,
                 cancels: Arc::new(CancelRegistry::default()),
             });
 
+            // Size the shell from the current monitor work area so the pipeline nav +
+            // profile controls usually fit on one row without overflowing small screens.
+            if let Some(window) = app.get_webview_window("main") {
+                size_main_window_for_monitor(&window);
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::startup::health_check,
+            commands::profile::list_profiles,
+            commands::profile::get_active_profile,
+            commands::profile::create_profile,
+            commands::profile::rename_profile,
+            commands::profile::switch_profile,
+            commands::profile::duplicate_profile,
+            commands::profile::delete_profile,
+            commands::profile::export_profile,
+            commands::profile::import_profile,
             commands::progress::cancel_operation,
             commands::settings::get_setting,
             commands::settings::set_setting,
@@ -229,8 +287,6 @@ pub fn run() {
             commands::metadata_binding::add_metadata_profile,
             commands::metadata_binding::remove_metadata_profile,
             commands::export::build_export,
-            commands::transfer::export_project,
-            commands::transfer::import_project,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -241,4 +297,44 @@ pub fn run() {
                 tauri::async_runtime::block_on(engine.shutdown());
             }
         });
+}
+
+/// Pick a comfortable startup size from the monitor work area (taskbar excluded).
+/// Uses ~82% of available space, clamped so small laptops stay usable and large
+/// displays do not open a near-fullscreen window.
+fn size_main_window_for_monitor(window: &tauri::WebviewWindow) {
+    const MIN_W: f64 = 960.0;
+    const MIN_H: f64 = 640.0;
+    const MAX_W: f64 = 1680.0;
+    const MAX_H: f64 = 1050.0;
+    const FRACTION: f64 = 0.82;
+    const MARGIN: f64 = 48.0;
+
+    let Ok(Some(monitor)) = window.current_monitor() else {
+        log::warn!("could not resolve current monitor; keeping configured window size");
+        return;
+    };
+    let scale = monitor.scale_factor();
+    let work = monitor.work_area().size;
+    let work_w = (work.width as f64 / scale) - MARGIN;
+    let work_h = (work.height as f64 / scale) - MARGIN;
+    if work_w <= 0.0 || work_h <= 0.0 {
+        return;
+    }
+
+    let width = (work_w * FRACTION).clamp(MIN_W.min(work_w), MAX_W.min(work_w));
+    let height = (work_h * FRACTION).clamp(MIN_H.min(work_h), MAX_H.min(work_h));
+
+    if let Err(e) = window.set_size(LogicalSize::new(width, height)) {
+        log::warn!("failed to set startup window size: {e}");
+        return;
+    }
+    if let Err(e) = window.center() {
+        log::warn!("failed to center startup window: {e}");
+    }
+    log::info!(
+        "Startup window sized to {width:.0}x{height:.0} (work area {:.0}x{:.0} @ scale {scale})",
+        work_w + MARGIN,
+        work_h + MARGIN
+    );
 }

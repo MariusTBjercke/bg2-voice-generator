@@ -41,7 +41,7 @@ where
     T: Send + 'static,
     F: FnOnce(&rusqlite::Connection) -> Result<T, AppError> + Send + 'static,
 {
-    let path = state.db_path.clone();
+    let path = state.db_path();
     tokio::task::spawn_blocking(move || {
         let conn = crate::db::open_read_db(&path)?;
         work(&conn)
@@ -119,7 +119,7 @@ pub async fn harvest_references(
             .collect();
         (
             project_id,
-            workspace_dir(&state.db_path, project_id),
+            workspace_dir(&state.db_path(), project_id),
             parallelism,
             existing_keys,
             ownership,
@@ -306,7 +306,7 @@ pub async fn set_speaker_group_excluded(
             project_id,
             &identity_key,
         )?;
-        let generated_dir = workspace_dir(&state.db_path, project_id).join("generated");
+        let generated_dir = workspace_dir(&state.db_path(), project_id).join("generated");
         for line_id in line_ids {
             let output_path: Option<String> = conn
                 .query_row(

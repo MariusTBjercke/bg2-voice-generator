@@ -56,7 +56,7 @@ where
     T: Send + 'static,
     F: FnOnce(&rusqlite::Connection) -> Result<T, AppError> + Send + 'static,
 {
-    let path = state.db_path.clone();
+    let path = state.db_path();
     tokio::task::spawn_blocking(move || {
         let conn = crate::db::open_read_db(&path)?;
         work(&conn)
@@ -287,7 +287,7 @@ fn apply_explicit_bind(
     sample_id: i64,
     source: BindingSource,
     display_identity_key: Option<&str>,
-    derivative: &Path,
+    _derivative: &Path,
     duration_secs: f32,
     duration_warning: Option<String>,
 ) -> Result<BindCloneResult, AppError> {
@@ -307,12 +307,10 @@ fn apply_explicit_bind(
             CloneStatus::Ready,
         )?;
     }
-    crate::generator::metadata_binding::refresh_generic_clones_for_donor(
+    crate::generator::metadata_binding::sync_harvested_pool_voice_for_speaker(
         conn,
         project_id,
         speaker_id,
-        sample_id,
-        derivative,
     )?;
     let clone = clone_for_speaker(conn, speaker_id)?
         .ok_or_else(|| AppError::Other("clone vanished after upsert".into()))?;
@@ -766,19 +764,10 @@ pub async fn set_clone_references(
         let clone = clone_by_id(&conn, clone_id)?
             .ok_or_else(|| AppError::Other(format!("no clone with id {clone_id}")))?;
         if changed {
-            let donor_speaker_id = clone.speaker_id;
-            let primary_sample_id = sample_ids[0];
-            let derivative: String = conn.query_row(
-                "SELECT local_derivative_path FROM reference_sample WHERE id=?1",
-                [primary_sample_id],
-                |row| row.get(0),
-            )?;
-            crate::generator::metadata_binding::refresh_generic_clones_for_donor(
+            crate::generator::metadata_binding::sync_harvested_pool_voice_for_speaker(
                 &conn,
                 project_id,
-                donor_speaker_id,
-                primary_sample_id,
-                Path::new(&derivative),
+                clone.speaker_id,
             )?;
         }
         (clone, references, reset_generations)
@@ -835,7 +824,7 @@ pub async fn preview_clone_voice(
             [clone.speaker_id],
             |row| row.get(0),
         )?;
-        let workspace = workspace_dir(&state.db_path, project_id);
+        let workspace = workspace_dir(&state.db_path(), project_id);
         let resolved = resolve_binding_preview_reference(
             &conn,
             &clone,
@@ -1065,7 +1054,7 @@ pub async fn generate_line(
 ) -> Result<LineResult, AppError> {
     let (job, workspace, strref) = {
         let conn = state.db.lock().await;
-        resolve_job(&conn, &state.db_path, line_id)?
+        resolve_job(&conn, &state.db_path(), line_id)?
     };
     let ffmpeg_bin = generation_encoder(&state)?;
     let mut emitter = ProgressEmitter::new(app, OP_GENERATION);
@@ -1116,7 +1105,7 @@ pub async fn set_line_render_override(
         let clone_settings = clone_settings_for_line(&conn, line_id)?;
         let project_id: i64 = conn.query_row("SELECT project_id FROM line WHERE id=?1", [line_id], |r| r.get(0))?;
         let change = write_line_render_override(&mut conn, line_id, Some(&settings), &clone_settings)?;
-        (change, workspace_dir(&state.db_path, project_id))
+        (change, workspace_dir(&state.db_path(), project_id))
     };
     remove_if_expected(change.output_path.as_deref(), &output_path_for(&workspace, line_id));
     remove_if_expected(change.candidate_path.as_deref(), &candidate_output_path_for(&workspace, line_id));
@@ -1137,7 +1126,7 @@ pub async fn clear_line_render_override(
         let clone_settings = clone_settings_for_line(&conn, line_id)?;
         let project_id: i64 = conn.query_row("SELECT project_id FROM line WHERE id=?1", [line_id], |r| r.get(0))?;
         let change = write_line_render_override(&mut conn, line_id, None, &clone_settings)?;
-        (change, workspace_dir(&state.db_path, project_id))
+        (change, workspace_dir(&state.db_path(), project_id))
     };
     remove_if_expected(change.output_path.as_deref(), &output_path_for(&workspace, line_id));
     remove_if_expected(change.candidate_path.as_deref(), &candidate_output_path_for(&workspace, line_id));
@@ -1169,7 +1158,7 @@ pub async fn generate_render_candidate(
 ) -> Result<RenderCandidate, AppError> {
     let (job, workspace, strref, previous_path) = {
         let conn = state.db.lock().await;
-        let (job, workspace, strref) = resolve_job(&conn, &state.db_path, line_id)?;
+        let (job, workspace, strref) = resolve_job(&conn, &state.db_path(), line_id)?;
         let candidate = RenderCandidate {
             line_id, status: crate::models::RenderCandidateStatus::Running, output_path: None,
             text_snapshot: job.text.clone(), clone_id: job.clone_id,
@@ -1216,7 +1205,7 @@ pub async fn accept_render_candidate(
 ) -> Result<LineResult, AppError> {
     let (job, workspace, candidate) = {
         let conn = state.db.lock().await;
-        let (job, workspace, _) = resolve_job(&conn, &state.db_path, line_id)?;
+        let (job, workspace, _) = resolve_job(&conn, &state.db_path(), line_id)?;
         let candidate = candidate_for_line(&conn, line_id)?.ok_or_else(|| AppError::Other("no render candidate for this line".into()))?;
         (job, workspace, candidate)
     };
@@ -1269,7 +1258,7 @@ pub async fn discard_render_candidate(
     let (path, workspace) = {
         let conn = state.db.lock().await;
         let project_id: i64 = conn.query_row("SELECT project_id FROM line WHERE id=?1", [line_id], |r| r.get(0))?;
-        (discard_candidate(&conn, line_id)?, workspace_dir(&state.db_path, project_id))
+        (discard_candidate(&conn, line_id)?, workspace_dir(&state.db_path(), project_id))
     };
     let existed = path.is_some();
     remove_if_expected(path.as_deref(), &candidate_output_path_for(&workspace, line_id));
@@ -1345,7 +1334,7 @@ pub async fn generate_lines_batched(
         let mut groups: Vec<((i64, String, String), Vec<LineJob>)> = Vec::new();
         let mut result = BatchGenResult::default();
         for line_id in &line_ids {
-            match resolve_job(&conn, &state.db_path, *line_id) {
+            match resolve_job(&conn, &state.db_path(), *line_id) {
                 Ok((job, _ws, _strref)) => {
                     result.total += 1;
                     let key = job.batch_group_key();
@@ -1369,7 +1358,7 @@ pub async fn generate_lines_batched(
         let workspace = groups
             .first()
             .and_then(|(_, jobs)| jobs.first())
-            .map(|_| workspace_from_any(&conn, &state.db_path, &line_ids))
+            .map(|_| workspace_from_any(&conn, &state.db_path(), &line_ids))
             .transpose()?
             .flatten();
         (groups, limits, workspace, result)
@@ -1739,7 +1728,7 @@ pub async fn list_completed_generations(
     let Some(project_id) = project_id else {
         return Ok(Vec::new());
     };
-    let workspace = workspace_dir(&state.db_path, project_id);
+    let workspace = workspace_dir(&state.db_path(), project_id);
     let _ = recover_orphaned_generation_files(&conn, project_id, &workspace)?;
     drop(conn);
     let generated_dir = workspace.join("generated");
@@ -1801,7 +1790,7 @@ pub async fn remove_generations(
             files_missing: 0,
         });
     };
-    let generated_dir = workspace_dir(&state.db_path, project_id).join("generated");
+    let generated_dir = workspace_dir(&state.db_path(), project_id).join("generated");
     let mut result = RemoveGenerationsResult {
         records_removed: 0,
         files_deleted: 0,

@@ -1,0 +1,294 @@
+//! Full-profile backup/restore: ZIP of a profile directory (DB + workspaces +
+//! agent-workspace), including local audio. Intended for personal machine moves
+//! and demos — not for redistributing copyrighted game-derived audio publicly.
+//! WeiDU export packs remain the shareable voice-pack path.
+
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
+
+use crate::db::DB_FILE_NAME;
+use crate::error::AppError;
+use crate::profile::{self, ProfileInfo, ProfileRegistry};
+
+pub const PROFILE_TRANSFER_KIND: &str = "bg2-voice-generator-profile";
+pub const PROFILE_TRANSFER_VERSION: i64 = 1;
+pub const MANIFEST_ENTRY: &str = "manifest.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProfileTransferManifest {
+    pub kind: String,
+    pub version: i64,
+    pub created_at: String,
+    pub app_version: String,
+    pub profile_id: String,
+    pub profile_name: String,
+    /// Absolute profile directory on the exporting machine (for path rewrite).
+    pub exported_profile_dir: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProfileExportResult {
+    pub dest_path: String,
+    pub profile_id: String,
+    pub profile_name: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProfileImportResult {
+    pub profile: ProfileInfo,
+    pub switched: bool,
+    pub paths_rewritten: usize,
+}
+
+fn zip_err(e: zip::result::ZipError) -> AppError {
+    AppError::Other(format!("Zip error: {e}"))
+}
+
+fn now_iso() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{secs}")
+}
+
+/// Checkpoint WAL so the on-disk DB file is complete before zipping/copying.
+pub fn checkpoint_db(conn: &Connection) -> Result<(), AppError> {
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    Ok(())
+}
+
+/// Zip the profile directory (db + workspaces + agent-workspace) to `dest_path`.
+pub fn export_profile_dir(
+    profile_dir: &Path,
+    info: &ProfileInfo,
+    dest_path: &Path,
+    app_version: &str,
+) -> Result<ProfileExportResult, AppError> {
+    if !profile_dir.join(DB_FILE_NAME).is_file() {
+        return Err(AppError::Other(format!(
+            "profile has no database at {}",
+            profile_dir.join(DB_FILE_NAME).display()
+        )));
+    }
+    if let Some(parent) = dest_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = File::create(dest_path)?;
+    let mut zip = ZipWriter::new(file);
+    let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+    let manifest = ProfileTransferManifest {
+        kind: PROFILE_TRANSFER_KIND.to_string(),
+        version: PROFILE_TRANSFER_VERSION,
+        created_at: now_iso(),
+        app_version: app_version.to_string(),
+        profile_id: info.id.clone(),
+        profile_name: info.name.clone(),
+        exported_profile_dir: profile_dir.to_string_lossy().to_string(),
+    };
+    let manifest_json = serde_json::to_vec_pretty(&manifest)
+        .map_err(|e| AppError::Other(format!("manifest serialize: {e}")))?;
+    zip.start_file(MANIFEST_ENTRY, opts)
+        .map_err(zip_err)?;
+    zip.write_all(&manifest_json)?;
+
+    add_dir_to_zip(&mut zip, profile_dir, Path::new("profile"), opts)?;
+    zip.finish().map_err(zip_err)?;
+
+    let bytes = fs::metadata(dest_path)?.len();
+    Ok(ProfileExportResult {
+        dest_path: dest_path.to_string_lossy().to_string(),
+        profile_id: info.id.clone(),
+        profile_name: info.name.clone(),
+        bytes,
+    })
+}
+
+fn add_dir_to_zip(
+    zip: &mut ZipWriter<File>,
+    src: &Path,
+    zip_prefix: &Path,
+    opts: SimpleFileOptions,
+) -> Result<(), AppError> {
+    for entry in walkdir::WalkDir::new(src).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(src)
+            .map_err(|e| AppError::Other(format!("strip prefix: {e}")))?;
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        // Skip WAL/SHM sidecars — DB should be checkpointed first.
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with(".db-wal") || name.ends_with(".db-shm") {
+            continue;
+        }
+        let zip_path = zip_prefix.join(rel);
+        let zip_name = zip_path.to_string_lossy().replace('\\', "/");
+        if entry.file_type().is_dir() {
+            let dir_name = format!("{zip_name}/");
+            zip.add_directory(dir_name, opts).map_err(zip_err)?;
+        } else if entry.file_type().is_file() {
+            zip.start_file(&zip_name, opts).map_err(zip_err)?;
+            let mut f = File::open(path)?;
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf)?;
+            zip.write_all(&buf)?;
+        }
+    }
+    Ok(())
+}
+
+/// Import a profile ZIP into a new profile id under `app_data`.
+pub fn import_profile_zip(
+    app_data: &Path,
+    bundle_path: &Path,
+    display_name: Option<String>,
+) -> Result<(ProfileImportResult, ProfileRegistry), AppError> {
+    let file = File::open(bundle_path)?;
+    let mut archive = ZipArchive::new(file).map_err(zip_err)?;
+
+    let manifest = {
+        let mut entry = archive.by_name(MANIFEST_ENTRY).map_err(zip_err)?;
+        let mut buf = String::new();
+        entry.read_to_string(&mut buf)?;
+        let m: ProfileTransferManifest = serde_json::from_str(&buf)
+            .map_err(|e| AppError::Other(format!("invalid profile manifest: {e}")))?;
+        if m.kind != PROFILE_TRANSFER_KIND {
+            return Err(AppError::Other(format!(
+                "not a profile bundle (kind={})",
+                m.kind
+            )));
+        }
+        if m.version > PROFILE_TRANSFER_VERSION {
+            return Err(AppError::Other(format!(
+                "profile bundle version {} is newer than this app supports ({})",
+                m.version, PROFILE_TRANSFER_VERSION
+            )));
+        }
+        m
+    };
+
+    let mut registry = profile::list_profiles(app_data)?;
+    let mut max: u64 = 0;
+    for p in &registry.profiles {
+        if let Ok(n) = p.id.parse::<u64>() {
+            max = max.max(n);
+        }
+    }
+    let new_id = (max + 1).to_string();
+    let name = display_name
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| manifest.profile_name.clone());
+
+    let dest = profile::profile_dir(app_data, &new_id);
+    if dest.exists() {
+        return Err(AppError::Other(format!(
+            "profile directory already exists: {}",
+            dest.display()
+        )));
+    }
+    fs::create_dir_all(&dest)?;
+
+    // Re-open archive for extraction (manifest already consumed).
+    drop(archive);
+    let file = File::open(bundle_path)?;
+    let mut archive = ZipArchive::new(file).map_err(zip_err)?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(zip_err)?;
+        let name = entry.name().to_string();
+        if name == MANIFEST_ENTRY || name.ends_with('/') {
+            continue;
+        }
+        let Some(rel) = name.strip_prefix("profile/") else {
+            continue;
+        };
+        if rel.is_empty() {
+            continue;
+        }
+        let out = crate::transfer::safe_rel_join(&dest, rel)?;
+        if let Some(parent) = out.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut outfile = File::create(&out)?;
+        std::io::copy(&mut entry, &mut outfile)?;
+    }
+
+    let dest_db = dest.join(DB_FILE_NAME);
+    if !dest_db.is_file() {
+        let _ = fs::remove_dir_all(&dest);
+        return Err(AppError::Other(
+            "imported bundle did not contain a profile database".into(),
+        ));
+    }
+
+    let old_root = PathBuf::from(&manifest.exported_profile_dir);
+    let paths_rewritten = profile::rewrite_profile_paths(&dest_db, &old_root, &dest)?;
+
+    let info = ProfileInfo {
+        id: new_id,
+        name,
+        created_at: now_iso(),
+    };
+    registry.profiles.push(info.clone());
+    profile::save_registry(app_data, &registry)?;
+
+    Ok((
+        ProfileImportResult {
+            profile: info,
+            switched: false,
+            paths_rewritten,
+        },
+        registry,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+    use tempfile::tempdir;
+
+    #[test]
+    fn export_import_round_trip_includes_workspace_file() {
+        let tmp = tempdir().unwrap();
+        let app = tmp.path().join("app");
+        fs::create_dir_all(&app).unwrap();
+        let resolved = profile::ensure_profile_layout(&app).unwrap();
+        db::open_db(&resolved.profile_dir).unwrap();
+        let ws = resolved.profile_dir.join("workspaces").join("1");
+        fs::create_dir_all(&ws).unwrap();
+        let sample = ws.join("clip.wav");
+        fs::write(&sample, b"RIFF").unwrap();
+
+        let zip_path = tmp.path().join("profile.zip");
+        export_profile_dir(
+            &resolved.profile_dir,
+            &resolved.info,
+            &zip_path,
+            "0.1.0",
+        )
+        .unwrap();
+
+        let (result, _) = import_profile_zip(&app, &zip_path, Some("Imported".into())).unwrap();
+        assert_eq!(result.profile.id, "2");
+        assert_eq!(result.profile.name, "Imported");
+        let imported = profile::profile_dir(&app, "2");
+        assert!(imported.join(DB_FILE_NAME).is_file());
+        assert!(imported.join("workspaces").join("1").join("clip.wav").is_file());
+    }
+}

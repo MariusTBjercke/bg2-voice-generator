@@ -14,8 +14,8 @@
       {
         "label": "main",
         "title": "BG2 Voice Generator",
-        "width": 1280,
-        "height": 820,
+        "width": 1440,
+        "height": 900,
         "minWidth": 960,
         "minHeight": 640,
         "resizable": true,
@@ -28,8 +28,8 @@
         "enable": true,
         "scope": [
           "$TEMP/bg2-voice-generator-*/**/*",
-          "$APPDATA/workspaces/**/*",
-          "$APPLOCALDATA/workspaces/**/*"
+          "$APPDATA/profiles/*/workspaces/**/*",
+          "$APPLOCALDATA/profiles/*/workspaces/**/*"
         ]
       }
     }

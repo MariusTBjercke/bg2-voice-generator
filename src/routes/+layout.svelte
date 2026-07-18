@@ -4,6 +4,15 @@
   import { page } from "$app/state";
   import { invoke } from "$lib/utils/invoke";
   import { project } from "$lib/stores/project";
+  import {
+    profiles,
+    refreshProfiles,
+    switchToProfile,
+    createProfile,
+    renameProfile,
+    duplicateProfile,
+    deleteProfile,
+  } from "$lib/stores/profiles";
   import { getInstallUiPreferences, updateInstallUiPreferences } from "$lib/stores/uiPreferences";
   import { startProgressListener } from "$lib/stores/progress";
   import StatusBadge from "$lib/components/StatusBadge.svelte";
@@ -11,12 +20,8 @@
 
   let { children } = $props();
 
-  // How often the footer re-checks backend health so it self-heals after a busy
-  // run or a dev reload (item-06b).
   const HEALTH_POLL_MS = 4000;
 
-  // Human labels for the operation ids the progress stream reports, so the footer
-  // can say WHICH long-running op is keeping the backend busy.
   const OP_LABELS: Record<string, string> = {
     harvest: "harvesting",
     attribution: "scanning",
@@ -25,8 +30,6 @@
     transfer: "transferring",
   };
 
-  // Pipeline stages, in dependency order. Later items fill these routes; the
-  // nav already points at them so the shell is complete from the start.
   const nav = [
     { href: "/", label: "Setup" },
     { href: "/dictionary", label: "Dictionary" },
@@ -39,23 +42,24 @@
     { href: "/transfer", label: "Transfer" },
   ];
 
-  // Footer health indicator: polls the backend health check from every screen so a
-  // busy run or a dev reload never freezes it on "Contacting backend…". UI-only —
-  // the backend reports its own state via a command. `lastGood` is kept so a failed
-  // poll degrades to "reconnecting" (with the last known version) rather than
-  // flipping straight to "unreachable".
   let health = $state<HealthReport | null>(null);
   let lastGood = $state<HealthReport | null>(null);
   let healthError = $state<string | null>(null);
 
-  // Any in-flight long operation (from the shared progress store) makes the footer
-  // report "busy" with the op label instead of a plain "reachable" state.
   const progressStore = startProgressListener();
   let ops = $state<string[]>([]);
   progressStore.subscribe((m) => (ops = Object.keys(m)));
   const busyLabel = $derived(
     ops.length > 0 ? (OP_LABELS[ops[0]] ?? ops[0]) : null,
   );
+
+  let profileBusy = $state(false);
+  let profileError = $state<string | null>(null);
+  let renameOpen = $state(false);
+  let renameValue = $state("");
+
+  const activeProfile = $derived($profiles.active);
+  const profileList = $derived($profiles.registry?.profiles ?? []);
 
   async function pollHealth() {
     try {
@@ -76,10 +80,8 @@
 
   let pathname = $derived(page.url.pathname);
 
-  // Hydrate the shared project store on every cold start so pipeline screens can
-  // load data without waiting for the Setup route's onMount (which also resolves
-  // languages). game_dir is synced immediately; locale follows best-effort.
   onMount(async () => {
+    await refreshProfiles();
     try {
       const gameDir = (await invoke<string | null>("get_setting", { key: "game_dir" })) ?? null;
       if (!gameDir) return;
@@ -99,6 +101,85 @@
       // Setup screen surfaces pick/read errors on visit
     }
   });
+
+  async function onProfileSelect(event: Event) {
+    const id = (event.currentTarget as HTMLSelectElement).value;
+    if (!id || id === activeProfile?.id) return;
+    profileBusy = true;
+    profileError = null;
+    try {
+      await switchToProfile(id);
+    } catch (e) {
+      profileError = String(e);
+      await refreshProfiles();
+    } finally {
+      profileBusy = false;
+    }
+  }
+
+  async function onCreateProfile() {
+    profileBusy = true;
+    profileError = null;
+    try {
+      const created = await createProfile();
+      await switchToProfile(created.id);
+    } catch (e) {
+      profileError = String(e);
+    } finally {
+      profileBusy = false;
+    }
+  }
+
+  async function onDuplicateProfile() {
+    if (!activeProfile) return;
+    profileBusy = true;
+    profileError = null;
+    try {
+      const dup = await duplicateProfile(activeProfile.id);
+      await switchToProfile(dup.id);
+    } catch (e) {
+      profileError = String(e);
+    } finally {
+      profileBusy = false;
+    }
+  }
+
+  function openRename() {
+    renameValue = activeProfile?.name ?? "";
+    renameOpen = true;
+  }
+
+  async function submitRename() {
+    if (!activeProfile) return;
+    profileBusy = true;
+    profileError = null;
+    try {
+      await renameProfile(activeProfile.id, renameValue);
+      renameOpen = false;
+    } catch (e) {
+      profileError = String(e);
+    } finally {
+      profileBusy = false;
+    }
+  }
+
+  async function onDeleteProfile() {
+    if (!activeProfile || profileList.length <= 1) return;
+    const id = activeProfile.id;
+    const other = profileList.find((p) => p.id !== id);
+    if (!other) return;
+    if (!confirm(`Delete profile “${activeProfile.name}”? This cannot be undone.`)) return;
+    profileBusy = true;
+    profileError = null;
+    try {
+      await switchToProfile(other.id);
+      await deleteProfile(id);
+    } catch (e) {
+      profileError = String(e);
+    } finally {
+      profileBusy = false;
+    }
+  }
 </script>
 
 <div class="shell">
@@ -111,7 +192,56 @@
         </a>
       {/each}
     </nav>
+    <div class="profile-bar">
+      <label class="profile-label" for="profile-select">Profile</label>
+      <select
+        id="profile-select"
+        class="profile-select"
+        disabled={profileBusy || profileList.length === 0}
+        value={activeProfile?.id ?? ""}
+        onchange={onProfileSelect}
+      >
+        {#each profileList as p (p.id)}
+          <option value={p.id}>{p.name}</option>
+        {/each}
+      </select>
+      <button type="button" class="profile-btn" disabled={profileBusy} onclick={onCreateProfile} title="New empty profile">
+        New
+      </button>
+      <button type="button" class="profile-btn" disabled={profileBusy || !activeProfile} onclick={onDuplicateProfile} title="Duplicate active profile">
+        Duplicate
+      </button>
+      <button type="button" class="profile-btn" disabled={profileBusy || !activeProfile} onclick={openRename} title="Rename active profile">
+        Rename
+      </button>
+      <button
+        type="button"
+        class="profile-btn danger"
+        disabled={profileBusy || !activeProfile || profileList.length <= 1}
+        onclick={onDeleteProfile}
+        title="Delete active profile"
+      >
+        Delete
+      </button>
+    </div>
   </header>
+
+  {#if profileError}
+    <div class="profile-error">{profileError}</div>
+  {/if}
+
+  {#if renameOpen && activeProfile}
+    <div class="rename-bar">
+      <label for="rename-input">Rename profile</label>
+      <input id="rename-input" bind:value={renameValue} disabled={profileBusy} />
+      <button type="button" class="profile-btn" disabled={profileBusy || !renameValue.trim()} onclick={submitRename}>
+        Save
+      </button>
+      <button type="button" class="profile-btn" disabled={profileBusy} onclick={() => (renameOpen = false)}>
+        Cancel
+      </button>
+    </div>
+  {/if}
 
   <main>{@render children()}</main>
 
@@ -123,6 +253,9 @@
       {:else}
         <StatusBadge tone="success">Backend v{health.app_version}</StatusBadge>
         <span class="detail">schema {health.schema_version}</span>
+      {/if}
+      {#if activeProfile}
+        <span class="detail">· {activeProfile.name}</span>
       {/if}
     {:else if lastGood}
       <StatusBadge tone="warn">Reconnecting…</StatusBadge>
@@ -151,6 +284,8 @@
     padding: var(--space-3) var(--space-5);
     border-bottom: 1px solid var(--border);
     background: var(--panel);
+    flex-wrap: wrap;
+    row-gap: var(--space-2);
   }
   h1 {
     margin: 0;
@@ -161,6 +296,8 @@
     display: flex;
     flex-wrap: wrap;
     gap: var(--space-1);
+    flex: 1 1 36rem;
+    min-width: 0;
   }
   nav a {
     color: var(--text-muted);
@@ -176,6 +313,70 @@
   nav a.active {
     color: var(--accent-ink);
     background: var(--accent);
+  }
+  .profile-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+    margin-left: auto;
+    flex: 0 1 auto;
+  }
+  .profile-label {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+  }
+  .profile-select {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: var(--space-1) var(--space-2);
+    font-size: 0.85rem;
+    max-width: 12rem;
+  }
+  .profile-btn {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: var(--space-1) var(--space-2);
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+  .profile-btn:hover:not(:disabled) {
+    border-color: var(--accent);
+  }
+  .profile-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .profile-btn.danger:hover:not(:disabled) {
+    border-color: var(--danger, #c44);
+    color: var(--danger, #c44);
+  }
+  .profile-error {
+    padding: var(--space-2) var(--space-5);
+    background: #3a1a1a;
+    color: #f0c0c0;
+    font-size: 0.85rem;
+  }
+  .rename-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-5);
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    font-size: 0.85rem;
+  }
+  .rename-bar input {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: var(--space-1) var(--space-2);
+    min-width: 12rem;
   }
   main {
     flex: 1;

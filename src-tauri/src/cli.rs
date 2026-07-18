@@ -161,13 +161,24 @@ fn default_db_path() -> Result<PathBuf, AppError> {
                 .map(PathBuf::from)
                 .map(|p| p.join(".local").join("share"))
         });
-    base.map(|p| {
-        p.join("com.bg2voicegen.desktop")
-            .join(crate::db::DB_FILE_NAME)
-    })
-    .ok_or_else(|| {
-        AppError::Other("cannot resolve app-data directory; pass --db or BG2_SYNTHESIS_DB".into())
-    })
+    let app_data = base
+        .map(|p| p.join("com.bg2voicegen.desktop"))
+        .ok_or_else(|| {
+            AppError::Other("cannot resolve app-data directory; pass --db or BG2_SYNTHESIS_DB".into())
+        })?;
+    if let Some(profile) = std::env::var_os("BG2_SYNTHESIS_PROFILE") {
+        return Ok(crate::profile::profile_dir(&app_data, &profile.to_string_lossy())
+            .join(crate::db::DB_FILE_NAME));
+    }
+    // Prefer active profile from profiles.json when present.
+    if let Ok(Some(reg)) = crate::profile::load_registry(&app_data) {
+        if let Ok(active) = reg.active() {
+            return Ok(crate::profile::profile_dir(&app_data, &active.id)
+                .join(crate::db::DB_FILE_NAME));
+        }
+    }
+    Ok(crate::profile::profile_dir(&app_data, crate::profile::DEFAULT_PROFILE_ID)
+        .join(crate::db::DB_FILE_NAME))
 }
 
 fn open_db(path: &Path) -> Result<Connection, AppError> {

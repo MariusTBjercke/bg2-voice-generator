@@ -234,7 +234,7 @@ pub async fn list_blocked_lines_page(
     query: Option<String>,
     reason: Option<String>,
 ) -> Result<BlockedLinesPage, AppError> {
-    let path = state.db_path.clone();
+    let path = state.db_path();
     tokio::task::spawn_blocking(move || {
         use rusqlite::OptionalExtension;
         let conn = crate::db::open_read_db(&path)?;

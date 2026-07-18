@@ -170,7 +170,7 @@ pub async fn list_voice_profiles(
     state: State<'_, AppState>,
     game_dir: String,
 ) -> Result<Vec<VoiceProfile>, AppError> {
-    let path = state.db_path.clone();
+    let path = state.db_path();
     tokio::task::spawn_blocking(move || {
         let conn = crate::db::open_read_db(&path)?;
         let Some(project_id) = conn
@@ -230,7 +230,7 @@ pub async fn create_imported_voice_profile(
         .collect::<Result<Vec<_>, _>>()?;
     let mut conn = state.db.lock().await;
     let project_id = project_id(&conn, &game_dir)?;
-    let root = voice_root(&state.db_path, project_id);
+    let root = voice_root(&state.db_path(), project_id);
     let staging = root.join(format!(
         ".staging-{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -343,7 +343,7 @@ pub async fn generate_designed_voice_candidates(
                 .into(),
         ));
     }
-    let preview_dir = workspace(&state.db_path, project_id).join("voice-design-previews");
+    let preview_dir = workspace(&state.db_path(), project_id).join("voice-design-previews");
     std::fs::create_dir_all(&preview_dir)?;
     // The directory is app-owned and non-durable. Remove only direct children whose
     // extension is WAV; never follow a user-supplied path.
@@ -410,7 +410,7 @@ pub async fn save_designed_voice_profile(
     }
     let mut conn = state.db.lock().await;
     let project_id = project_id(&conn, &game_dir)?;
-    let preview_dir = workspace(&state.db_path, project_id).join("voice-design-previews");
+    let preview_dir = workspace(&state.db_path(), project_id).join("voice-design-previews");
     let preview_path = preview_dir.join(format!("{preview_id}.wav"));
     if preview_path.parent() != Some(preview_dir.as_path()) || !preview_path.exists() {
         return Err(AppError::Other(
@@ -431,7 +431,7 @@ pub async fn save_designed_voice_profile(
         params![project_id,display_name,design_json,fingerprint,now],
     )?;
     let profile_id = tx.last_insert_rowid();
-    let final_dir = voice_root(&state.db_path, project_id).join(profile_id.to_string());
+    let final_dir = voice_root(&state.db_path(), project_id).join(profile_id.to_string());
     std::fs::create_dir_all(&final_dir)?;
     let final_path = final_dir.join("reference-0.wav");
     if let Err(error) = std::fs::rename(&preview_path, &final_path) {
@@ -469,6 +469,11 @@ pub async fn bind_speaker_voice_profile(
         speaker_id,
         voice_profile_id,
         BindingSource::Override,
+    )?;
+    crate::generator::metadata_binding::sync_harvested_pool_voice_for_speaker(
+        &conn,
+        project_id,
+        speaker_id,
     )?;
     profile_by_id(&conn, voice_profile_id)?
         .ok_or_else(|| AppError::Other("voice profile vanished after binding".into()))
@@ -542,7 +547,7 @@ pub async fn delete_voice_profile(
         crate::db::voice_profiles::delete_profile(&conn, project_id, voice_profile_id)?;
 
     // Only remove this profile's managed reference audio — never generation output.
-    let root = voice_root(&state.db_path, project_id);
+    let root = voice_root(&state.db_path(), project_id);
     for path in managed_paths {
         if path.starts_with(&root) && std::fs::remove_file(&path).is_ok() {
             result.files_deleted += 1;

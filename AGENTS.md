@@ -38,18 +38,20 @@ generation; `ffmpeg`/`ffprobe`, WeiDU, and a stripped CPython are vendored under
 Data flows one direction; each GUI screen (and its route) maps to one stage:
 
 ```
-game install ─▶ Dictionary ─▶ Attribution ─▶ Harvest + approve ─▶ Bind ─▶ Generate ─▶ Review (opt) ─▶ Export ─▶ Transfer
-   (Setup)      reapply_token_   scan_attribution  harvest_references  bind_clone /   generate_line /   build_export   export_project /
-                standins          list_blocked_*    list_reference_*    metadata_*     generate_lines_   (WeiDU)        import_project
-                                  get_attribution_  set_sample_decision  auto_bind_all  batched
-                                  counts            auto_approve_*       apply_metadata_ install_engine
-                                                    verify_speech (opt)  bindings
+profile + game install ─▶ Dictionary ─▶ Attribution ─▶ Harvest + approve ─▶ Bind ─▶ Generate ─▶ Review (opt) ─▶ Export ─▶ Transfer
+   (Setup / switch)        reapply_token_   scan_attribution  harvest_references  bind_clone /   generate_line /   build_export   export_profile /
+                           standins          list_blocked_*    list_reference_*    metadata_*     generate_lines_   (WeiDU)        import_profile
+                                            get_attribution_  set_sample_decision  auto_bind_all  batched
+                                            counts            auto_approve_*       apply_metadata_ install_engine
+                                                              verify_speech (opt)  bindings
 ```
 
-Setup persists the `game_dir` setting and picks the active locale; **locale is passed
-per-call** (there is no persisted `active_language` key). The **Dictionary** screen
-configures spoken stand-ins for dynamic TLK tokens (`<CHARNAME>`, `<PRO_HISHER>`, etc.) plus
-machine-wide generation-only pronunciation rules.
+Setup persists the per-profile `game_dir` setting and picks the active locale; **locale is passed
+per-call** (there is no persisted `active_language` key). The shell manages **folder-isolated
+profiles** (`profiles.json` + `profiles/<id>/` under app data): each profile has its own DB,
+workspaces, and agent workspace, and may point at the same or a different game install.
+**Dictionary** configures spoken stand-ins for dynamic TLK tokens (`<CHARNAME>`, `<PRO_HISHER>`, etc.) plus
+profile-scoped generation-only pronunciation rules.
 **Attribution** scans CRE-owned DLGs plus companion banter/interjection DLGs from
 `interdia.2da`, companion post/join DLGs from `pdialog.2da` (e.g. `yoshp.dlg`),
 and prefix-matched side-chain companion DLGs (e.g. `jaheiraj.dlg`;
@@ -59,9 +61,9 @@ CRE dialogue, the same companion DLG trees (quality-capped, text/duration gated)
 sound slots, and an Attribution **gap-fill** for speakers with Ready lines but few
 automatic samples (uniquely attributed official VO only); re-running `harvest_references`
 is **additive** (keeps approvals/bindings, inserts only new sound resrefs). **Binding** pairs approved reference clips with speakers via
-per-speaker clones and/or demographic default pools (metadata binding). Transfer (`export_project` /
-`import_project`) moves project STATE only — it is **audio-free**; an import reports
-`needs_local_rescan` and the receiving machine rebuilds audio locally.
+per-speaker clones and/or demographic default pools (metadata binding). Transfer (`export_profile` /
+`import_profile`) backs up or restores an entire profile folder **including local audio**
+(personal machine-move / demo use). WeiDU Export packs remain the shareable in-game voice pack.
 
 Generation resolves a separate synthesis transcript without changing `line.text`: an
 enabled-by-default mapper converts supported `*...*` cues to base OmniVoice non-verbal
@@ -77,8 +79,10 @@ writing SQLite directly. Review markers and overrides are local and are not tran
   from the frontend via `src/lib/utils/invoke.ts`. There is **no business logic in Svelte**
   and the frontend never touches Tauri/FS directly (asset-protocol URLs for `<audio>` go
   through `assetUrl`, gated by `assetProtocol.scope` in `tauri.conf.json`).
-- **Never transfer or expose game-derived audio.** Transfer bundles are audio-free by
-  construction; the UI must reflect "re-scan/regenerate locally".
+- **Profile backups vs public packs.** Profile Transfer ZIPs may include local
+  workspace audio for personal backup/machine-move; do not treat them as a public
+  distribution channel for game-derived audio. WeiDU Export packs remain the
+  shareable in-game voice pack (generated derivatives only).
 - **Native WeiDU export, EEex-independent packs.** Do not imply a runtime
   player or an EEex requirement for generated packs.
 - **TS↔Rust mirror contract.** Every command return type has a mirrored interface in
@@ -99,7 +103,7 @@ writing SQLite directly. Review markers and overrides are local and are not tran
 ## Code layout
 
 **Backend (`src-tauri/src/`).** `lib.rs` owns `AppState`, plugin registration, the SQLite
-bootstrap, and the full `invoke_handler` — the canonical registry of the **106 commands** the
+bootstrap, and the full `invoke_handler` — the canonical registry of the **commands** the
 backend exposes (add a command there or the UI can't reach it). `main.rs` is the thin binary
 entry. `error.rs` = `AppError` (serializes to a plain string). `models.rs` = the shared
 structs mirrored as TS, with the `contract_tests` anchor. `paths.rs` = portable-vs-dev
@@ -130,7 +134,9 @@ structs mirrored as TS, with the `contract_tests` anchor. `paths.rs` = portable-
   boot, in-app provisioning, health gate, kill-on-exit (`AppState.omnivoice`, shut down
   from the `RunEvent` handler in `lib.rs`).
 - `export/` — WeiDU pack build (`build`, `tp2`, `manifest`, `docs`, `plan`, `resref`, `zip`).
-- `transfer/` — audio-free project `export`/`import` bundles. `backup/` — backups.
+- `profile.rs` / `profile_transfer.rs` — folder-isolated profiles + full-profile ZIP
+  backup/import (includes workspace audio). `transfer/` — zip-slip path sanitizer.
+  `backup/` — backups.
 
 **Frontend (`src/`).** One route per pipeline stage under `src/routes/`: `/` (Setup),
 `/dictionary`, `/attribution`, `/harvest`, `/binding`, `/generation`, `/agent`, `/export`, `/transfer`.

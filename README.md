@@ -13,12 +13,11 @@ at play time.
 
 ## Copyright stance
 
-This tool never distributes game audio. Voice **clones** are learned locally from the
-reference clips already present in *your* installation, and the generated lines live only
-on your machine. The project-transfer feature (below) moves **state only** — speaker,
-line, and decision metadata — and is audio-free by construction: the receiving machine
-re-scans its own install and regenerates the audio locally. Nothing derived from the game
-files leaves your computer.
+This tool never redistributes game audio as a public mod. Voice **clones** are learned
+locally from the reference clips already present in *your* installation. **WeiDU export
+packs** contain only generated derivatives for in-game use. **Profile Transfer** backups
+may include local workspace audio so you can move your own work between machines or keep
+a demo sandbox — keep those ZIPs private; they are not a redistribution channel.
 
 ## Prerequisites
 
@@ -152,9 +151,7 @@ reads from the one before it, so run them in sequence the first time.
    Build demographic **Voice pools** from any mixture of harvested, imported, and designed
    profiles, then **Apply defaults** for stable per-speaker distribution across each pool.
    A personal profile or approved harvested sample overrides the pool and applies to the
-   full identity group. Profiles report their origin and local availability; audio-free
-   project imports mark imported/designed profiles as needing local audio or a fresh
-   audition. Use **Exclude from pack** on a character to keep Generate all/missing and
+   full identity group. Profiles report their origin and local availability. Use **Exclude from pack** on a character to keep Generate all/missing and
    Export from voicing them (useful for mute companions). If they already have generated
    clips, you are asked whether to delete those too; declining still excludes them from
    packs while keeping the files for a later re-include.
@@ -277,24 +274,29 @@ reads from the one before it, so run them in sequence the first time.
    that WeiDU component before installing a newly exported pack; the new pack keeps the original
    manuscript while attaching the generated audio.
 
-8. **Transfer** (optional). Move a project between machines. **Export project…** writes an
-   audio-free `.zip` of the state (speakers/lines/decisions plus voice-profile names,
-   recipes, transcripts, and harvested natural keys—but never profile audio or paths); **import** it on another
-   install and the app tells you it `needs_local_rescan` — re-run Attribution → Harvest →
-   Generate → Export there to rebuild the audio locally. No game audio is ever transferred.
+8. **Transfer** (optional). Back up or restore a full **profile** (database + workspaces
+   audio + agent workspace). **Export profile…** writes a `.zip` of the active profile;
+   **Import profile…** creates a *new* profile from that ZIP and switches to it. Use this
+   for personal machine moves and demo sandboxes — keep backups private. WeiDU packs on
+   the Export screen remain the way to share a voice pack for the game.
+
+   Profiles live under `%APPDATA%\com.bg2voicegen.desktop\profiles\<id>\`. The header
+   Profile control can create, duplicate, rename, delete, and switch profiles; each may
+   use the same or a different game install path.
 
 ### Headless synthesis review
 
 Power users can run the same companion CLI directly:
 
 ```powershell
-.\bg2-synthesis.exe --db "$env:APPDATA\com.bg2voicegen.desktop\bg2vg.db" audit-corpus --project 1
-.\bg2-synthesis.exe --db "$env:APPDATA\com.bg2voicegen.desktop\bg2vg.db" auto-review-plain --project 1
-.\bg2-synthesis.exe --db "$env:APPDATA\com.bg2voicegen.desktop\bg2vg.db" list-flagged --project 1
-.\bg2-synthesis.exe --db "$env:APPDATA\com.bg2voicegen.desktop\bg2vg.db" review --line 42
-.\bg2-synthesis.exe --db "$env:APPDATA\com.bg2voicegen.desktop\bg2vg.db" tag --batch overrides.json
+.\bg2-synthesis.exe --db "$env:APPDATA\com.bg2voicegen.desktop\profiles\1\bg2vg.db" audit-corpus --project 1
+.\bg2-synthesis.exe --db "$env:APPDATA\com.bg2voicegen.desktop\profiles\1\bg2vg.db" auto-review-plain --project 1
+.\bg2-synthesis.exe --db "$env:APPDATA\com.bg2voicegen.desktop\profiles\1\bg2vg.db" list-flagged --project 1
+.\bg2-synthesis.exe --db "$env:APPDATA\com.bg2voicegen.desktop\profiles\1\bg2vg.db" review --line 42
+.\bg2-synthesis.exe --db "$env:APPDATA\com.bg2voicegen.desktop\profiles\1\bg2vg.db" tag --batch overrides.json
 ```
 
+(Or omit `--db` to use the active profile from `profiles.json` / `BG2_SYNTHESIS_PROFILE`.)
 Use `export --dir <folder>` / `import <folder>` for chunked agent work. Every write
 routes through the app's validation and invalidates generated clips that used the old
 transcript.

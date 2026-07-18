@@ -22,6 +22,10 @@ pub struct HealthReport {
     pub schema_version: i32,
 }
 
+// Re-export profile DTOs so the TS↔Rust contract anchor lives beside other mirrors.
+pub use crate::profile::{ProfileInfo, ProfileRegistry};
+pub use crate::profile_transfer::{ProfileExportResult, ProfileImportResult};
+
 // --- Domain status enums (item-05) ---------------------------------------------
 // Each serializes to the exact lowercase token its column's CHECK constraint
 // allows. `Default` marks the DB default so inserts and round-trips agree.
@@ -1433,6 +1437,42 @@ mod contract_tests {
                 app_version: String::new(),
                 db_path: String::new(),
                 schema_version: 0,
+            }),
+        );
+        expect(
+            vec!["id", "name", "created_at"],
+            keys(&ProfileInfo {
+                id: String::new(),
+                name: String::new(),
+                created_at: String::new(),
+            }),
+        );
+        expect(
+            vec!["active_id", "profiles"],
+            keys(&ProfileRegistry {
+                active_id: String::new(),
+                profiles: Vec::new(),
+            }),
+        );
+        expect(
+            vec!["dest_path", "profile_id", "profile_name", "bytes"],
+            keys(&ProfileExportResult {
+                dest_path: String::new(),
+                profile_id: String::new(),
+                profile_name: String::new(),
+                bytes: 0,
+            }),
+        );
+        expect(
+            vec!["profile", "switched", "paths_rewritten"],
+            keys(&ProfileImportResult {
+                profile: ProfileInfo {
+                    id: String::new(),
+                    name: String::new(),
+                    created_at: String::new(),
+                },
+                switched: false,
+                paths_rewritten: 0,
             }),
         );
         expect(

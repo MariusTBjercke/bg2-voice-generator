@@ -28,7 +28,7 @@ where
     T: Send + 'static,
     F: FnOnce(&rusqlite::Connection) -> Result<T, AppError> + Send + 'static,
 {
-    let path = state.db_path.clone();
+    let path = state.db_path();
     tokio::task::spawn_blocking(move || {
         let conn = crate::db::open_read_db(&path)?;
         work(&conn)

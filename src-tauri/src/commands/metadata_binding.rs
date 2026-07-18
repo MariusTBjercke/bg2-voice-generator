@@ -81,7 +81,7 @@ where
     T: Send + 'static,
     F: FnOnce(&rusqlite::Connection) -> Result<T, AppError> + Send + 'static,
 {
-    let path = state.db_path.clone();
+    let path = state.db_path();
     tokio::task::spawn_blocking(move || {
         let conn = crate::db::open_read_db(&path)?;
         work(&conn)
@@ -603,14 +603,14 @@ pub async fn add_metadata_donor(
         .ok_or_else(|| AppError::Other("unknown game directory".into()))?;
     let bindable = bindable_donor_speaker_id(&conn, project_id, donor_speaker_id)?.ok_or_else(|| {
         AppError::Other(format!(
-            "donor speaker {donor_speaker_id} has no approved reference clip"
+            "donor speaker {donor_speaker_id} has no personally bound harvest voice"
         ))
     })?;
     let binding_id = ensure_binding(&conn, project_id, sex, race, creature_category)?;
     add_donor(&conn, binding_id, bindable)?;
-    let (sample_id, _) = crate::db::generation::approved_primary_sample(&conn, bindable)?
-        .ok_or_else(|| AppError::Other("donor lost its approved sample".into()))?;
-    let profile_id = crate::db::voice_profiles::ensure_harvested_profile(&conn, project_id, &[sample_id])?;
+    let profile_id = crate::generator::metadata_binding::resolve_pool_profile_for_donor(
+        &conn, project_id, bindable,
+    )?;
     crate::db::metadata_binding::add_profile(&conn, binding_id, profile_id)?;
     Ok(())
 }

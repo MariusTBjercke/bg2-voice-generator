@@ -16,7 +16,7 @@ pub async fn health_check(state: State<'_, AppState>) -> Result<HealthReport, Ap
     let schema_version = schema::current_schema_version(&conn)?;
     Ok(HealthReport {
         app_version: env!("CARGO_PKG_VERSION").to_string(),
-        db_path: state.db_path.to_string_lossy().to_string(),
+        db_path: state.db_path().to_string_lossy().to_string(),
         schema_version,
     })
 }

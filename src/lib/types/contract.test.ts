@@ -9,6 +9,10 @@
 import { describe, expect, it } from 'vitest';
 import type {
   HealthReport,
+  ProfileInfo,
+  ProfileRegistry,
+  ProfileExportResult,
+  ProfileImportResult,
   GameLanguages,
   TlkSummary,
   TlkEntryView,
@@ -129,6 +133,17 @@ describe('TS<->Rust model contract (mirror of models.rs contract_tests)', () => 
   it('struct key sets match the Rust serde shapes', () => {
     expect(keys(s<HealthReport>({ app_version: '', db_path: '', schema_version: 0 })))
       .toEqual(want('app_version', 'db_path', 'schema_version'));
+    expect(keys(s<ProfileInfo>({ id: '', name: '', created_at: '' })))
+      .toEqual(want('id', 'name', 'created_at'));
+    expect(keys(s<ProfileRegistry>({ active_id: '', profiles: [] })))
+      .toEqual(want('active_id', 'profiles'));
+    expect(keys(s<ProfileExportResult>({ dest_path: '', profile_id: '', profile_name: '', bytes: 0 })))
+      .toEqual(want('dest_path', 'profile_id', 'profile_name', 'bytes'));
+    expect(keys(s<ProfileImportResult>({
+      profile: { id: '', name: '', created_at: '' },
+      switched: false,
+      paths_rewritten: 0,
+    }))).toEqual(want('profile', 'switched', 'paths_rewritten'));
     expect(keys(s<DesignVoiceAttributes>({ gender: 'female', age: 'young adult', pitch: 'high pitch', whisper: false, accent: null })))
       .toEqual(want('gender', 'age', 'pitch', 'whisper', 'accent'));
     expect(keys(s<VoiceProfileReference>({ id: 0, voice_profile_id: 0, reference_sample_id: null, managed_path: null, resolved_audio_path: null, source_strref: null, source_sound_resref: null, transcript: '', sort_order: 0, fingerprint: null })))

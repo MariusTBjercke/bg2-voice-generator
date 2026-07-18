@@ -119,7 +119,7 @@ async fn build_export_inner(
         Some(format!("Staging audio… 0 / {line_count} lines")),
     );
 
-    let out_dir = exports_dir(&state.db_path, project_id);
+    let out_dir = exports_dir(&state.db_path(), project_id);
     std::fs::create_dir_all(&out_dir)?;
     let created_at = chrono::Utc::now().to_rfc3339();
 

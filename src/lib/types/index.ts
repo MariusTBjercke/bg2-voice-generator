@@ -8,6 +8,34 @@ export interface HealthReport {
   schema_version: number;
 }
 
+/** Mirror of `profile::ProfileInfo`. */
+export interface ProfileInfo {
+  id: string;
+  name: string;
+  created_at: string;
+}
+
+/** Mirror of `profile::ProfileRegistry`. */
+export interface ProfileRegistry {
+  active_id: string;
+  profiles: ProfileInfo[];
+}
+
+/** Mirror of `profile_transfer::ProfileExportResult`. */
+export interface ProfileExportResult {
+  dest_path: string;
+  profile_id: string;
+  profile_name: string;
+  bytes: number;
+}
+
+/** Mirror of `profile_transfer::ProfileImportResult`. */
+export interface ProfileImportResult {
+  profile: ProfileInfo;
+  switched: boolean;
+  paths_rewritten: number;
+}
+
 // --- Game resource resolution views (item-04) ---
 // Minimal, forward-compatible mirrors of `extractor::views`
 // (src-tauri/src/extractor/views.rs). The authoritative domain contracts land
@@ -1131,32 +1159,6 @@ export interface ExportResult {
   voice_changed_lines: number;
   edition: string;
   mod_state_hash: string;
-}
-
-/**
- * Mirror of `transfer::export::TransferExportResult` (item-12) - the outcome of a
- * portable transfer-bundle export. The bundle carries config + generation STATE only,
- * never game-derived audio; the counts summarize what travelled.
- */
-export interface TransferExportResult {
-  path: string;
-  speakers: number;
-  lines: number;
-  decisions: number;
-}
-
-/**
- * Mirror of `transfer::import::TransferImportResult` (item-12) - the outcome of
- * reconstructing a transfer bundle into a fresh project. `needs_local_rescan` is always
- * true: no audio was transferred, so the target must re-scan + re-harvest + regenerate.
- */
-export interface TransferImportResult {
-  project_id: number;
-  speakers: number;
-  lines: number;
-  decisions: number;
-  clones: number;
-  needs_local_rescan: boolean;
 }
 
 // --- Progress + cancel (item-06b) ----------------------------------------------
