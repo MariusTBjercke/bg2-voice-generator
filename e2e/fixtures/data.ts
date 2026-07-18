@@ -62,9 +62,29 @@ const defaultRenderSettingsJson = JSON.stringify(defaultRenderSettings);
 
 export const healthReport: HealthReport = {
   app_version: "0.1.0-e2e",
-  db_path: "C:\\fixture\\app.db",
+  db_path: "C:\\fixture\\profiles\\1\\bg2vg.db",
   schema_version: 1,
 };
+
+export const profileRegistry = {
+  active_id: "1",
+  profiles: [
+    { id: "1", name: "Default", created_at: "0" },
+  ],
+};
+
+/** Mutable active-profile snapshot for mock IPC (updated in place on switch). */
+export const activeProfile = {
+  id: "1",
+  name: "Default",
+  created_at: "0",
+};
+
+export function setActiveProfile(p: { id: string; name: string; created_at: string }) {
+  activeProfile.id = p.id;
+  activeProfile.name = p.name;
+  activeProfile.created_at = p.created_at;
+}
 
 export const gameLanguages = {
   locales: [FIXTURE_LOCALE, "de_DE"],

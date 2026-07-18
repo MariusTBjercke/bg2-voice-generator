@@ -23,6 +23,9 @@ import {
   gameLanguages,
   generatableLines,
   healthReport,
+  profileRegistry,
+  activeProfile,
+  setActiveProfile,
   metadataBindings,
   referenceSamples,
   settings,
@@ -71,6 +74,81 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
   switch (cmd) {
     case "health_check":
       return healthReport;
+
+    case "list_profiles":
+      return { ...profileRegistry, profiles: [...profileRegistry.profiles] };
+
+    case "get_active_profile":
+      return { ...activeProfile };
+
+    case "create_profile": {
+      const name = arg<string | null>(args, "name") ?? `Profile ${profileRegistry.profiles.length + 1}`;
+      const id = String(profileRegistry.profiles.length + 1);
+      const info = { id, name, created_at: "0" };
+      profileRegistry.profiles.push(info);
+      return info;
+    }
+
+    case "rename_profile": {
+      const id = arg<string>(args, "id");
+      const name = arg<string>(args, "name");
+      const p = profileRegistry.profiles.find((x) => x.id === id);
+      if (!p) throw new Error(`unknown profile ${id}`);
+      p.name = name;
+      if (activeProfile.id === id) setActiveProfile(p);
+      return { ...p };
+    }
+
+    case "switch_profile": {
+      const id = arg<string>(args, "id");
+      const p = profileRegistry.profiles.find((x) => x.id === id);
+      if (!p) throw new Error(`unknown profile ${id}`);
+      profileRegistry.active_id = id;
+      setActiveProfile(p);
+      return { ...p };
+    }
+
+    case "duplicate_profile": {
+      const id = String(profileRegistry.profiles.length + 1);
+      const info = {
+        id,
+        name: arg<string | null>(args, "name") ?? `Copy of ${activeProfile.name}`,
+        created_at: "0",
+      };
+      profileRegistry.profiles.push(info);
+      return info;
+    }
+
+    case "delete_profile": {
+      const id = arg<string>(args, "id");
+      if (profileRegistry.profiles.length <= 1) throw new Error("cannot delete the last profile");
+      if (profileRegistry.active_id === id) throw new Error("cannot delete the active profile");
+      profileRegistry.profiles = profileRegistry.profiles.filter((p) => p.id !== id);
+      return { ...profileRegistry, profiles: [...profileRegistry.profiles] };
+    }
+
+    case "export_profile":
+      return {
+        dest_path: arg<string>(args, "destPath"),
+        profile_id: activeProfile.id,
+        profile_name: activeProfile.name,
+        bytes: 1024,
+      };
+
+    case "import_profile": {
+      const id = String(profileRegistry.profiles.length + 1);
+      const info = {
+        id,
+        name: arg<string | null>(args, "name") ?? "Imported",
+        created_at: "0",
+      };
+      profileRegistry.profiles.push(info);
+      if (arg<boolean | null>(args, "switchTo") !== false) {
+        profileRegistry.active_id = id;
+        setActiveProfile(info);
+      }
+      return { profile: info, switched: true, paths_rewritten: 0 };
+    }
 
     case "get_setting": {
       const key = arg<string>(args, "key");
