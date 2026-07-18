@@ -19,7 +19,7 @@ test.describe("Generation screen", () => {
   test("speaker names deep-link to Binding with that identity", async ({ page }) => {
     const row = page.locator(".line").filter({ hasText: "#22570" });
     const speaker = row.getByRole("link", { name: "Xzar" });
-    await expect(speaker).toHaveAttribute("href", "/binding?identity=22570");
+    await expect(speaker).toHaveAttribute("href", "/binding?identity=22570%3A1");
   });
 
   test("identity query filters the speaker scope", async ({ page }) => {

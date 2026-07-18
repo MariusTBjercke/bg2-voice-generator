@@ -84,6 +84,21 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
       return undefined;
     }
 
+    case "get_peak_normalize_default": {
+      const raw = settings.get("omnivoice_peak_normalize_dbfs");
+      if (raw == null || raw === "") return -1;
+      if (raw.toLowerCase() === "off") return null;
+      return Number(raw);
+    }
+
+    case "set_peak_normalize_default": {
+      const value = args && "value" in args ? (args.value as number | null) : null;
+      if (value === null) settings.set("omnivoice_peak_normalize_dbfs", "off");
+      else if (value === -1) settings.set("omnivoice_peak_normalize_dbfs", null);
+      else settings.set("omnivoice_peak_normalize_dbfs", String(value));
+      return 0;
+    }
+
     case "reapply_token_standins":
       requireGameDir(args);
       return {
@@ -155,6 +170,129 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
     case "synthesis_corpus_audit_summary":
       requireGameDir(args);
       return { ...synthesisAuditSummary };
+
+    case "binding_audit_progress":
+      requireGameDir(args);
+      return {
+        personal_ready: 3,
+        flagged: 1,
+        reviewed: 1,
+        remaining_personal: 2,
+        generic_skipped: 5,
+        unbound: 10,
+      };
+
+    case "list_marked_bindings":
+      requireGameDir(args);
+      return [
+        {
+          speaker_id: 101,
+          display_name: "Boy",
+          cre_resref: "BOY01",
+          sex: 1,
+          display_identity_key: "100:1",
+          binding_source: "default",
+          sample_id: 55,
+          sample_sound_resref: "jaheir62",
+          sample_owner_cre_resref: "BOY01",
+          sample_text_excerpt: "It is a path of conscience.",
+          review_status: arg(args, "status") === "reviewed" ? "reviewed" : "flagged",
+          review_reason: "agent noted foreign VO",
+          heuristic_hints: [],
+        },
+      ];
+
+    case "list_suspicious_bindings":
+      requireGameDir(args);
+      return [
+        {
+          speaker_id: 101,
+          display_name: "Boy",
+          cre_resref: "BOY01",
+          sex: 1,
+          display_identity_key: "100:1",
+          binding_source: "default",
+          sample_id: 55,
+          sample_sound_resref: "jaheir62",
+          sample_owner_cre_resref: "BOY01",
+          sample_text_excerpt: "It is a path of conscience.",
+          review_status: null,
+          review_reason: "",
+          heuristic_hints: [
+            {
+              code: "crowd_with_companion_stem",
+              detail: "crowd display name `Boy` bound to companion-like stem `jaheir`",
+            },
+          ],
+        },
+      ];
+
+    case "list_personal_bindings":
+      requireGameDir(args);
+      return [
+        {
+          speaker_id: 101,
+          display_name: "Boy",
+          cre_resref: "BOY01",
+          sex: 1,
+          display_identity_key: "100:1",
+          operational_identity_key: "ungrouped:101",
+          binding_source: "default",
+          clone_status: "ready",
+          sample_id: 55,
+          sample_sound_resref: "jaheir62",
+          sample_owner_cre_resref: "BOY01",
+          sample_eligibility: "automatic",
+          sample_shared_source_count: 1,
+          sample_text_excerpt: "It is a path of conscience.",
+          review_status: null,
+          review_reason: "",
+          heuristic_hints: [],
+        },
+      ];
+
+    case "list_binding_groups":
+      requireGameDir(args);
+      return [];
+
+    case "show_binding_detail":
+      requireGameDir(args);
+      return {
+        speaker_id: 101,
+        display_name: "Boy",
+        cre_resref: "BOY01",
+        sex: 1,
+        display_identity_key: "100:1",
+        operational_identity_key: "ungrouped:101",
+        binding_source: "default",
+        clone_status: "ready",
+        sample_id: 55,
+        review: null,
+        personal: null,
+        samples: [],
+        display_group_siblings: [],
+        shares_voice_with_display_group: false,
+      };
+
+    case "flag_binding_review":
+    case "mark_binding_reviewed":
+      requireGameDir(args);
+      return {
+        project_id: 1,
+        cre_resref: String(arg(args, "creResref") ?? "BOY01"),
+        status: cmd === "flag_binding_review" ? "flagged" : "reviewed",
+        reason: String(arg(args, "reason") ?? ""),
+        updated_at: "now",
+      };
+
+    case "clear_binding_review_marker":
+    case "clear_personal_binding":
+      requireGameDir(args);
+      return true;
+
+    case "reject_binding_sample":
+      requireGameDir(args);
+      return null;
 
     case "list_synthesis_flagged": {
       requireGameDir(args);
@@ -468,6 +606,8 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
       if (profile && effective) {
         effective.binding_source = "override";
         effective.inherited = false;
+        effective.follow_speaker_id = null;
+        effective.follow_display_name = null;
         effective.voice_profile_id = profile.id;
         effective.voice_profile_name = profile.display_name;
         effective.voice_profile_origin = profile.origin;
@@ -480,6 +620,7 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
       if (clone && profile) {
         clone.voice_profile_id = profile.id;
         clone.primary_sample_id = null;
+        clone.follow_speaker_id = null;
         clone.binding_source = "override";
       }
       return profile;
@@ -577,6 +718,61 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
       requireGameDir(args);
       const speakerId = arg<number>(args, "speakerId");
       return effectiveBindings.find((b) => b.speaker_id === speakerId) ?? effectiveBindings[0];
+    }
+
+    case "follow_speaker_voice": {
+      requireGameDir(args);
+      const speakerId = arg<number>(args, "speakerId");
+      const followSpeakerId = arg<number>(args, "followSpeakerId");
+      const target = effectiveBindings.find((b) => b.speaker_id === followSpeakerId);
+      const followName =
+        speakers.find((s) => s.id === followSpeakerId)?.display_name ??
+        String(followSpeakerId);
+      const idx = effectiveBindings.findIndex((b) => b.speaker_id === speakerId);
+      if (idx >= 0) {
+        effectiveBindings[idx] = {
+          ...effectiveBindings[idx],
+          binding_source: "follow",
+          inherited: false,
+          follow_speaker_id: followSpeakerId,
+          follow_display_name: followName,
+          clone_status: target?.clone_status ?? "ready",
+          sample_id: target?.sample_id ?? null,
+          sample_path: target?.sample_path ?? null,
+          voice_profile_id: target?.voice_profile_id ?? null,
+          voice_profile_name: target?.voice_profile_name ?? null,
+          voice_profile_origin: target?.voice_profile_origin ?? null,
+          donor_speaker_id: target?.donor_speaker_id ?? null,
+          donor_display_name: target?.donor_display_name ?? null,
+        };
+        const clone = clones.find((row) => row.speaker_id === speakerId);
+        if (clone) {
+          clone.binding_source = "follow";
+          clone.follow_speaker_id = followSpeakerId;
+          clone.primary_sample_id = null;
+          clone.voice_profile_id = null;
+          clone.status = "ready";
+        }
+        return effectiveBindings[idx];
+      }
+      return {
+        speaker_id: speakerId,
+        line_count: 0,
+        clone_id: 99,
+        binding_source: "follow",
+        clone_status: "ready",
+        sample_id: target?.sample_id ?? null,
+        sample_path: target?.sample_path ?? null,
+        voice_profile_id: target?.voice_profile_id ?? null,
+        voice_profile_name: target?.voice_profile_name ?? null,
+        voice_profile_origin: target?.voice_profile_origin ?? null,
+        donor_speaker_id: target?.donor_speaker_id ?? null,
+        donor_display_name: target?.donor_display_name ?? null,
+        inherited: false,
+        follow_speaker_id: followSpeakerId,
+        follow_display_name: followName,
+        sample_voice_sex: null,
+      };
     }
 
     case "list_demographic_groups":

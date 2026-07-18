@@ -40,7 +40,7 @@ test.describe("Harvest manual-only fallback", () => {
     await expect(page.getByRole("heading", { name: /Xzar/ })).toBeVisible();
     await expect(page.getByRole("link", { name: "Open on Binding" })).toHaveAttribute(
       "href",
-      "/binding?identity=22570",
+      "/binding?identity=22570%3A1",
     );
     await expect(page).toHaveURL(/\/harvest$/);
   });

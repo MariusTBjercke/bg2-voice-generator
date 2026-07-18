@@ -55,7 +55,7 @@ test.describe("Guided voice binding", () => {
     await expect(harvested.getByRole("button", { name: "Play", exact: true })).toBeVisible();
     await expect(harvested.getByRole("link", { name: "Manage in Harvest" })).toHaveAttribute(
       "href",
-      "/harvest?identity=22570",
+      "/harvest?identity=22570%3A1",
     );
     await expect(harvested.getByRole("button", { name: "Rename" })).toHaveCount(0);
     await expect(harvested.getByRole("button", { name: "Delete…" })).toHaveCount(0);
@@ -106,7 +106,7 @@ test.describe("Guided voice binding", () => {
     await group.getByRole("button", { name: "Add custom voice" }).click();
 
     await page.getByRole("button", { name: /Xzar/ }).first().click();
-    const override = page.locator(".profile-override");
+    const override = page.locator(".profile-override").filter({ hasText: "Assign an imported or designed profile" });
     await override.getByRole("combobox").selectOption("102");
     await override.getByRole("button", { name: "Assign profile" }).click();
     await expect(page.locator(".effective-voice")).toContainText("Young Amnian noble");
@@ -120,11 +120,11 @@ test.describe("Guided voice binding", () => {
     // Montaron borrows Xzar's demographic voice — Review samples opens the donor.
     await expect(page.getByRole("link", { name: "Review samples" })).toHaveAttribute(
       "href",
-      "/harvest?identity=22570",
+      "/harvest?identity=22570%3A1",
     );
     await expect(page.getByRole("link", { name: "Open on Generation" })).toHaveAttribute(
       "href",
-      "/generation?identity=33001",
+      "/generation?identity=33001%3A1",
     );
     await expect(page).toHaveURL(/\/binding$/);
   });
@@ -166,6 +166,15 @@ test.describe("Guided voice binding", () => {
     await page.getByRole("button", { name: /Xzar/ }).first().click();
     await expect(page.getByRole("strong").filter({ hasText: "Effective voice" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Play effective voice", exact: true })).toBeVisible();
+  });
+
+  test("can follow another character's voice from the detail pane", async ({ page }) => {
+    await page.getByRole("button", { name: /Montaron/ }).first().click();
+    const follow = page.locator(".profile-override").filter({ hasText: "Follow another character" });
+    await follow.getByRole("combobox").selectOption("1");
+    await follow.getByRole("button", { name: "Follow character" }).click();
+    await expect(page.locator(".effective-voice")).toContainText("Following");
+    await expect(page.locator(".speaker.active")).toContainText("Following character");
   });
 
   test("edits compact and advanced voice tuning without saving immediately", async ({ page }) => {

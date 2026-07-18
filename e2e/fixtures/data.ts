@@ -55,6 +55,7 @@ export const defaultRenderSettings: OmniVoiceRenderSettings = {
   audio_chunk_threshold: 30,
   seed: 42,
   peak_normalize_dbfs: -1,
+  peak_normalize_inherit: true,
 };
 
 const defaultRenderSettingsJson = JSON.stringify(defaultRenderSettings);
@@ -124,7 +125,7 @@ export const speakers: Speaker[] = [
 
 export const speakerGroups: SpeakerGroup[] = [
   {
-    identity_key: "22570",
+    identity_key: "22570:1",
     display_name: "Xzar",
     long_name_strref: 22570,
     variant_count: 1,
@@ -145,7 +146,7 @@ export const speakerGroups: SpeakerGroup[] = [
     ],
   },
   {
-    identity_key: "33001",
+    identity_key: "33001:1",
     display_name: "Montaron",
     long_name_strref: 33001,
     variant_count: 1,
@@ -264,6 +265,7 @@ export const clones: Clone[] = [
     speaker_id: 1,
     primary_sample_id: 1,
     voice_profile_id: 100,
+    follow_speaker_id: null,
     binding_source: "default",
     status: "ready",
     render_settings_json: defaultRenderSettingsJson,
@@ -273,6 +275,7 @@ export const clones: Clone[] = [
     speaker_id: 2,
     primary_sample_id: 2,
     voice_profile_id: 100,
+    follow_speaker_id: null,
     binding_source: "default",
     status: "ready",
     render_settings_json: defaultRenderSettingsJson,
@@ -294,6 +297,9 @@ export const effectiveBindings: EffectiveSpeakerBinding[] = [
     donor_speaker_id: 1,
     donor_display_name: "Xzar",
     inherited: true,
+    follow_speaker_id: null,
+    follow_display_name: null,
+    sample_voice_sex: null,
   },
   {
     speaker_id: 2,
@@ -309,6 +315,9 @@ export const effectiveBindings: EffectiveSpeakerBinding[] = [
     donor_speaker_id: 1,
     donor_display_name: "Xzar",
     inherited: false,
+    follow_speaker_id: null,
+    follow_display_name: null,
+    sample_voice_sex: null,
   },
 ];
 
