@@ -4,7 +4,7 @@ The local TTS engine that BG2 Voice Generator drives as a managed subprocess.
 
 This is a **generation-time** dependency only. The voice packs the app exports are
 native WeiDU installs and do **not** require this engine, Python, or the app itself to
-play (see `docs/adr/0001-native-weidu-export.md`).
+play (see the root `README.md` copyright / export sections).
 
 ## Files
 

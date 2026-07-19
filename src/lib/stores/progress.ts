@@ -1,6 +1,6 @@
 // Live per-operation progress, fed by the backend's `operation://progress` event
 // stream (item-06b). The backend is the SOLE source of progress: the frontend
-// never polls the filesystem or pipeline (see docs/adr/0003-repo-module-layout.md).
+// never polls the filesystem or pipeline (UI-only; see AGENTS.md frontend architecture).
 //
 // The store maps each running operation id (`harvest`, `attribution`, ...) to its
 // latest `OperationProgress`. A terminal phase (`done` / `cancelled` / `error`)

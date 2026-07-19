@@ -49,11 +49,14 @@ Playwright starts `npm run dev` with `VITE_E2E_MOCK=1` on **http://localhost:142
     bootstrap.ts  # Visit Setup, wait for mocked install hydration
   stubs/          # Vite aliases for plugin-dialog / plugin-opener
   shell.spec.ts       # App shell + nav
+  dictionary.spec.ts  # Placeholders / Pronunciation / Tag rules tabs
   attribution.spec.ts
   harvest.spec.ts     # Harvest identity groups + sample list
-  binding.spec.ts
+  binding.spec.ts     # Voice library + pools + speaker binds
   generation.spec.ts  # Engine card + synthesis preview
-  agent.spec.ts       # Human/AI review workspace + corpus audit cards
+  agent.spec.ts       # Synthesis review + binding audit + AI workspace
+  export.spec.ts
+  design.spec.ts      # Cross-screen visual hierarchy snapshots
 ```
 
 **Bootstrap flow:** most screens need `$project.gameDir`. Tests call
@@ -78,8 +81,9 @@ packages to `e2e/stubs/*` (see [`vite.config.js`](../vite.config.js)).
 ## Snapshot policy
 
 Layout snapshot baselines live under `e2e/*-snapshots/` (`shell.spec.ts` top bar;
-`binding.spec.ts` desktop + narrow). Keep snapshots **minimal** (Windows font rendering
-can differ across machines). After an intentional layout change:
+`binding.spec.ts` desktop + narrow; `design.spec.ts` Setup / Harvest / Generation /
+Export). Keep snapshots **minimal** (Windows font rendering can differ across machines).
+After an intentional layout change:
 
 ```powershell
 npm run test:e2e:update-snapshots

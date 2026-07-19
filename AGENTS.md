@@ -51,7 +51,8 @@ per-call** (there is no persisted `active_language` key). The shell manages **fo
 profiles** (`profiles.json` + `profiles/<id>/` under app data): each profile has its own DB,
 workspaces, and agent workspace, and may point at the same or a different game install.
 **Dictionary** configures spoken stand-ins for dynamic TLK tokens (`<CHARNAME>`, `<PRO_HISHER>`, etc.) plus
-profile-scoped generation-only pronunciation rules.
+profile-scoped generation-only pronunciation rules and OmniVoice tag rules (stage-cue /
+spoken-word → tag).
 **Attribution** scans CRE-owned DLGs plus companion banter/interjection DLGs from
 `interdia.2da`, companion post/join DLGs from `pdialog.2da` (e.g. `yoshp.dlg`),
 and prefix-matched side-chain companion DLGs (e.g. `jaheiraj.dlg`;
@@ -60,17 +61,21 @@ harvest/bindings/generation). **Harvest** pulls reference clips from uniquely ow
 CRE dialogue, the same companion DLG trees (quality-capped, text/duration gated), CRE
 sound slots, and an Attribution **gap-fill** for speakers with Ready lines but few
 automatic samples (uniquely attributed official VO only); re-running `harvest_references`
-is **additive** (keeps approvals/bindings, inserts only new sound resrefs). **Binding** pairs approved reference clips with speakers via
-per-speaker clones and/or demographic default pools (metadata binding). Transfer (`export_profile` /
-`import_profile`) backs up or restores an entire profile folder **including local audio**
-(personal machine-move / demo use). WeiDU Export packs remain the shareable in-game voice pack.
+is **additive** (keeps approvals/bindings, inserts only new sound resrefs). **Binding**
+pairs speakers with voices via the Voice library (harvested / imported / designed
+profiles), per-speaker clones, and/or demographic default pools (metadata binding).
+Transfer (`export_profile` / `import_profile`) backs up or restores an entire profile
+folder — database (including synthesis overrides, review markers, binding-audit markers,
+dictionary/tag rules), workspace audio, and agent workspace — for personal machine-move /
+demo use. WeiDU Export packs remain the shareable in-game voice pack.
 
 Generation resolves a separate synthesis transcript without changing `line.text`: an
 enabled-by-default mapper converts supported `*...*` cues to base OmniVoice non-verbal
-tags, then a string-keyed human/agent override may replace that result. The optional `/agent`
-Review screen supports manual review and stages a workspace for Codex/Claude (`AGENTS.md` + `.agents/skills/` for Codex,
-`CLAUDE.md` + `.claude/skills/` for Claude); agents must use `bg2-synthesis` rather than
-writing SQLite directly. Review markers and overrides are local and are not transferred.
+tags, then a string-keyed human/agent override may replace that result. The optional
+`/agent` Review screen supports manual synthesis-text review, personal voice-binding
+audit, and stages a workspace for Codex/Claude (`AGENTS.md` + `.agents/skills/` for Codex,
+`CLAUDE.md` + `.claude/skills/` for Claude) with the `set-synthesis` and `audit-bindings`
+skills; agents must use `bg2-synthesis` rather than writing SQLite directly.
 
 ## Hard constraints (don't violate)
 
@@ -79,10 +84,10 @@ writing SQLite directly. Review markers and overrides are local and are not tran
   from the frontend via `src/lib/utils/invoke.ts`. There is **no business logic in Svelte**
   and the frontend never touches Tauri/FS directly (asset-protocol URLs for `<audio>` go
   through `assetUrl`, gated by `assetProtocol.scope` in `tauri.conf.json`).
-- **Profile backups vs public packs.** Profile Transfer ZIPs may include local
-  workspace audio for personal backup/machine-move; do not treat them as a public
-  distribution channel for game-derived audio. WeiDU Export packs remain the
-  shareable in-game voice pack (generated derivatives only).
+- **Profile backups vs public packs.** Profile Transfer ZIPs include the full profile
+  folder (database + workspace audio + agent workspace) for personal backup/machine-move;
+  do not treat them as a public distribution channel for game-derived audio. WeiDU Export
+  packs remain the shareable in-game voice pack (generated derivatives only).
 - **Native WeiDU export, EEex-independent packs.** Do not imply a runtime
   player or an EEex requirement for generated packs.
 - **TS↔Rust mirror contract.** Every command return type has a mirrored interface in
@@ -111,32 +116,37 @@ structs mirrored as TS, with the `contract_tests` anchor. `paths.rs` = portable-
 
 - `commands/` — thin Tauri wrappers that use the writer DB mutex or independent read-only
   WAL connections and delegate to the domain
-  modules: `startup` (`health_check`), `settings`, `extractor` (languages + TLK/DLG/CRE
-  inspectors), `attribution`, `harvest`, `generate` (engine + `install_engine` + `bind_clone`
-  + `generate_line` + `generate_lines_batched` + `assign_fallback_voices`),
-  `metadata_binding` (demographic pools + effective speaker bindings),
-  `synthesis` (preview/override/review/corpus audit), `agent` (workspace + launcher), `export`,
-  `transfer`, and `progress` (the `operation://progress` events + `cancel_operation` +
-  `CancelRegistry`).
+  modules: `startup` (`health_check`), `settings`, `dictionary` / `tag_rules`, `extractor`
+  (languages + TLK/DLG/CRE inspectors), `attribution`, `harvest`, `generate` (engine +
+  `install_engine` + `bind_clone` + `generate_line` + `generate_lines_batched` +
+  `assign_fallback_voices`), `voice_profiles` (library import / design auditions),
+  `metadata_binding` (demographic pools + effective speaker bindings), `binding_audit`
+  (personal-clone review), `synthesis` (preview/override/review/corpus audit), `agent`
+  (workspace + launcher), `export`, `profile` (list/create/switch + transfer), and
+  `progress` (the `operation://progress` events + `cancel_operation` + `CancelRegistry`).
 - `db/` — SQLite: `schema`, `queries`, `attribution`, `harvest`, `generation`, `export`,
-  `speaker_groups` (identity-group bucketing + clone propagation).
+  `speaker_groups` (identity-group bucketing + clone propagation), `voice_profiles`,
+  `binding_audit`, `metadata_binding`.
 - `extractor/` — native Infinity Engine parsing (`key`/`bif`/`tlk`/`dlg`/`cre`/`lang`/
   `resource`/`restype`/`bytes`/`tokens`/`attribution`/`views`). No subprocess/CSV/.NET.
 - `audio/` — `ffmpeg` wrapper, `wav`, candidate selection + `scoring`.
 - `voices/` — reference-clip harvesting (`harvest.rs`).
 - `generator/` — `binding`, `clone`, `batch`, `run` (single-line + batched generation).
+- `dictionary.rs` / `tag_rules.rs` / `omnivoice_tags.rs` — pronunciation + tag-rule
+  application and the pinned OmniVoice tag catalog.
 - `synthesis.rs` + `cli.rs` — generation-text precedence, string-keyed overrides/review
-  state, and the shared implementation behind the `bg2-synthesis` companion binary.
+  state, binding-audit CLI (`binding …`), and the shared implementation behind the
+  `bg2-synthesis` companion binary.
 - `agent_templates.rs` / `agent_templates/` — project workspace docs (`AGENTS.md`,
-  `CLAUDE.md`) + embedded `set-synthesis` skill staged to `.agents/skills/` and
-  `.claude/skills/` by the Review screen.
+  `CLAUDE.md`) + embedded `set-synthesis` and `audit-bindings` skills staged to
+  `.agents/skills/` and `.claude/skills/` by the Review screen.
 - `tts/` — OmniVoice engine supervisor (`engine.rs`, `install.rs`, `omnivoice.rs`): lazy
   boot, in-app provisioning, health gate, kill-on-exit (`AppState.omnivoice`, shut down
   from the `RunEvent` handler in `lib.rs`).
 - `export/` — WeiDU pack build (`build`, `tp2`, `manifest`, `docs`, `plan`, `resref`, `zip`).
 - `profile.rs` / `profile_transfer.rs` — folder-isolated profiles + full-profile ZIP
-  backup/import (includes workspace audio). `transfer/` — zip-slip path sanitizer.
-  `backup/` — backups.
+  backup/import (DB + workspace audio + agent workspace). `transfer/` — zip-slip path
+  sanitizer. `backup/` — backups.
 
 **Frontend (`src/`).** One route per pipeline stage under `src/routes/`: `/` (Setup),
 `/dictionary`, `/attribution`, `/harvest`, `/binding`, `/generation`, `/agent`, `/export`, `/transfer`.
@@ -156,10 +166,10 @@ The frontend is **UI-only**. Svelte 5 runes throughout (`$state`/`$derived`/`$ef
 - `components/` — the shared plain-CSS primitives: `Button`, `Card`, `Section`,
   `StatusBadge`, `ErrorNotice`, `Pager` (display-only paging), `ProgressBar` (determinate +
   indeterminate, respects `prefers-reduced-motion`), `SearchFilterBar`, `SearchableMultiSelect`.
-- `stores/` — `project` (`{gameDir, locale}`), `results` (a UI-only cache keyed by `gameDir`,
-  reset on install change — never a source of truth), `progress` (the lazy
-  `operation://progress` listener, keyed by op, terminal phase clears the entry), `filters`
-  (per-screen search/filter state).
+- `stores/` — `project` (`{gameDir, locale}`), `profiles` (active profile + switch/hydrate),
+  `results` (a UI-only cache keyed by `gameDir`, reset on install change — never a source
+  of truth), `progress` (the lazy `operation://progress` listener, keyed by op, terminal
+  phase clears the entry), `filters` (per-screen search/filter state).
 - `filters/` — pure filter helpers + configs used by list screens (`generation.ts`, etc.).
 - `app.css` — `:root` design tokens: the dark palette (`#0c0d0b` bg / `#e6e6e6` text /
   `#2a2d27` borders) + spacing/radii. Plain CSS, no framework.

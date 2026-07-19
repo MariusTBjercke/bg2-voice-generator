@@ -2,7 +2,9 @@
 
 Dictionary rules replace difficult spellings immediately before BG2 Voice Generator sends
 generation text to OmniVoice. They never change TLK subtitles or exported dialogue strings.
-Rules are machine-wide and stay local, like placeholder settings.
+Rules are **profile-scoped** (stored in the active profile database, applied to every line
+in that profile — not per-line) and travel with Profile Transfer backups, like placeholder
+settings and tag rules.
 
 The Dictionary screen has three tabs:
 

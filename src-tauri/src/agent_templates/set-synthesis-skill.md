@@ -12,7 +12,7 @@ directly.
 Run `bg2-synthesis catalog` for the full allowed inline tag list.
 
 For **recurring** spoken-word → tag patterns (for example every bare `Bah` should become
-`[dissatisfaction-hnn]`), prefer a machine-wide **Tag rule** via the Dictionary screen or
+`[dissatisfaction-hnn]`), prefer a profile-scoped **Tag rule** via the Dictionary screen or
 `bg2-synthesis tag-rule add --find Bah --tag "[dissatisfaction-hnn]" --match whole_word`
 instead of per-line overrides. Keep `tag --line` / `tag --batch` for one-off delivery.
 

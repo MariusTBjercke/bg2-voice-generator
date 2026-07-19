@@ -16,7 +16,8 @@ at play time.
 This tool never redistributes game audio as a public mod. Voice **clones** are learned
 locally from the reference clips already present in *your* installation. **WeiDU export
 packs** contain only generated derivatives for in-game use. **Profile Transfer** backups
-may include local workspace audio so you can move your own work between machines or keep
+may include local workspace audio and full profile database state (including synthesis
+overrides and review markers) so you can move your own work between machines or keep
 a demo sandbox — keep those ZIPs private; they are not a redistribution channel.
 
 ## Prerequisites
@@ -106,7 +107,7 @@ reads from the one before it, so run them in sequence the first time.
    profile** (neutral / male / female) for gendered protagonist tokens; advanced overrides
    let you customise individual tokens. **Save + Apply** persists the settings and, on an
    existing project, re-applies stand-ins to tokenized lines. New scans pick up placeholder
-   settings automatically. The **Pronunciation** tab applies machine-wide `find → speak as`
+   settings automatically. The **Pronunciation** tab applies profile-scoped `find → speak as`
    rules immediately before generation. The **Tag rules** tab seeds the stage-cue → OmniVoice
    tag mapper as editable defaults and lets you add spoken-word → tag rules (for example
    `Bah` → `[dissatisfaction-hnn]`). Both affect generated audio only; subtitles remain unchanged.
@@ -200,39 +201,48 @@ reads from the one before it, so run them in sequence the first time.
    Overrides must preserve the subtitle's spoken words, apply to every identical string, and
    never change the subtitle or exported TLK text.
 
-6a. **Dialogue review** (optional). The **Review** screen opens on deterministically flagged
-   strings and also provides a paged **Remaining** queue for every undecided unique string.
-   Accept the current mapper output as reviewed, or edit and save a generation-only override.
-   Overrides and review progress persist across sessions but remain local to this machine.
+6a. **Dialogue review** (optional). The **Review** screen covers two optional passes before
+   Export:
+
+   - **Generation text** — opens on deterministically flagged strings and also provides a
+     paged **Remaining** queue for every undecided unique string. Accept the current mapper
+     output as reviewed, or edit and save a generation-only override.
+   - **Voice bindings** — audits personal clones for wrong-character reference clips
+     (heuristic **Suspicious** list plus a full personal-binding walk). Flag suspects, reject
+     bad samples, clear a personal bind so demographic fallback can take over, or mark a
+     binding reviewed when it is clearly self-voice.
+
+   Overrides, review markers, and binding-audit markers persist in the profile database
+   (and travel with **Transfer** backups).
 
    For AI-assisted review, the same screen stages a safe project workspace and launches Codex
-   or Claude to review unique dialogue strings using the bundled
-   `bg2-synthesis.exe` companion CLI. The workspace uses the cross-agent layout:
-   `AGENTS.md` (Codex reads this directly), `CLAUDE.md` (imports `AGENTS.md` for Claude
-   Code), and the same `set-synthesis` skill under `.agents/skills/` and
-   `.claude/skills/`. The agent accepts the default mapper with `review` or writes a
-   generation-only override with `tag`; it never edits TLK text directly. Overrides may
-   fix mapper placement or, **very sparingly**, add allowed OmniVoice inline tags when
-   delivery is unambiguous (`bg2-synthesis catalog` lists body/non-verbal tags plus
-   English intonation tags like `[question-en]` and `[surprise-ah]`). Tags such as
-   `[angry]` / `[sad]` are **not** supported by the base checkpoint. Progress persists
-   across sessions. Overrides are local machine state and are not included in
-   project-transfer bundles.
+   or Claude using the bundled `bg2-synthesis.exe` companion CLI. The workspace uses the
+   cross-agent layout: `AGENTS.md` (Codex reads this directly), `CLAUDE.md` (imports
+   `AGENTS.md` for Claude Code), and the `set-synthesis` plus `audit-bindings` skills under
+   both `.agents/skills/` and `.claude/skills/`. For synthesis text, the agent accepts the
+   default mapper with `review` or writes a generation-only override with `tag`; it never
+   edits TLK text directly. Overrides may fix mapper placement or, **very sparingly**, add
+   allowed OmniVoice inline tags when delivery is unambiguous (`bg2-synthesis catalog` lists
+   body/non-verbal tags plus English intonation tags like `[question-en]` and
+   `[surprise-ah]`). Tags such as `[angry]` / `[sad]` are **not** supported by the base
+   checkpoint. For bindings, follow `audit-bindings` and use `bg2-synthesis binding …`
+   (flag / review / reject-sample / clear-personal) — never approve samples or edit pools
+   from the agent workspace.
 
-   The mapper always runs for lines without an override. Most agent work is `review` —
-   marking a unique string as looked-at while the mapper turns supported cues such as
-   `*sigh*` into OmniVoice tags and strips unsupported cues. Use `tag` only when you
-   want a deliberate override; those always win over the mapper. Review markers do not
+   The mapper always runs for lines without an override. Most synthesis agent work is
+   `review` — marking a unique string as looked-at while the mapper turns supported cues
+   such as `*sigh*` into OmniVoice tags and strips unsupported cues. Use `tag` only when
+   you want a deliberate override; those always win over the mapper. Review markers do not
    lock in synthesis text — they only track workflow progress on the Review screen.
 
-   **Typical session**
+   **Typical synthesis session**
 
    1. Finish **Attribution** (and optional earlier pipeline steps) so the project exists.
    2. Open **Review** and note the progress counters (`remaining` is what still needs a
       decision).
    3. Click **Launch Codex** or **Launch Claude** (or **Reveal workspace** and start the
-      CLI yourself). The app opens a terminal in a prepared folder with `AGENTS.md`, the
-      `set-synthesis` skill, and the resolved `bg2-synthesis` path.
+      CLI yourself). The app opens a terminal in a prepared folder with `AGENTS.md`, both
+      skills, and the resolved `bg2-synthesis` path.
    4. Tell the agent something like: *“Follow the set-synthesis skill. Run
       `audit-corpus`, then `auto-review-plain`, then work `list-flagged`; `review` when
       mapper output is acceptable; `tag` only for mapper fixes or rare, high-confidence
@@ -261,6 +271,18 @@ reads from the one before it, so run them in sequence the first time.
    Inspect one line at any time with `show --line <id>` (prints original text, resolved
    synthesis text, and whether it came from override / mapper / plain).
 
+   **Typical binding-audit session** (same workspace; follow the `audit-bindings` skill):
+
+   ```powershell
+   bg2-synthesis binding progress --project 1
+   bg2-synthesis binding list-suspicious --project 1 --limit 100
+   bg2-synthesis binding show --project 1 --cre BOY
+   bg2-synthesis binding flag --project 1 --cre BOY --reason "jaheir62 VO on Boy"
+   bg2-synthesis binding reject-sample --project 1 --sample 42
+   bg2-synthesis binding clear-personal --project 1 --cre BOY
+   bg2-synthesis binding review --project 1 --cre JAHEI
+   ```
+
 7. **Export.** Optionally name the pack, then click **Build export** to write a native
    WeiDU voice-pack folder (and, when WeiDU is vendored, a packaged `.zip` installer). The
    result shows the patched/deferred line counts, the install fingerprint, and buttons to
@@ -274,17 +296,21 @@ reads from the one before it, so run them in sequence the first time.
    that WeiDU component before installing a newly exported pack; the new pack keeps the original
    manuscript while attaching the generated audio.
 
-8. **Transfer** (optional). Back up or restore a full **profile** (database + workspaces
-   audio + agent workspace). **Export profile…** writes a `.zip` of the active profile;
-   **Import profile…** creates a *new* profile from that ZIP and switches to it. Use this
-   for personal machine moves and demo sandboxes — keep backups private. WeiDU packs on
-   the Export screen remain the way to share a voice pack for the game.
+8. **Transfer** (optional). Back up or restore a full **profile** folder. **Export profile…**
+   writes a `.zip` of the active profile; **Import profile…** creates a *new* profile from
+   that ZIP and switches to it. The archive includes as much profile state as possible: the
+   SQLite database (attribution, harvest approvals, bindings, demographic pools, voice
+   profiles, dictionary/tag rules, synthesis overrides, review markers, binding-audit
+   markers, generated-line records), workspace audio, and the agent workspace. Use this for
+   personal machine moves and demo sandboxes — keep backups private (they may contain
+   game-derived reference clips). WeiDU packs on the Export screen remain the way to share
+   a voice pack for the game.
 
    Profiles live under `%APPDATA%\com.bg2voicegen.desktop\profiles\<id>\`. The header
    Profile control can create, duplicate, rename, delete, and switch profiles; each may
    use the same or a different game install path.
 
-### Headless synthesis review
+### Headless synthesis and binding review
 
 Power users can run the same companion CLI directly:
 
@@ -294,10 +320,12 @@ Power users can run the same companion CLI directly:
 .\bg2-synthesis.exe --db "$env:APPDATA\com.bg2voicegen.desktop\profiles\1\bg2vg.db" list-flagged --project 1
 .\bg2-synthesis.exe --db "$env:APPDATA\com.bg2voicegen.desktop\profiles\1\bg2vg.db" review --line 42
 .\bg2-synthesis.exe --db "$env:APPDATA\com.bg2voicegen.desktop\profiles\1\bg2vg.db" tag --batch overrides.json
+.\bg2-synthesis.exe --db "$env:APPDATA\com.bg2voicegen.desktop\profiles\1\bg2vg.db" binding progress --project 1
+.\bg2-synthesis.exe --db "$env:APPDATA\com.bg2voicegen.desktop\profiles\1\bg2vg.db" binding list-suspicious --project 1
 ```
 
 (Or omit `--db` to use the active profile from `profiles.json` / `BG2_SYNTHESIS_PROFILE`.)
-Use `export --dir <folder>` / `import <folder>` for chunked agent work. Every write
+Use `export --dir <folder>` / `import <folder>` for chunked synthesis agent work. Every write
 routes through the app's validation and invalidates generated clips that used the old
 transcript.
 
