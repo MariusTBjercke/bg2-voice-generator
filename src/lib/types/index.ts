@@ -632,8 +632,8 @@ export interface VerifySpeechResult {
 
 /**
  * Mirror of `commands::generate::AutoBindResult` - what a bulk auto-bind run did:
- * a clone bound (`ready`) for each speaker with an approved clip, skipping speakers
- * already bound `ready` and counting any whose clip failed validation.
+ * clones bound (`ready`) for speakers with an approved clip. Gap-fill skips any
+ * ready voice; full remap skips only already-personal ready and replaces demographics.
  */
 export interface AutoBindResult {
   speakers_bound: number;

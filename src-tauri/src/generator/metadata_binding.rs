@@ -4,10 +4,11 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::db::generation::{
-    approved_primary_sample, clone_for_speaker, fallback_donor_pool, set_clone_status, upsert_clone,
+    approved_primary_sample, clear_clone_for_speaker, clone_for_speaker, fallback_donor_pool,
+    set_clone_status, upsert_clone,
 };
 use crate::db::metadata_binding::{
     donors_for_key, metadata_apply_targets, profiles_for_key, replace_profile,
@@ -18,7 +19,7 @@ use crate::db::speaker_groups::{
 use crate::error::AppError;
 use crate::generator::binding::{best_donor, Demographics, DemographicMatch, DonorCandidate};
 use crate::generator::clone::validate_file;
-use crate::models::{BindingSource, CloneStatus};
+use crate::models::{BindingSource, CloneStatus, VoiceProfileOrigin};
 
 /// Pick a stable donor index for `speaker_id` from a non-empty pool.
 /// Re-applying without pool changes yields the same donor; changing pool membership
@@ -708,6 +709,119 @@ pub fn apply_metadata_binding_to_speaker(
     apply_one(conn, project_id, target, &pool, auto_fill_unmapped)
 }
 
+/// True when a personal (`default`/`override`) harvested bind can no longer resolve
+/// from approved samples. Designed/imported profiles and follow binds are never stale
+/// under this rule — they do not depend on harvest approvals.
+pub fn personal_binding_is_stale(
+    conn: &Connection,
+    speaker_id: i64,
+) -> Result<bool, AppError> {
+    let Some(clone) = clone_for_speaker(conn, speaker_id)? else {
+        return Ok(false);
+    };
+    if !matches!(
+        clone.binding_source,
+        BindingSource::Default | BindingSource::Override
+    ) {
+        return Ok(false);
+    }
+    if clone.follow_speaker_id.is_some() {
+        return Ok(false);
+    }
+    if let Some(profile_id) = clone.voice_profile_id {
+        if let Some(profile) = crate::db::voice_profiles::profile_by_id(conn, profile_id)? {
+            if profile.origin != VoiceProfileOrigin::Harvested {
+                return Ok(false);
+            }
+        }
+    }
+    let project_id: i64 = conn.query_row(
+        "SELECT project_id FROM speaker WHERE id=?1",
+        [speaker_id],
+        |r| r.get(0),
+    )?;
+    let owners = donor_sample_owner_ids(conn, project_id, speaker_id)?;
+    for owner_id in owners {
+        if approved_primary_sample(conn, owner_id)?.is_some() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Clear hollow personal binds (no remaining approved harvest samples) for one
+/// Binding display group and restore configured demographic defaults.
+///
+/// Returns how many speakers had a clone cleared. Speakers stay unbound when no
+/// pool/donor can be resolved (`auto_fill_unmapped` matches Apply defaults).
+pub fn clear_stale_personal_binding_for_speaker(
+    conn: &Connection,
+    project_id: i64,
+    speaker_id: i64,
+    auto_fill_unmapped: bool,
+) -> Result<usize, AppError> {
+    if !personal_binding_is_stale(conn, speaker_id)? {
+        return Ok(0);
+    }
+    let identity_key = display_identity_key_for_speaker(conn, speaker_id)?;
+    let member_ids = speaker_ids_in_group(conn, project_id, &identity_key)?;
+    let mut cleared = 0usize;
+    for sid in &member_ids {
+        if clear_clone_for_speaker(conn, *sid)? {
+            cleared += 1;
+        }
+    }
+    for sid in member_ids {
+        let target = conn
+            .query_row(
+                "SELECT id, sex, race, class, creature_category FROM speaker \
+                 WHERE id = ?1 AND project_id = ?2",
+                rusqlite::params![sid, project_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let Some(target) = target else {
+            continue;
+        };
+        let _ = apply_metadata_binding_to_speaker(conn, project_id, target, auto_fill_unmapped)?;
+    }
+    Ok(cleared)
+}
+
+/// Project-wide sweep used after harvest / at the start of Apply defaults.
+pub fn clear_stale_personal_bindings(
+    conn: &Connection,
+    project_id: i64,
+    auto_fill_unmapped: bool,
+) -> Result<usize, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT c.speaker_id FROM clone c \
+         JOIN speaker s ON s.id = c.speaker_id \
+         WHERE s.project_id = ?1 \
+           AND c.binding_source IN ('default', 'override') \
+           AND c.follow_speaker_id IS NULL \
+         ORDER BY c.speaker_id",
+    )?;
+    let speakers: Vec<i64> = stmt
+        .query_map([project_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut cleared = 0usize;
+    let mut seen = std::collections::HashSet::new();
+    for speaker_id in speakers {
+        let key = display_identity_key_for_speaker(conn, speaker_id)?;
+        if !seen.insert(key) {
+            continue;
+        }
+        cleared += clear_stale_personal_binding_for_speaker(
+            conn,
+            project_id,
+            speaker_id,
+            auto_fill_unmapped,
+        )?;
+    }
+    Ok(cleared)
+}
+
 /// Apply demographic defaults to every speaker without an explicit personal binding.
 pub fn apply_metadata_bindings(
     conn: &Connection,
@@ -715,6 +829,10 @@ pub fn apply_metadata_bindings(
     auto_fill_unmapped: bool,
     reshuffle: bool,
 ) -> Result<ApplyMetadataOutcome, AppError> {
+    // Hollow personal overrides (sample unapproved/gone) would otherwise permanently
+    // block demographic fill — clear them first so they become apply targets.
+    let _ = clear_stale_personal_bindings(conn, project_id, auto_fill_unmapped)?;
+
     let pool = donor_pool(conn, project_id)?;
 
     let mut outcome = ApplyMetadataOutcome::default();
@@ -888,9 +1006,53 @@ mod tests {
             false,
         )
         .unwrap()
-        .unwrap();
+        .expect("demographic default");
         assert_eq!(assignment.donor_speaker_id, donor);
-        assert_eq!(clone_for_speaker(&conn, target).unwrap().unwrap().binding_source, BindingSource::Generic);
+        assert!(assignment.from_pool);
+        let clone = clone_for_speaker(&conn, target).unwrap().unwrap();
+        assert_eq!(clone.binding_source, BindingSource::Generic);
+    }
+
+    #[test]
+    fn stale_personal_bind_without_approved_samples_is_cleared_and_pool_restored() {
+        use crate::audio::wav::build_pcm_wav;
+        use crate::db::generation::{clone_for_speaker, set_clone_status, upsert_clone};
+        use crate::generator::clone::REFERENCE_SAMPLE_RATE;
+        use crate::models::CloneStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("donor.wav");
+        let samples: Vec<i16> = (0..REFERENCE_SAMPLE_RATE).map(|_| 8_000).collect();
+        std::fs::write(&path, build_pcm_wav(REFERENCE_SAMPLE_RATE, &samples)).unwrap();
+        let conn = mem_db();
+        let pid = project(&conn);
+        let donor = speaker(&conn, pid, "donor", 1, 2, 0, 3);
+        approve(&conn, donor, &path.to_string_lossy());
+        let target = speaker(&conn, pid, "wellyn", 1, 2, 0, 3);
+        approve(&conn, target, &path.to_string_lossy());
+        let personal_sample = approved_primary_sample(&conn, target).unwrap().unwrap().0;
+        let clone_id = upsert_clone(&conn, target, personal_sample, BindingSource::Default).unwrap();
+        set_clone_status(&conn, clone_id, CloneStatus::Ready).unwrap();
+        // Simulate lost approval while leaving the hollow personal override in place.
+        conn.execute(
+            "UPDATE reference_sample SET decision='pending' WHERE id=?1",
+            [personal_sample],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE clone SET status='pending', primary_sample_id=NULL WHERE id=?1",
+            [clone_id],
+        )
+        .unwrap();
+        let binding_id = ensure_binding(&conn, pid, 1, 2, 3).unwrap();
+        add_donor(&conn, binding_id, donor).unwrap();
+
+        assert!(personal_binding_is_stale(&conn, target).unwrap());
+        let outcome = apply_metadata_bindings(&conn, pid, false, false).unwrap();
+        assert!(outcome.speakers_pool_bound >= 1);
+        let clone = clone_for_speaker(&conn, target).unwrap().unwrap();
+        assert_eq!(clone.binding_source, BindingSource::Generic);
+        assert_eq!(clone.status, CloneStatus::Ready);
     }
 
     #[test]

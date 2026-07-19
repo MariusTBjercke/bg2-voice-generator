@@ -23,6 +23,7 @@ test.describe("Guided voice binding", () => {
     await expect(page.getByLabel("Effective voice readiness")).toContainText("1 demographic defaults");
     await expect(page.getByRole("button", { name: "Apply defaults" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Auto-configure all" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Fill gaps with personal samples" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Use personal samples for all" })).toBeVisible();
   });
 

@@ -707,6 +707,9 @@ pub fn persist(
     counts.speakers = touched.len();
     counts.samples_added = counts.samples;
     tx.commit()?;
+    // Re-harvest often leaves personal clones pending with no approved sample —
+    // clear those hollow overrides so demographic Apply defaults can fill them.
+    let _ = crate::generator::metadata_binding::clear_stale_personal_bindings(conn, project_id, false)?;
     Ok(counts)
 }
 
@@ -759,6 +762,21 @@ pub fn set_decision(
     )?;
     if prior_decision.as_deref() == Some("approved") && decision != "approved" {
         invalidate_clones_referencing_sample(conn, sample_id)?;
+        // Hollow personal binds (no remaining approved samples) block Apply defaults —
+        // clear them and restore demographic defaults when a pool/donor is available.
+        if let Some((project_id, speaker_id)) = conn
+            .query_row(
+                "SELECT s.project_id, rs.speaker_id FROM reference_sample rs \
+                 JOIN speaker s ON s.id = rs.speaker_id WHERE rs.id = ?1",
+                params![sample_id],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()?
+        {
+            let _ = crate::generator::metadata_binding::clear_stale_personal_binding_for_speaker(
+                conn, project_id, speaker_id, false,
+            )?;
+        }
     }
     Ok(n > 0)
 }
@@ -1602,15 +1620,15 @@ mod tests {
         let counts = persist(&mut conn, pid, &[sample("xzar", "xzar01")], true, false).unwrap();
         assert_eq!(counts.clones_invalidated, 1);
 
-        let (status, primary): (String, Option<i64>) = conn
+        // Fresh sample is pending (no preserved approval) → hollow personal bind cleared.
+        let clone_count: i64 = conn
             .query_row(
-                "SELECT status, primary_sample_id FROM clone WHERE speaker_id = ?1",
+                "SELECT count(*) FROM clone WHERE speaker_id = ?1",
                 params![sid],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(status, "pending");
-        assert_eq!(primary, None);
+        assert_eq!(clone_count, 0);
     }
 
     #[test]
@@ -1642,15 +1660,14 @@ mod tests {
             .query_row("SELECT count(*) FROM reference_sample", [], |r| r.get(0))
             .unwrap();
         assert_eq!(sample_count, 0);
-        let (status, primary): (String, Option<i64>) = conn
+        let clone_count: i64 = conn
             .query_row(
-                "SELECT status, primary_sample_id FROM clone WHERE speaker_id = ?1",
+                "SELECT count(*) FROM clone WHERE speaker_id = ?1",
                 params![sid],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(status, "pending");
-        assert_eq!(primary, None);
+        assert_eq!(clone_count, 0);
     }
 
     #[test]
@@ -1985,9 +2002,43 @@ mod tests {
         set_clone_status(&conn, clone_id, CloneStatus::Ready).unwrap();
 
         assert!(set_decision(&conn, sample_id, "pending").unwrap());
+        // No remaining approved samples → hollow personal bind is removed entirely
+        // (so Apply defaults / demographic restore can take over).
+        assert!(clone_for_speaker(&conn, sid).unwrap().is_none());
+    }
+
+    #[test]
+    fn set_decision_keeps_personal_bind_when_another_approved_sample_remains() {
+        use crate::db::generation::{clone_for_speaker, set_clone_status, upsert_clone};
+        use crate::models::{BindingSource, CloneStatus};
+
+        let conn = mem_db();
+        let pid = project(&conn);
+        let sid = speaker(&conn, pid, "anno");
+        conn.execute(
+            "INSERT INTO reference_sample (speaker_id, decision, local_derivative_path) \
+             VALUES (?1, 'approved', 'a.wav')",
+            params![sid],
+        )
+        .unwrap();
+        let first = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO reference_sample (speaker_id, decision, local_derivative_path) \
+             VALUES (?1, 'approved', 'b.wav')",
+            params![sid],
+        )
+        .unwrap();
+        let second = conn.last_insert_rowid();
+        let clone_id = upsert_clone(&conn, sid, first, BindingSource::Default).unwrap();
+        set_clone_status(&conn, clone_id, CloneStatus::Ready).unwrap();
+
+        assert!(set_decision(&conn, first, "pending").unwrap());
         let clone = clone_for_speaker(&conn, sid).unwrap().unwrap();
         assert_eq!(clone.status, CloneStatus::Pending);
         assert!(clone.primary_sample_id.is_none());
+        assert_eq!(clone.binding_source, BindingSource::Default);
+        // Second approval still present — keep personal so Bind / auto_bind can re-resolve.
+        assert_eq!(decision_of(&conn, second), "approved");
     }
 
     #[test]

@@ -1497,54 +1497,55 @@
       {/if}
 
       <div class="batch-settings">
-        <div class="batch-field">
-          <label for="batch-size">Batch size</label>
-          <input
-            id="batch-size"
-            type="number"
-            min="1"
-            inputmode="numeric"
-            placeholder={String(DEFAULT_BATCH_SIZE)}
-            bind:value={batchSize}
-          />
-        </div>
-        <div class="batch-field">
-          <label for="char-budget">Character budget</label>
-          <input
-            id="char-budget"
-            type="number"
-            min="1"
-            inputmode="numeric"
-            placeholder={String(DEFAULT_CHAR_BUDGET)}
-            bind:value={charBudget}
-          />
-        </div>
-        <div class="batch-field peak-field">
-          <label class="check" for="peak-normalize-enabled">
+        <div class="batch-controls">
+          <div class="batch-field">
+            <label for="batch-size">Batch size</label>
             <input
-              id="peak-normalize-enabled"
-              type="checkbox"
-              bind:checked={peakNormalizeEnabled}
+              id="batch-size"
+              type="number"
+              min="1"
+              inputmode="numeric"
+              placeholder={String(DEFAULT_BATCH_SIZE)}
+              bind:value={batchSize}
             />
-            Peak normalize
-          </label>
-          {#if peakNormalizeEnabled}
-            <label class="number-control" for="peak-normalize-dbfs">
-              Target dBFS
+          </div>
+          <div class="batch-field">
+            <label for="char-budget">Character budget</label>
+            <input
+              id="char-budget"
+              type="number"
+              min="1"
+              inputmode="numeric"
+              placeholder={String(DEFAULT_CHAR_BUDGET)}
+              bind:value={charBudget}
+            />
+          </div>
+          <div class="batch-field">
+            <label for="peak-normalize-dbfs">Target dBFS</label>
+            <input
+              id="peak-normalize-dbfs"
+              type="number"
+              min="-6"
+              max="0"
+              step="0.1"
+              disabled={!peakNormalizeEnabled}
+              bind:value={peakNormalizeDbfs}
+            />
+          </div>
+          <div class="batch-field batch-field-check">
+            <label class="check" for="peak-normalize-enabled">
               <input
-                id="peak-normalize-dbfs"
-                type="number"
-                min="-6"
-                max="0"
-                step="0.1"
-                bind:value={peakNormalizeDbfs}
+                id="peak-normalize-enabled"
+                type="checkbox"
+                bind:checked={peakNormalizeEnabled}
               />
+              Peak normalize
             </label>
-          {/if}
+          </div>
+          <Button variant="ghost" onclick={saveBatchSettings} disabled={savingSettings}>
+            {savingSettings ? "Saving…" : "Save"}
+          </Button>
         </div>
-        <Button variant="ghost" onclick={saveBatchSettings} disabled={savingSettings}>
-          {savingSettings ? "Saving…" : "Save"}
-        </Button>
         <p class="batch-hint">
           Lines sharing a voice are sent to the engine together, capped by BOTH the
           batch size and the total character budget (the main VRAM dial). Leave a field
@@ -2066,14 +2067,19 @@
   }
   .batch-settings {
     display: flex;
-    align-items: flex-end;
+    flex-direction: column;
     gap: var(--space-3);
-    flex-wrap: wrap;
     margin-bottom: var(--space-3);
     padding: var(--space-3);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--panel-2);
+  }
+  .batch-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--space-3);
   }
   .batch-field {
     display: flex;
@@ -2084,7 +2090,7 @@
     font-size: 0.8rem;
     color: var(--text-muted);
   }
-  .batch-field input {
+  .batch-field input[type="number"] {
     width: 7rem;
     font: inherit;
     background: var(--panel);
@@ -2093,29 +2099,28 @@
     border-radius: var(--radius-sm);
     padding: var(--space-1) var(--space-2);
   }
-  .batch-field input:focus {
+  .batch-field input[type="number"]:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+  .batch-field input[type="number"]:focus {
     outline: none;
     border-color: var(--accent);
   }
-  .peak-field .check {
+  .batch-field-check .check {
     display: flex;
     align-items: center;
     gap: var(--space-2);
+    min-height: 2.1rem;
     font-size: 0.8rem;
     color: var(--text-muted);
-  }
-  .peak-field .number-control {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-1);
-    font-size: 0.8rem;
-    color: var(--text-muted);
+    white-space: nowrap;
   }
   .batch-hint {
-    flex: 1 1 16rem;
     margin: 0;
     font-size: 0.8rem;
     color: var(--text-muted);
+    max-width: 52rem;
   }
   .lines-head h3 {
     margin-right: auto;

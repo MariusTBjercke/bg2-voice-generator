@@ -333,18 +333,23 @@ pub struct AutoBindResult {
     pub speakers_failed: usize,
 }
 
-/// Bind (or rebind) a clone for EVERY speaker with an approved reference clip in
-/// the project rooted at `game_dir`, in one pass (mirror `auto_approve_best_samples`).
-/// A speaker already carrying a personal `ready` clone is skipped; a generic
-/// demographic default is intentionally replaced. Otherwise the approved clip is
-/// validated and upserted as `ready`, or the clone is marked `failed` if the clip is
-/// bad (never fatal to the batch). Uses the `default` binding tier. The
-/// project is resolved WITHOUT creating one; an unknown dir yields a zero result.
-/// Read/DB-only - no engine (binding is metadata + file validation).
+/// Bind (or rebind) a clone for speakers with an approved reference clip in the
+/// project rooted at `game_dir`.
+///
+/// When `gaps_only` is false (default): a speaker already carrying a personal
+/// `ready` clone is skipped; a generic demographic default is intentionally
+/// replaced. When `gaps_only` is true: any `ready` clone (personal, demographic,
+/// or follow) is left alone — only unbound / pending / failed speakers are filled.
+///
+/// Otherwise the approved clip is validated and upserted as `ready`, or the clone
+/// is marked `failed` if the clip is bad (never fatal to the batch). Uses the
+/// `default` binding tier. The project is resolved WITHOUT creating one; an
+/// unknown dir yields a zero result. Read/DB-only - no engine.
 #[tauri::command]
 pub async fn auto_bind_all(
     state: State<'_, AppState>,
     game_dir: String,
+    gaps_only: Option<bool>,
 ) -> Result<AutoBindResult, AppError> {
     let conn = state.db.lock().await;
     let project_id: Option<i64> = conn
@@ -357,11 +362,20 @@ pub async fn auto_bind_all(
     let Some(project_id) = project_id else {
         return Ok(AutoBindResult::default());
     };
+    auto_bind_project(&conn, project_id, gaps_only.unwrap_or(false))
+}
+
+/// Project-scoped bulk personal bind. See [`auto_bind_all`].
+pub fn auto_bind_project(
+    conn: &rusqlite::Connection,
+    project_id: i64,
+    gaps_only: bool,
+) -> Result<AutoBindResult, AppError> {
     // Soften cross-identity automatic samples before choosing a bind target.
     // Does not clear existing Ready clones — those stay until the group is rebound.
-    let _ = crate::db::harvest::demote_cross_identity_automatic_samples(&conn, project_id)?;
+    let _ = crate::db::harvest::demote_cross_identity_automatic_samples(conn, project_id)?;
     let mut result = AutoBindResult::default();
-    let display_groups = crate::db::speaker_groups::list_speaker_groups(&conn, project_id)?;
+    let display_groups = crate::db::speaker_groups::list_speaker_groups(conn, project_id)?;
     for group in display_groups {
         if group.excluded {
             result.speakers_skipped += group.variant_count as usize;
@@ -369,12 +383,12 @@ pub async fn auto_bind_all(
         }
         let identity_key = group.identity_key;
         let member_ids = crate::db::speaker_groups::speaker_ids_in_group(
-            &conn,
+            conn,
             project_id,
             &identity_key,
         )?;
         let shares_voice =
-            crate::db::binding_audit::display_group_shares_voice(&conn, project_id, &identity_key)?;
+            crate::db::binding_audit::display_group_shares_voice(conn, project_id, &identity_key)?;
 
         // Non-companion display groups bind per CRE — never fan one clip across
         // crowd-name variants (Boy, Guard, …).
@@ -382,11 +396,12 @@ pub async fn auto_bind_all(
             for member_id in member_ids {
                 let member_key = format!("ungrouped:{member_id}");
                 match auto_bind_one_group(
-                    &conn,
+                    conn,
                     project_id,
                     &member_key,
                     &[member_id],
                     false,
+                    gaps_only,
                 )? {
                     AutoBindOutcome::Bound => result.speakers_bound += 1,
                     AutoBindOutcome::Skipped => result.speakers_skipped += 1,
@@ -398,7 +413,14 @@ pub async fn auto_bind_all(
         }
 
         let member_count = member_ids.len();
-        match auto_bind_one_group(&conn, project_id, &identity_key, &member_ids, true)? {
+        match auto_bind_one_group(
+            conn,
+            project_id,
+            &identity_key,
+            &member_ids,
+            true,
+            gaps_only,
+        )? {
             AutoBindOutcome::Bound => result.speakers_bound += member_count,
             AutoBindOutcome::Skipped => result.speakers_skipped += member_count,
             AutoBindOutcome::Failed => result.speakers_failed += member_count,
@@ -421,10 +443,22 @@ fn auto_bind_one_group(
     identity_key: &str,
     member_ids: &[i64],
     propagate: bool,
+    gaps_only: bool,
 ) -> Result<AutoBindOutcome, AppError> {
     let member_count = member_ids.len();
     if member_count == 0 {
         return Ok(AutoBindOutcome::None);
+    }
+
+    // Gap-fill: leave any ready voice alone (personal, demographic, or follow).
+    if gaps_only {
+        for member_id in member_ids {
+            if let Some(existing) = clone_for_speaker(conn, *member_id)? {
+                if existing.status == CloneStatus::Ready {
+                    return Ok(AutoBindOutcome::Skipped);
+                }
+            }
+        }
     }
 
     // Preserve a deliberate per-speaker override. One override can safely become
@@ -2566,6 +2600,70 @@ mod tests {
         assert!(
             err.contains("reference sample 999999 not found"),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn auto_bind_gaps_only_leaves_demographic_ready_alone() {
+        use crate::audio::wav::build_pcm_wav;
+        use crate::db::generation::{set_clone_status, upsert_clone};
+
+        let dir = tempfile::tempdir().unwrap();
+        let donor_wav = dir.path().join("donor.wav");
+        let personal_wav = dir.path().join("personal.wav");
+        let samples: Vec<i16> = (0..REFERENCE_SAMPLE_RATE).map(|_| 8_000).collect();
+        std::fs::write(&donor_wav, build_pcm_wav(REFERENCE_SAMPLE_RATE, &samples)).unwrap();
+        std::fs::write(&personal_wav, build_pcm_wav(REFERENCE_SAMPLE_RATE, &samples)).unwrap();
+
+        let conn = mem_db();
+        let pid = insert_project(&conn);
+        let donor = insert_speaker(&conn, pid, "donor");
+        let bound = insert_speaker(&conn, pid, "bound");
+        let gap = insert_speaker(&conn, pid, "gap");
+
+        conn.execute(
+            "INSERT INTO reference_sample (speaker_id, decision, local_derivative_path, provenance_json, scores_json) \
+             VALUES (?1, 'approved', ?2, '{}', '{}')",
+            params![donor, donor_wav.to_string_lossy()],
+        )
+        .unwrap();
+        let donor_sample = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO reference_sample (speaker_id, decision, local_derivative_path, provenance_json, scores_json) \
+             VALUES (?1, 'approved', ?2, '{}', '{}')",
+            params![bound, personal_wav.to_string_lossy()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO reference_sample (speaker_id, decision, local_derivative_path, provenance_json, scores_json) \
+             VALUES (?1, 'approved', ?2, '{}', '{}')",
+            params![gap, personal_wav.to_string_lossy()],
+        )
+        .unwrap();
+
+        let donor_clone = upsert_clone(&conn, donor, donor_sample, BindingSource::Default).unwrap();
+        set_clone_status(&conn, donor_clone, CloneStatus::Ready).unwrap();
+        let generic = upsert_clone(&conn, bound, donor_sample, BindingSource::Generic).unwrap();
+        set_clone_status(&conn, generic, CloneStatus::Ready).unwrap();
+
+        let gaps = auto_bind_project(&conn, pid, true).unwrap();
+        assert_eq!(gaps.speakers_bound, 1, "only the unbound gap speaker");
+        assert_eq!(
+            clone_for_speaker(&conn, bound).unwrap().unwrap().binding_source,
+            BindingSource::Generic,
+            "demographic ready must stay"
+        );
+        assert_eq!(
+            clone_for_speaker(&conn, gap).unwrap().unwrap().binding_source,
+            BindingSource::Default
+        );
+
+        let remap = auto_bind_project(&conn, pid, false).unwrap();
+        assert!(remap.speakers_bound >= 1);
+        assert_eq!(
+            clone_for_speaker(&conn, bound).unwrap().unwrap().binding_source,
+            BindingSource::Default,
+            "full remap replaces demographic with personal"
         );
     }
 }

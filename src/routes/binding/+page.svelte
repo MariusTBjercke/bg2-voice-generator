@@ -152,6 +152,8 @@
   let bindWarning = $state<string | null>(null);
   let autoBinding = $state(false);
   let autoBindResult = $state<AutoBindResult | null>(null);
+  let autoBindGapsOnly = $state(false);
+  let autoBindingMode = $state<"gaps" | "all" | null>(null);
   let error = $state<string | null>(null);
   let speakerPage = $state(0);
   // Speakers REBOUND this session: their previously generated clips still carry the
@@ -1668,17 +1670,19 @@
     }
   }
 
-  // Bind (or rebind) a clone for EVERY speaker with an approved clip in one
-  // backend call (set-based; see commands::generate). Speakers already bound
-  // `ready` are skipped. Refresh the clone cache so all badges reflect reality.
-  async function autoBindAll() {
+  // Bulk personal bind. `gapsOnly` fills unbound/pending only; full mode also
+  // replaces demographic defaults when a personal sample exists.
+  async function autoBindAll(gapsOnly: boolean) {
     if (!dir) return;
     autoBinding = true;
+    autoBindingMode = gapsOnly ? "gaps" : "all";
     error = null;
     try {
       autoBindResult = await invoke<AutoBindResult>("auto_bind_all", {
         gameDir: dir,
+        gapsOnly,
       });
+      autoBindGapsOnly = gapsOnly;
       await Promise.all([
         loadClones(),
         loadSpeakersWithLines(),
@@ -1690,6 +1694,7 @@
       error = String(e);
     } finally {
       autoBinding = false;
+      autoBindingMode = null;
     }
   }
 
@@ -2603,21 +2608,26 @@
           <div class="bulk-text">
             <h3>Bulk personal overrides</h3>
             <p class="hint">
-              Replace demographic defaults with each speaker's best approved personal sample.
-              This is optional.
+              Optional. Gap-fill binds only speakers with no ready voice yet.
+              “For all” also replaces demographic defaults when a personal sample exists.
             </p>
             {#if autoBindResult}
               <p class="summary">
-                Bound {autoBindResult.speakers_bound}, skipped
+                {autoBindGapsOnly ? "Gap-fill" : "Remap"}: bound {autoBindResult.speakers_bound}, skipped
                 {autoBindResult.speakers_skipped}{autoBindResult.speakers_failed > 0
                   ? `, failed ${autoBindResult.speakers_failed}`
                   : ""}.
               </p>
             {/if}
           </div>
-          <Button onclick={autoBindAll} disabled={autoBinding || binding}>
-            {autoBinding ? "Applying overrides…" : "Use personal samples for all"}
-          </Button>
+          <div class="reset-actions">
+            <Button variant="ghost" onclick={() => autoBindAll(true)} disabled={autoBinding || binding}>
+              {autoBindingMode === "gaps" ? "Filling gaps…" : "Fill gaps with personal samples"}
+            </Button>
+            <Button onclick={() => autoBindAll(false)} disabled={autoBinding || binding}>
+              {autoBindingMode === "all" ? "Applying overrides…" : "Use personal samples for all"}
+            </Button>
+          </div>
         </div>
       </Card>
       <Card>

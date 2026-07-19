@@ -515,7 +515,9 @@ pub fn clear_speaker_clones(
 }
 
 /// Speakers eligible for demographic defaults: any speaker without an explicit
-/// personal binding. Approved personal samples remain optional until the user
+/// personal binding. Hollow personal binds (no remaining approved harvest samples)
+/// are cleared by [`crate::generator::metadata_binding::clear_stale_personal_bindings`]
+/// before apply. Approved personal samples remain optional until the user
 /// explicitly binds one, while existing generic clones are refreshed on apply.
 pub fn metadata_apply_targets(
     conn: &Connection,
