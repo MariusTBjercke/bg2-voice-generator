@@ -133,14 +133,25 @@ reads from the one before it, so run them in sequence the first time.
    clips whose duration cannot match the TLK transcript are skipped.
    **Re-harvest is additive**: existing samples, approvals, bindings, and voice-profile
    links are kept; only newly discovered sound resrefs are decoded and saved as pending.
-   The speaker list groups variant CREs into **identity groups** (e.g. every
-   `jahei*` form of Jaheira). Pick a group to see candidate samples with quality scores,
-   press ▶ to audition a clip in-app, and **Approve** or **Reject** each one. Use
-   **Auto-approve best for all speakers** (or the per-group **Approve best**) to accept
-   the top-scored pending sample everywhere at once — already-decided groups are left
-   untouched. **Verify speech (optional VAD)** runs a neural voice-activity check over
-   pending samples (engine required). Long lists are paged and filterable; progress/cancel
-   work as on Attribution.
+
+   The speaker list groups CRE variants into **identity / display groups** — usually the
+   same long name and sex (e.g. Jaheira’s `jahei*` forms). That is a **heuristic UI card**,
+   not a guarantee that every CRE under the card truly shares one voice. Verified companions
+   (from `interdia` / `pdialog` / side-chain tables) can share a clone across variants;
+   same-name crowd NPCs are often reviewed together but are not automatically one voice.
+   Harvest also tries to attach each official clip to the right speaker. Game data is messy:
+   the same sound can appear on multiple CREs, or a CRE can carry another character’s VO.
+   Risky clips are marked **manual only** / **shared by N identities** — still review them.
+   Treat odd groupings and wrong-character samples as expected edge cases to fix in Harvest
+   or Binding, not as app bugs.
+
+   Pick a group to see candidate samples with quality scores, press ▶ to audition a clip
+   in-app, and **Approve** or **Reject** each one. Use **Auto-approve best for all speakers**
+   (or the per-group **Approve best**) to accept the top-scored *automatic* pending sample
+   everywhere at once — already-decided groups are left untouched; manual-only clips are
+   skipped unless you use the opt-in gap-fill approve path. **Verify speech (optional VAD)**
+   runs a neural voice-activity check over pending samples (engine required). Long lists are
+   paged and filterable; progress/cancel work as on Attribution.
 
 5. **Bind.** The collapsible **Voice library** holds reusable, project-scoped voice
    profiles. A profile may come from approved harvested game audio, one to four audio
@@ -156,6 +167,17 @@ reads from the one before it, so run them in sequence the first time.
    Export from voicing them (useful for mute companions). If they already have generated
    clips, you are asked whether to delete those too; declining still excludes them from
    packs while keeping the files for a later re-include.
+
+   **Expect manual Harvest/Binding work for a good pack.** Auto-approve, auto-bind, and
+   pool auto-configure speed things up, but they are not a one-click finish. Many
+   demographic buckets have few or no usable harvested clips of their own — fill those
+   pools by borrowing donors from related demographics, importing/designing Voice library
+   profiles, or setting personal binds on characters you care about. Spot-check pools and
+   important NPCs before a large Generate run. If a character was approved with the wrong
+   reference clip, **Reject** that sample, clear or re-bind the personal clone, then
+   regenerate affected lines. The optional Review **Voice bindings** audit (Suspicious list)
+   is built for these wrong-character cases — please use it before filing a bug about
+   “Jaheira’s voice on a random Boy,” and so on.
 
 6. **Generate.** This is the only screen that uses the OmniVoice engine. On a fresh
    install the engine card shows **Install engine** — click it once to provision the local

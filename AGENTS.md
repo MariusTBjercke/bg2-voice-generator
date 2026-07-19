@@ -61,10 +61,16 @@ harvest/bindings/generation). **Harvest** pulls reference clips from uniquely ow
 CRE dialogue, the same companion DLG trees (quality-capped, text/duration gated), CRE
 sound slots, and an Attribution **gap-fill** for speakers with Ready lines but few
 automatic samples (uniquely attributed official VO only); re-running `harvest_references`
-is **additive** (keeps approvals/bindings, inserts only new sound resrefs). **Binding**
-pairs speakers with voices via the Voice library (harvested / imported / designed
-profiles), per-speaker clones, and/or demographic default pools (metadata binding).
-Transfer (`export_profile` / `import_profile`) backs up or restores an entire profile
+is **additive** (keeps approvals/bindings, inserts only new sound resrefs). Cross-identity
+or shared sounds are marked `manual_only` (still reviewable). Display **identity groups**
+bucket same long-name+sex CREs for the UI; only verified companions auto-share clones across
+variants — treat wrong-character samples / awkward crowd cards as expected heuristics to
+fix in Harvest/Binding/Review, not necessarily bugs. **Binding** pairs speakers with voices
+via the Voice library (harvested / imported / designed profiles), per-speaker clones, and/or
+demographic default pools (metadata binding). Auto helpers speed approval and binding, but
+good packs usually need manual pool work: many demographics lack enough harvested clips, so
+pools borrow donors from related buckets or use imported/designed profiles. Transfer
+(`export_profile` / `import_profile`) backs up or restores an entire profile
 folder — database (including synthesis overrides, review markers, binding-audit markers,
 dictionary/tag rules), workspace audio, and agent workspace — for personal machine-move /
 demo use. WeiDU Export packs remain the shareable in-game voice pack.
