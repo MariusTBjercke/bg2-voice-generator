@@ -111,12 +111,14 @@
         workspaces. Keep backups private — they can contain game-derived reference clips.
       </p>
       {#if exporting || (transferBusy && !importing)}
-        <ProgressBar
-          value={transferProgress?.done ?? 0}
-          max={transferProgress?.total ?? null}
-          label="Export profile"
-          message={transferProgress?.message ?? "Writing profile backup…"}
-        />
+        <div class="progress-row">
+          <ProgressBar
+            value={transferProgress?.done ?? 0}
+            max={transferProgress?.total ?? null}
+            label="Export profile"
+            message={transferProgress?.message ?? "Preparing profile backup…"}
+          />
+        </div>
       {/if}
       {#if exportError}
         <ErrorNotice message={exportError} />
@@ -143,12 +145,14 @@
         if this machine uses a different install location.
       </p>
       {#if importing || (transferBusy && !exporting)}
-        <ProgressBar
-          value={transferProgress?.done ?? 0}
-          max={transferProgress?.total ?? null}
-          label="Import profile"
-          message={transferProgress?.message ?? "Importing profile…"}
-        />
+        <div class="progress-row">
+          <ProgressBar
+            value={transferProgress?.done ?? 0}
+            max={transferProgress?.total ?? null}
+            label="Import profile"
+            message={transferProgress?.message ?? "Reading profile backup…"}
+          />
+        </div>
       {/if}
       {#if importError}
         <ErrorNotice message={importError} />
@@ -189,5 +193,11 @@
     align-items: center;
     gap: var(--space-2);
     font-size: 0.9rem;
+  }
+  .progress-row {
+    margin-top: var(--space-3);
+  }
+  .progress-row :global(.progress) {
+    min-width: 0;
   }
 </style>

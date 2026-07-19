@@ -111,6 +111,10 @@ pub async fn delete_profile(
     profile::delete_profile(&state.app_data_dir, &id, &active)
 }
 
+/// Fixed progress units outside the per-file archive / extract loops.
+const TRANSFER_PREP_STEPS: u64 = 1;
+const TRANSFER_FINALIZE_STEPS: u64 = 1;
+
 #[tauri::command]
 pub async fn export_profile(
     app: AppHandle,
@@ -119,12 +123,7 @@ pub async fn export_profile(
     profile_id: Option<String>,
 ) -> Result<ProfileExportResult, AppError> {
     let mut emitter = ProgressEmitter::new(app, OP_TRANSFER);
-    emitter.finish(
-        "running",
-        0,
-        None,
-        Some("Writing profile backup…".to_string()),
-    );
+    emitter.tick(0, None, Some("Preparing profile backup…".to_string()));
 
     let id = profile_id.unwrap_or_else(|| state.active_profile_id());
     let registry = profile::list_profiles(&state.app_data_dir)?;
@@ -142,16 +141,36 @@ pub async fn export_profile(
         drop(conn);
     }
 
+    let file_total = profile_transfer::count_export_files(&dir) as u64;
+    let total = TRANSFER_PREP_STEPS + file_total + TRANSFER_FINALIZE_STEPS;
+    emitter.tick(
+        TRANSFER_PREP_STEPS,
+        Some(total),
+        Some(format!("Archiving… 0 / {file_total} files")),
+    );
+
     let result = profile_transfer::export_profile_dir(
         &dir,
         &info,
         &PathBuf::from(&dest_path),
         env!("CARGO_PKG_VERSION"),
+        Some(&mut |done, file_count, name| {
+            emitter.tick(
+                TRANSFER_PREP_STEPS + done as u64,
+                Some(total),
+                Some(format!("Archiving… {name} ({done}/{file_count})")),
+            );
+        }),
     );
 
     match &result {
-        Ok(_) => emitter.finish("done", 1, None, Some("Profile backup written".to_string())),
-        Err(e) => emitter.finish("error", 0, None, Some(e.to_string())),
+        Ok(r) => emitter.finish(
+            "done",
+            total,
+            Some(total),
+            Some(format!("Profile backup written ({} bytes)", r.bytes)),
+        ),
+        Err(e) => emitter.finish("error", 0, Some(total), Some(e.to_string())),
     }
     result
 }
@@ -165,28 +184,59 @@ pub async fn import_profile(
     switch_to: Option<bool>,
 ) -> Result<ProfileImportResult, AppError> {
     let mut emitter = ProgressEmitter::new(app, OP_TRANSFER);
-    emitter.finish(
-        "running",
-        0,
-        None,
-        Some("Importing profile…".to_string()),
+    let bundle = PathBuf::from(&bundle_path);
+    let do_switch = switch_to.unwrap_or(true);
+
+    emitter.tick(0, None, Some("Reading profile backup…".to_string()));
+
+    let file_total = match profile_transfer::count_import_files(&bundle) {
+        Ok(n) => n as u64,
+        Err(e) => {
+            emitter.finish("error", 0, None, Some(e.to_string()));
+            return Err(e);
+        }
+    };
+    // Prep + extract files (+ optional profile switch). Path rewrite runs inside import.
+    let switch_steps = u64::from(do_switch);
+    let total = TRANSFER_PREP_STEPS + file_total + switch_steps;
+    emitter.tick(
+        TRANSFER_PREP_STEPS,
+        Some(total),
+        Some(format!("Extracting… 0 / {file_total} files")),
     );
 
     match profile_transfer::import_profile_zip(
         &state.app_data_dir,
-        &PathBuf::from(&bundle_path),
+        &bundle,
         name,
+        Some(&mut |done, file_count, entry_name| {
+            emitter.tick(
+                TRANSFER_PREP_STEPS + done as u64,
+                Some(total),
+                Some(format!("Extracting… {entry_name} ({done}/{file_count})")),
+            );
+        }),
     ) {
         Ok((mut imported, _)) => {
-            if switch_to.unwrap_or(true) {
+            if do_switch {
+                emitter.tick(
+                    TRANSFER_PREP_STEPS + file_total,
+                    Some(total),
+                    Some("Switching to imported profile…".to_string()),
+                );
                 switch_profile_inner(&state, &imported.profile.id).await?;
                 imported.switched = true;
             }
-            emitter.finish("done", 1, None, Some("Profile imported".to_string()));
+            emitter.finish(
+                "done",
+                total,
+                Some(total),
+                Some(format!("Profile imported ({})", imported.profile.name)),
+            );
             Ok(imported)
         }
         Err(e) => {
-            emitter.finish("error", 0, None, Some(e.to_string()));
+            emitter.finish("error", 0, Some(total), Some(e.to_string()));
             Err(e)
         }
     }

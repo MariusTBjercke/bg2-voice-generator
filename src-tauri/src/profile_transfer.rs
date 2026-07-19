@@ -66,12 +66,46 @@ pub fn checkpoint_db(conn: &Connection) -> Result<(), AppError> {
     Ok(())
 }
 
+/// True for SQLite WAL/SHM sidecars that must not be archived (DB is checkpointed first).
+fn is_sqlite_sidecar(name: &str) -> bool {
+    name.ends_with("-wal")
+        || name.ends_with("-shm")
+        || name.ends_with(".db-wal")
+        || name.ends_with(".db-shm")
+}
+
+/// Count file entries that [`export_profile_dir`] will archive (excludes dirs + sidecars).
+pub fn count_export_files(profile_dir: &Path) -> usize {
+    walkdir::WalkDir::new(profile_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            if !e.file_type().is_file() {
+                return false;
+            }
+            let path = e.path();
+            let Ok(rel) = path.strip_prefix(profile_dir) else {
+                return false;
+            };
+            if rel.as_os_str().is_empty() {
+                return false;
+            }
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            !is_sqlite_sidecar(name)
+        })
+        .count()
+}
+
 /// Zip the profile directory (db + workspaces + agent-workspace) to `dest_path`.
+///
+/// When `on_progress` is set it is called once per archived **file** as
+/// `(index_1based, file_total, entry_name)`, matching the WeiDU export ZIP ticker.
 pub fn export_profile_dir(
     profile_dir: &Path,
     info: &ProfileInfo,
     dest_path: &Path,
     app_version: &str,
+    mut on_progress: Option<&mut dyn FnMut(usize, usize, &str)>,
 ) -> Result<ProfileExportResult, AppError> {
     if !profile_dir.join(DB_FILE_NAME).is_file() {
         return Err(AppError::Other(format!(
@@ -82,6 +116,7 @@ pub fn export_profile_dir(
     if let Some(parent) = dest_path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let file_total = count_export_files(profile_dir);
     let file = File::create(dest_path)?;
     let mut zip = ZipWriter::new(file);
     let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
@@ -101,7 +136,14 @@ pub fn export_profile_dir(
         .map_err(zip_err)?;
     zip.write_all(&manifest_json)?;
 
-    add_dir_to_zip(&mut zip, profile_dir, Path::new("profile"), opts)?;
+    add_dir_to_zip(
+        &mut zip,
+        profile_dir,
+        Path::new("profile"),
+        opts,
+        file_total,
+        &mut on_progress,
+    )?;
     zip.finish().map_err(zip_err)?;
 
     let bytes = fs::metadata(dest_path)?.len();
@@ -118,7 +160,10 @@ fn add_dir_to_zip(
     src: &Path,
     zip_prefix: &Path,
     opts: SimpleFileOptions,
+    file_total: usize,
+    on_progress: &mut Option<&mut dyn FnMut(usize, usize, &str)>,
 ) -> Result<(), AppError> {
+    let mut file_index = 0usize;
     for entry in walkdir::WalkDir::new(src).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
         let rel = path
@@ -132,7 +177,7 @@ fn add_dir_to_zip(
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("");
-        if name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with(".db-wal") || name.ends_with(".db-shm") {
+        if is_sqlite_sidecar(name) {
             continue;
         }
         let zip_path = zip_prefix.join(rel);
@@ -146,16 +191,42 @@ fn add_dir_to_zip(
             let mut buf = Vec::new();
             f.read_to_end(&mut buf)?;
             zip.write_all(&buf)?;
+            file_index += 1;
+            if let Some(progress) = on_progress.as_mut() {
+                progress(file_index, file_total, &zip_name);
+            }
         }
     }
     Ok(())
 }
 
+/// Count extractable `profile/` file entries in a transfer ZIP (excludes dirs + manifest).
+pub fn count_import_files(bundle_path: &Path) -> Result<usize, AppError> {
+    let file = File::open(bundle_path)?;
+    let mut archive = ZipArchive::new(file).map_err(zip_err)?;
+    let mut count = 0usize;
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i).map_err(zip_err)?;
+        let name = entry.name();
+        if name == MANIFEST_ENTRY || name.ends_with('/') {
+            continue;
+        }
+        if name.strip_prefix("profile/").is_some_and(|rel| !rel.is_empty()) {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 /// Import a profile ZIP into a new profile id under `app_data`.
+///
+/// When `on_progress` is set it is called once per extracted **file** as
+/// `(index_1based, file_total, entry_name)`.
 pub fn import_profile_zip(
     app_data: &Path,
     bundle_path: &Path,
     display_name: Option<String>,
+    mut on_progress: Option<&mut dyn FnMut(usize, usize, &str)>,
 ) -> Result<(ProfileImportResult, ProfileRegistry), AppError> {
     let file = File::open(bundle_path)?;
     let mut archive = ZipArchive::new(file).map_err(zip_err)?;
@@ -205,9 +276,11 @@ pub fn import_profile_zip(
 
     // Re-open archive for extraction (manifest already consumed).
     drop(archive);
+    let file_total = count_import_files(bundle_path)?;
     let file = File::open(bundle_path)?;
     let mut archive = ZipArchive::new(file).map_err(zip_err)?;
 
+    let mut file_index = 0usize;
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(zip_err)?;
         let name = entry.name().to_string();
@@ -226,6 +299,10 @@ pub fn import_profile_zip(
         }
         let mut outfile = File::create(&out)?;
         std::io::copy(&mut entry, &mut outfile)?;
+        file_index += 1;
+        if let Some(progress) = on_progress.as_mut() {
+            progress(file_index, file_total, &name);
+        }
     }
 
     let dest_db = dest.join(DB_FILE_NAME);
@@ -276,15 +353,35 @@ mod tests {
         fs::write(&sample, b"RIFF").unwrap();
 
         let zip_path = tmp.path().join("profile.zip");
+        let mut export_ticks = Vec::new();
         export_profile_dir(
             &resolved.profile_dir,
             &resolved.info,
             &zip_path,
             "0.1.0",
+            Some(&mut |done, total, name| {
+                export_ticks.push((done, total, name.to_string()));
+            }),
         )
         .unwrap();
+        assert!(!export_ticks.is_empty());
+        let (last_done, last_total, _) = export_ticks.last().unwrap();
+        assert_eq!(*last_done, *last_total);
+        assert_eq!(*last_total, count_export_files(&resolved.profile_dir));
 
-        let (result, _) = import_profile_zip(&app, &zip_path, Some("Imported".into())).unwrap();
+        let mut import_ticks = Vec::new();
+        let (result, _) = import_profile_zip(
+            &app,
+            &zip_path,
+            Some("Imported".into()),
+            Some(&mut |done, total, name| {
+                import_ticks.push((done, total, name.to_string()));
+            }),
+        )
+        .unwrap();
+        assert!(!import_ticks.is_empty());
+        let (last_done, last_total, _) = import_ticks.last().unwrap();
+        assert_eq!(*last_done, *last_total);
         assert_eq!(result.profile.id, "2");
         assert_eq!(result.profile.name, "Imported");
         let imported = profile::profile_dir(&app, "2");
