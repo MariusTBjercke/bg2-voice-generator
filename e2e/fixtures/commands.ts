@@ -428,6 +428,11 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
 
     case "get_attribution_counts":
       requireGameDir(args);
+      // Profile-scoped DB: non-default profiles report a distinct speaker count so
+      // E2E can assert the open Attribution screen reloads after a profile switch.
+      if (activeProfile.id !== "1") {
+        return { ...attributionCounts, speakers: 99 };
+      }
       return attributionCounts;
 
     case "list_blocked_lines":

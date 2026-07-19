@@ -19,6 +19,7 @@
   import Button from "$lib/components/Button.svelte";
   import StatusBadge from "$lib/components/StatusBadge.svelte";
   import ErrorNotice from "$lib/components/ErrorNotice.svelte";
+  import WorkflowCallout from "$lib/components/WorkflowCallout.svelte";
   import Pager from "$lib/components/Pager.svelte";
   import SearchFilterBar from "$lib/components/SearchFilterBar.svelte";
   import SearchableSelect from "$lib/components/SearchableSelect.svelte";
@@ -2067,13 +2068,16 @@
 
 <Section
   title="Binding"
-  description="Set demographic defaults first, then optionally give individual speakers their own voice. A demographic-only setup is complete and ready for generation."
+  description="Build reusable voice pools, assign demographic defaults, and optionally give individual speakers a personal voice."
 >
   {#if !dir}
-    <Card>
-      <p class="hint">Choose your game folder on the <a href="/">Setup</a> screen first.</p>
-    </Card>
+    <WorkflowCallout tone="warn" title="Reference voices required" message="Complete Setup, Attribution, and Harvest before assigning voices to speakers." href="/harvest" action="Open Harvest" />
   {:else}
+    <nav class="page-steps" aria-label="Binding sections">
+      <a href="#voice-library-panel"><span>1</span> Voice library</a>
+      <a href="#defaults-heading"><span>2</span> Demographic defaults</a>
+      <a href="#overrides-heading"><span>3</span> Speaker overrides <small>Optional</small></a>
+    </nav>
     <ErrorNotice message={error} />
     {#if bindWarning}
       <p class="bind-warning">{bindWarning}</p>
@@ -3319,6 +3323,20 @@
 </Section>
 
 <style>
+  .page-steps {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    overflow-x: auto;
+    padding: var(--space-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--panel-deep);
+  }
+  .page-steps a { display: inline-flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); color: var(--text-muted); text-decoration: none; white-space: nowrap; }
+  .page-steps a:hover { color: var(--text); background: var(--panel-2); }
+  .page-steps span { display: grid; place-items: center; width: 1.35rem; height: 1.35rem; border: 1px solid var(--accent); border-radius: 50%; color: var(--accent-light); font-size: 0.7rem; }
+  .page-steps small { color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.06em; }
   .hint {
     margin: var(--space-3) 0 0;
     color: var(--text-muted);

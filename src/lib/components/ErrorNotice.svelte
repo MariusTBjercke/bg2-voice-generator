@@ -8,10 +8,11 @@
 
 <style>
   .error-notice {
-    background: var(--panel);
+    background: var(--danger-wash);
     border: 1px solid var(--danger);
     border-radius: var(--radius);
-    padding: var(--space-3) var(--space-4);
-    color: var(--danger);
+    padding: var(--space-4);
+    color: color-mix(in srgb, var(--danger) 82%, white);
+    box-shadow: inset 3px 0 0 var(--danger);
   }
 </style>

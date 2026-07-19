@@ -12,6 +12,7 @@
   import Card from "$lib/components/Card.svelte";
   import Button from "$lib/components/Button.svelte";
   import ErrorNotice from "$lib/components/ErrorNotice.svelte";
+  import WorkflowCallout from "$lib/components/WorkflowCallout.svelte";
   import PlaceholderSettings from "$lib/components/PlaceholderSettings.svelte";
   import type {
     DictionaryPreview,
@@ -329,7 +330,7 @@
 
 <Section
   title="Dictionary"
-  description="Configure generation-only substitutions. Placeholders resolve game tokens; Pronunciation makes difficult spellings easier to say; Tag rules insert OmniVoice non-verbal controls."
+  description="Choose how dynamic game tokens and difficult words should sound without changing the original dialogue text."
 >
   <div class="tabs" role="tablist" aria-label="Dictionary sections">
     <button
@@ -543,29 +544,36 @@
       Tag rules affect generated audio only. Overrides still win for one-off lines.
     </p>
   {/if}
+  <WorkflowCallout title="Dictionary changes are optional" message="The included defaults cover common BG2 tokens and cues. When they look right, scan the installation to attribute each line." href="/attribution" action="Continue to Attribution" />
 </Section>
 
 <style>
   .tabs {
     display: flex;
     gap: 0.25rem;
-    border-bottom: 1px solid var(--border);
-    margin-bottom: 1rem;
+    width: fit-content;
+    max-width: 100%;
+    padding: var(--space-1);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--panel-deep);
+    overflow-x: auto;
   }
   .tabs button {
     background: transparent;
     border: 0;
-    border-bottom: 2px solid transparent;
-    color: var(--muted);
+    border-radius: var(--radius-sm);
+    color: var(--text-muted);
     padding: 0.65rem 0.85rem;
     cursor: pointer;
   }
   .tabs button.active {
-    color: var(--text);
+    color: var(--accent-ink);
     border-color: var(--accent);
+    background: var(--accent);
   }
   .blurb {
-    color: var(--muted);
+    color: var(--text-muted);
     margin-bottom: 1rem;
   }
   .summary {
@@ -581,7 +589,7 @@
   .preview-grid span,
   .muted,
   small {
-    color: var(--muted);
+    color: var(--text-muted);
   }
   .summary strong {
     font-size: 1.7rem;

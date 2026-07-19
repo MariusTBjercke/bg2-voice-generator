@@ -21,9 +21,11 @@
   import StatusBadge from "$lib/components/StatusBadge.svelte";
   import ErrorNotice from "$lib/components/ErrorNotice.svelte";
   import ProgressBar from "$lib/components/ProgressBar.svelte";
+  import WorkflowCallout from "$lib/components/WorkflowCallout.svelte";
   import Pager from "$lib/components/Pager.svelte";
   import SearchFilterBar from "$lib/components/SearchFilterBar.svelte";
   import ExpandableText from "$lib/components/ExpandableText.svelte";
+  import Icon from "$lib/components/Icon.svelte";
   import { filterItems, type FilterConfig, type FilterValues } from "$lib/filters";
   import {
     bestApprovedSampleForBinding,
@@ -659,11 +661,17 @@
 
 <Section
   title="Harvest"
-  description="Decode reference voice clips for attributed characters (unique main dialogue, quality-capped companion/banter VO, sound slots, and Attribution gap-fill for thin speakers), then audition and approve the best samples. Re-harvest adds newly found clips only and keeps existing approvals and bindings. Approved samples become the input for voice binding."
+  description="Collect official reference clips for attributed characters, audition the results, and approve the best voice samples."
 >
   <Card>
-    <div class="harvest-settings">
-      <div class="harvest-field">
+    <details class="harvest-advanced">
+      <summary>
+        <Icon name="settings" size={16} />
+        <span>Performance settings</span>
+        <Icon name="chevron-down" size={15} />
+      </summary>
+      <div class="harvest-settings">
+        <div class="harvest-field">
         <label
           for="harvest-parallelism"
           title="How many reference clips decode at once (one ffmpeg process per worker). Auto uses up to {AUTO_MAX_HARVEST_PARALLELISM} workers, or fewer on low-core CPUs. On fast storage and many cores, try 12–16; lower the value if the disk fans spin up or harvest slows down."
@@ -679,16 +687,17 @@
           placeholder="Auto"
           bind:value={harvestParallelism}
         />
+        </div>
+        <Button variant="ghost" onclick={saveHarvestSettings} disabled={savingSettings}>
+          {savingSettings ? "Saving…" : "Save"}
+        </Button>
+        <p class="harvest-hint">
+          Leave blank for Auto (up to {AUTO_MAX_HARVEST_PARALLELISM} concurrent ffmpeg
+          decodes). Set 1–{MAX_HARVEST_PARALLELISM} to override — save before harvesting.
+        </p>
       </div>
-      <Button variant="ghost" onclick={saveHarvestSettings} disabled={savingSettings}>
-        {savingSettings ? "Saving…" : "Save"}
-      </Button>
-      <p class="harvest-hint">
-        Leave blank for Auto (up to {AUTO_MAX_HARVEST_PARALLELISM} concurrent ffmpeg
-        decodes). Set 1–{MAX_HARVEST_PARALLELISM} to override — save before harvesting.
-      </p>
-    </div>
-    <ErrorNotice message={settingsError} />
+      <ErrorNotice message={settingsError} />
+    </details>
 
     <div class="row">
       <Button onclick={runHarvest} disabled={harvesting || !!harvestProgress || !dir}>
@@ -724,9 +733,15 @@
             ? "Auto-approve remaining (automatic)"
             : "Auto-approve best for all characters"}
       </Button>
-      <Button
-        variant="ghost"
-        onclick={resetAll}
+      <details class="maintenance-actions">
+        <summary>
+          <span>Advanced actions</span>
+          <Icon name="chevron-down" size={15} />
+        </summary>
+        <div class="maintenance-menu">
+          <Button
+            variant="danger"
+            onclick={resetAll}
         disabled={harvesting ||
           !!harvestProgress ||
           autoApproving ||
@@ -735,10 +750,10 @@
           groups.length === 0}
       >
         {resetting ? "Resetting…" : "Reset all decisions"}
-      </Button>
-      <Button
-        variant="ghost"
-        onclick={fillManualGaps}
+          </Button>
+          <Button
+            variant="ghost"
+            onclick={fillManualGaps}
         disabled={harvesting ||
           !!harvestProgress ||
           autoApproving ||
@@ -748,10 +763,10 @@
         title="Always gap-only: approve a pending manual-only clip for exact CRE variants with no approved sample and no qualifying automatic candidate. Does not overwrite existing approvals."
       >
         {autoApproving && approvalMode === "manual" ? "Filling gaps…" : "Fill gaps with manual-only"}
-      </Button>
-      <Button
-        variant="ghost"
-        onclick={verifySpeech}
+          </Button>
+          <Button
+            variant="ghost"
+            onclick={verifySpeech}
         disabled={harvesting ||
           !!harvestProgress ||
           verifying ||
@@ -763,7 +778,9 @@
         title="Optional: re-check surviving clips with neural VAD when audio may not match the transcript (e.g. mostly silence). Grunts are filtered by TLK text at harvest. Re-run auto-approve afterwards."
       >
         {verifying || verifyProgress ? "Verifying…" : "Verify speech (optional VAD)"}
-      </Button>
+          </Button>
+        </div>
+      </details>
       {#if harvesting || harvestProgress}
         <StatusBadge tone="info">Harvesting… this can take a while</StatusBadge>
       {:else if !dir}
@@ -817,10 +834,11 @@
           : ""}). Re-run auto-approve to re-rank with the verified scores.
       </p>
     {/if}
-    {#if !dir}
-      <p class="hint">Choose your game folder on the <a href="/">Setup</a> screen first.</p>
-    {/if}
   </Card>
+
+  {#if !dir}
+    <WorkflowCallout tone="warn" title="Attribution comes first" message="Choose an installation and scan its dialogue before harvesting reference voices." href="/attribution" action="Open Attribution" />
+  {/if}
 
   <ErrorNotice message={error} />
 
@@ -990,7 +1008,7 @@
                           aria-label={`${expanded ? "Collapse" : "Expand"} variants for ${group.soundResref}`}
                           onclick={() => toggleSoundExpand(group.soundResref)}
                         >
-                          {expanded ? "▾" : "▸"}
+                          <Icon name={expanded ? "chevron-down" : "chevron-right"} size={17} />
                         </button>
                       {/if}
                     </div>
@@ -1140,6 +1158,55 @@
     align-items: center;
     gap: var(--space-3);
     flex-wrap: wrap;
+  }
+  .harvest-advanced { margin-bottom: var(--space-4); }
+  .harvest-advanced > summary,
+  .maintenance-actions > summary {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--control-icon-gap);
+    width: fit-content;
+    min-height: var(--control-height);
+    list-style: none;
+    cursor: pointer;
+    color: var(--text-muted);
+    font-size: var(--control-font-size);
+    font-weight: var(--control-font-weight);
+  }
+  .harvest-advanced > summary::-webkit-details-marker,
+  .maintenance-actions > summary::-webkit-details-marker { display: none; }
+  .harvest-advanced > summary :global(svg:first-child) { color: var(--accent); }
+  .harvest-advanced > summary :global(svg:last-child),
+  .maintenance-actions > summary :global(svg:last-child) { transition: transform 0.15s ease; }
+  .harvest-advanced[open] > summary :global(svg:last-child),
+  .maintenance-actions[open] > summary :global(svg:last-child) { transform: rotate(180deg); }
+  .harvest-advanced[open] > summary,
+  .maintenance-actions[open] > summary { color: var(--accent-light); }
+  .harvest-advanced .harvest-settings { margin-top: var(--space-3); }
+  .maintenance-actions { position: relative; }
+  .maintenance-actions > summary {
+    padding: 0 var(--space-4);
+    border: 1px solid var(--border);
+    border-radius: var(--control-radius);
+    background: var(--panel-2);
+    color: var(--text);
+  }
+  .maintenance-menu {
+    position: absolute;
+    top: calc(100% + var(--space-2));
+    right: 0;
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-2);
+    width: max-content;
+    max-width: min(25rem, 80vw);
+    padding: var(--space-3);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    background: var(--panel-raised);
+    box-shadow: var(--shadow-lg);
   }
   .check {
     display: inline-flex;
@@ -1310,14 +1377,18 @@
     flex-wrap: wrap;
   }
   .expand {
-    flex-shrink: 0;
-    font: inherit;
+    display: grid;
+    place-items: center;
+    flex: 0 0 2rem;
+    width: 2rem;
+    height: 2rem;
     background: transparent;
     border: none;
     color: var(--text-muted);
     cursor: pointer;
-    padding: 0 var(--space-1);
+    padding: 0;
   }
+  .expand:hover { color: var(--text); background: var(--panel-2); }
   .sound-variants {
     list-style: none;
     margin: var(--space-2) 0 0;

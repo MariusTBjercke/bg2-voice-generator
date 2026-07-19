@@ -25,6 +25,8 @@
     flex-direction: column;
     gap: var(--space-1);
     min-width: 0;
+    max-width: 100%;
+    width: 100%;
   }
   .name {
     font-weight: 500;

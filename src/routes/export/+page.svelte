@@ -10,6 +10,7 @@
   import StatusBadge from "$lib/components/StatusBadge.svelte";
   import ErrorNotice from "$lib/components/ErrorNotice.svelte";
   import ProgressBar from "$lib/components/ProgressBar.svelte";
+  import WorkflowCallout from "$lib/components/WorkflowCallout.svelte";
   import { progress } from "$lib/stores/progress";
   import { generationFocusHref } from "$lib/navigation/generationDeepLink";
   import type { CompletedGeneration, ExportResult } from "$lib/types";
@@ -110,12 +111,10 @@
 
 <Section
   title="Export"
-  description="Bundle your completed generations into a native WeiDU voice pack (a self-contained ZIP you can install over the game). No engine needed."
+  description="Package completed dialogue into a native, self-contained WeiDU voice pack ready to install over the game."
 >
   {#if !dir}
-    <Card>
-      <p class="hint">Choose your game folder on the <a href="/">Setup</a> screen first.</p>
-    </Card>
+    <WorkflowCallout tone="warn" title="Nothing to export yet" message="Connect a game installation and generate dialogue before building a voice pack." href="/generation" action="Open Generation" />
   {:else}
     <Card>
       <div class="build-row">
@@ -143,13 +142,14 @@
           />
         </div>
       {/if}
-      <p class="hint">
-        Exports every line whose audio is generated; lines that can't be safely patched
-        (script tokens, transitions, already-voiced, shared-text conflicts, missing clips)
-        are deferred and reported below. Spoken placeholder stand-ins are used only in the
-        generated audio: the installed pack preserves the original dialogue text and tokens.
-        Running with nothing to export is not harmful.
-      </p>
+      <details class="export-help">
+        <summary>What gets included?</summary>
+        <p class="hint">
+          Every safely patchable generated line is included. Script tokens, transitions,
+          already-voiced lines, shared-text conflicts, and missing clips are deferred and
+          reported below. The installed pack always preserves the original dialogue text.
+        </p>
+      </details>
       {#if voiceChangedCount > 0}
         <div class="warn-box" role="status">
           {voiceChangedCount} generated clip{voiceChangedCount === 1 ? " uses" : "s use"} an earlier
@@ -214,6 +214,9 @@
 </Section>
 
 <style>
+  .export-help { margin-top: var(--space-4); padding-top: var(--space-3); border-top: 1px solid var(--border); }
+  .export-help summary { width: fit-content; cursor: pointer; color: var(--text-muted); font-size: 0.86rem; }
+  .export-help[open] summary { color: var(--accent-light); }
   h3 {
     margin: 0;
     font-size: 1rem;

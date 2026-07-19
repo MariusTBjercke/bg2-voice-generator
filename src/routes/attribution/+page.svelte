@@ -18,6 +18,7 @@
   import Pager from "$lib/components/Pager.svelte";
   import SearchFilterBar from "$lib/components/SearchFilterBar.svelte";
   import ExpandableText from "$lib/components/ExpandableText.svelte";
+  import WorkflowCallout from "$lib/components/WorkflowCallout.svelte";
   import { type FilterConfig, type FilterValues } from "$lib/filters";
   import { progress } from "$lib/stores/progress";
   import {
@@ -248,6 +249,9 @@
       error = "Choose a game folder on the Setup screen first.";
       return;
     }
+    if (wipeDownstream && !confirm("Re-scan and clear harvest approvals, voice bindings, demographic pools, and generation state? Exported packs and audio files stay on disk.")) {
+      return;
+    }
     scanning = true;
     cancelling = false;
     error = null;
@@ -285,7 +289,7 @@
 
 <Section
   title="Attribution"
-  description="Scan the install to attribute speakers to dialogue lines, then review the lines that were blocked."
+  description="Match dialogue lines to their speakers, then review anything that could not be prepared safely."
 >
   <Card>
     <div class="row">
@@ -309,10 +313,18 @@
         </span>
       {/if}
     </div>
-    <label class="wipe-option">
-      <input type="checkbox" bind:checked={wipeDownstream} disabled={scanBusy} />
-      Wipe harvest, bindings, and generation state on re-scan
-    </label>
+    {#if scanned}
+      <details class="advanced-scan">
+        <summary>Advanced re-scan options</summary>
+        <label class="wipe-option">
+          <input type="checkbox" bind:checked={wipeDownstream} disabled={scanBusy} />
+          <span>
+            <strong>Start downstream stages over</strong>
+            <small>Clears harvest approvals, bindings, demographic pools, and generation state after confirmation.</small>
+          </span>
+        </label>
+      </details>
+    {/if}
     {#if scanProgress}
       <div class="progress-row">
         <ProgressBar
@@ -326,10 +338,11 @@
         </Button>
       </div>
     {/if}
-    {#if !$project.gameDir}
-      <p class="hint">Choose your game folder on the <a href="/">Setup</a> screen first.</p>
-    {/if}
   </Card>
+
+  {#if !$project.gameDir}
+    <WorkflowCallout tone="warn" title="Game installation required" message="Choose the BG2EE installation this profile should scan before running Attribution." href="/" action="Open Setup" />
+  {/if}
 
   <ErrorNotice message={error} />
 
@@ -420,7 +433,7 @@
       {/if}
     </Card>
   {:else if !scanning}
-    <Card><p class="hint">Not scanned yet. Run a scan to see attribution results.</p></Card>
+    <WorkflowCallout title="Ready for the first scan" message="Run Attribution above to discover speakers, generatable lines, and anything requiring attention." />
   {/if}
 </Section>
 
@@ -445,10 +458,16 @@
     display: flex;
     align-items: center;
     gap: var(--space-2);
-    margin-top: var(--space-2);
+    margin-top: var(--space-3);
     font-size: 0.9rem;
     color: var(--text-muted);
   }
+  .wipe-option span { display: flex; flex-direction: column; gap: var(--space-1); }
+  .wipe-option strong { color: var(--text); font-weight: 600; }
+  .wipe-option small { color: var(--text-faint); }
+  .advanced-scan { margin-top: var(--space-4); padding-top: var(--space-3); border-top: 1px solid var(--border); }
+  .advanced-scan summary { width: fit-content; cursor: pointer; color: var(--text-muted); font-size: 0.84rem; }
+  .advanced-scan[open] summary { color: var(--accent-light); }
   .progress-row {
     display: flex;
     align-items: flex-end;

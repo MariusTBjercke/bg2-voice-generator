@@ -10,7 +10,7 @@
   let { tone = "neutral", title, children }: Props = $props();
 </script>
 
-<span class="badge {tone}" {title}>{@render children()}</span>
+<span class="badge {tone}" {title}><span class="dot" aria-hidden="true"></span>{@render children()}</span>
 
 <style>
   .badge {
@@ -23,6 +23,15 @@
     border: 1px solid var(--border);
     border-radius: 999px;
     color: var(--text-muted);
+    background: rgba(255, 255, 255, 0.015);
+    white-space: nowrap;
+  }
+  .dot {
+    width: 0.38rem;
+    height: 0.38rem;
+    border-radius: 50%;
+    background: currentColor;
+    box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 16%, transparent);
   }
   .success {
     color: var(--success);

@@ -1,15 +1,14 @@
 <script lang="ts">
   import { open, save } from "@tauri-apps/plugin-dialog";
   import { invoke } from "$lib/utils/invoke";
-  import { project } from "$lib/stores/project";
-  import { ensureGameDir } from "$lib/stores/results";
-  import { profiles, refreshProfiles } from "$lib/stores/profiles";
+  import { profiles, adoptActiveProfile } from "$lib/stores/profiles";
   import Section from "$lib/components/Section.svelte";
   import Card from "$lib/components/Card.svelte";
   import Button from "$lib/components/Button.svelte";
   import StatusBadge from "$lib/components/StatusBadge.svelte";
   import ErrorNotice from "$lib/components/ErrorNotice.svelte";
   import ProgressBar from "$lib/components/ProgressBar.svelte";
+  import WorkflowCallout from "$lib/components/WorkflowCallout.svelte";
   import { progress } from "$lib/stores/progress";
   import type { ProfileExportResult, ProfileImportResult } from "$lib/types";
 
@@ -83,17 +82,7 @@
         switchTo: true,
       });
       // Import already switched AppState; refresh UI + drop caches for the new profile.
-      ensureGameDir(null);
-      project.set({ gameDir: null, locale: null });
-      await refreshProfiles();
-      try {
-        const gameDir =
-          (await invoke<string | null>("get_setting", { key: "game_dir" })) ?? null;
-        project.update((p) => ({ ...p, gameDir }));
-        if (gameDir) ensureGameDir(gameDir);
-      } catch {
-        // Setup surfaces errors
-      }
+      await adoptActiveProfile();
     } catch (e) {
       importError = String(e);
     } finally {
@@ -104,13 +93,12 @@
 
 <Section
   title="Transfer"
-  description="Back up or restore a full profile (database, harvested references, generated audio, and agent workspace). Use this to move your work between machines or keep a demo sandbox. WeiDU packs on the Export screen remain the way to share a voice pack for the game."
+  description="Back up or restore a complete working profile when moving between machines or preparing a private demo environment."
 >
   {#if !active}
-    <Card>
-      <p class="hint">No active profile yet — it is created automatically on first launch.</p>
-    </Card>
+    <WorkflowCallout tone="warn" title="No active profile" message="A default profile is normally created automatically. Return to Setup to initialize the workspace." href="/" action="Open Setup" />
   {:else}
+    <WorkflowCallout tone="warn" title="Keep profile backups private" message="Transfer archives can contain game-derived reference clips. Use Export when you want a shareable WeiDU voice pack." href="/export" action="Open Export" />
     <Card>
       <div class="panel-head">
         <h3>Export profile</h3>

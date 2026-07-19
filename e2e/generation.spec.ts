@@ -176,6 +176,7 @@ test.describe("Generation screen", () => {
       localStorage.setItem("e2e.voice-changed-generation-ids", JSON.stringify(staleIds));
     }, { completedIds, staleIds });
     await page.getByRole("button", { name: "Refresh" }).click();
+    await page.getByText("More batch actions", { exact: true }).click();
 
     await expect(page.getByText("voice changed", { exact: true })).toHaveCount(2);
     await expect(page.getByRole("button", { name: "Re-generate voice-changed (2)" })).toBeDisabled();
@@ -205,6 +206,7 @@ test.describe("Generation screen", () => {
     const banner = page.getByRole("status").filter({ hasText: "blocked or skipped" });
     await expect(banner).toContainText("1 generated clip is on blocked or skipped lines");
     await banner.getByRole("button", { name: "Show them" }).click();
+    await page.getByText("More batch actions", { exact: true }).click();
 
     await expect(page.getByRole("heading", { name: /Generatable lines \(1 of 105\)/ })).toBeVisible();
     const row = page.locator(".line").filter({ hasText: "#99448" });

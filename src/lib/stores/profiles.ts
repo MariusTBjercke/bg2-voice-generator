@@ -6,6 +6,7 @@ import { invoke } from "$lib/utils/invoke";
 import type { ProfileInfo, ProfileRegistry } from "$lib/types";
 import { project } from "$lib/stores/project";
 import { ensureGameDir } from "$lib/stores/results";
+import { resetSpeakerGroups } from "$lib/stores/speakerGroups";
 
 export interface ProfilesState {
   active: ProfileInfo | null;
@@ -20,6 +21,19 @@ export const profiles = writable<ProfilesState>({
   loading: false,
   error: null,
 });
+
+/** Bumped on profile switch/import so the shell remounts the active route. */
+export const profileGeneration = writable(0);
+
+function bumpProfileGeneration(): void {
+  profileGeneration.update((n) => n + 1);
+}
+
+function clearProfileCaches(): void {
+  ensureGameDir(null);
+  resetSpeakerGroups();
+  project.set({ gameDir: null, locale: null });
+}
 
 export async function refreshProfiles(): Promise<void> {
   profiles.update((p) => ({ ...p, loading: true, error: null }));
@@ -39,15 +53,8 @@ export async function refreshProfiles(): Promise<void> {
   }
 }
 
-/** Switch profile, clear result caches, and re-hydrate game_dir from the new DB. */
-export async function switchToProfile(id: string): Promise<void> {
-  const current = get(profiles).active?.id;
-  if (current === id) return;
-  await invoke<ProfileInfo>("switch_profile", { id });
-  // Drop UI caches keyed by the previous install/profile.
-  ensureGameDir(null);
-  project.set({ gameDir: null, locale: null });
-  await refreshProfiles();
+/** Re-hydrate `game_dir` from the active profile DB into the project store. */
+async function hydrateGameDir(): Promise<void> {
   try {
     const gameDir = (await invoke<string | null>("get_setting", { key: "game_dir" })) ?? null;
     project.update((p) => ({ ...p, gameDir }));
@@ -55,6 +62,25 @@ export async function switchToProfile(id: string): Promise<void> {
   } catch {
     // Setup will surface errors
   }
+}
+
+/** Switch profile, clear result caches, and re-hydrate game_dir from the new DB. */
+export async function switchToProfile(id: string): Promise<void> {
+  const current = get(profiles).active?.id;
+  if (current === id) return;
+  await invoke<ProfileInfo>("switch_profile", { id });
+  clearProfileCaches();
+  await refreshProfiles();
+  bumpProfileGeneration();
+  await hydrateGameDir();
+}
+
+/** After import (or any out-of-band active-profile change): drop caches and remount routes. */
+export async function adoptActiveProfile(): Promise<void> {
+  clearProfileCaches();
+  await refreshProfiles();
+  bumpProfileGeneration();
+  await hydrateGameDir();
 }
 
 export async function createProfile(name?: string): Promise<ProfileInfo> {

@@ -36,6 +36,22 @@ test.describe("Attribution screen", () => {
     );
   });
 
+  test("reloads attribution counts when the active profile changes", async ({ page }) => {
+    const speakers = page
+      .locator(".stat")
+      .filter({ has: page.getByText("Speakers", { exact: true }) })
+      .locator(".value");
+    await expect(speakers).toHaveText(String(attributionCounts.speakers));
+
+    const trigger = page.getByRole("button", { name: "Active profile" });
+    await trigger.click();
+    await page.getByRole("listbox", { name: "Profiles" }).getByRole("option", { name: "Campaign archive 03" }).click();
+    await expect(trigger).toContainText("Campaign archive 03");
+
+    // Same install path as Default — must remount/reload without leaving Attribution.
+    await expect(speakers).toHaveText("99");
+  });
+
   test("lists blocked lines with derived reasons", async ({ page }) => {
     await expect(
       page.getByRole("heading", { name: `Blocked lines (${blockedLines.length})` }),
@@ -52,5 +68,16 @@ test.describe("Attribution screen", () => {
     await reasonSelect.selectOption("already voiced");
     await expect(page.getByRole("cell", { name: "44001" })).toBeVisible();
     await expect(page.getByRole("cell", { name: "44002" })).not.toBeVisible();
+  });
+
+  test("keeps downstream reset advanced and requires confirmation", async ({ page }) => {
+    await page.getByText("Advanced re-scan options", { exact: true }).click();
+    await page.getByLabel(/Start downstream stages over/).check();
+    page.once("dialog", async (dialog) => {
+      expect(dialog.message()).toContain("clear harvest approvals");
+      await dialog.dismiss();
+    });
+    await page.getByRole("button", { name: "Re-scan attribution" }).click();
+    await expect(page.getByRole("button", { name: "Re-scan attribution" })).toBeEnabled();
   });
 });

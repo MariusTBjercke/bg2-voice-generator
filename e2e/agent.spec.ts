@@ -38,9 +38,9 @@ test("shows synthesis progress and launches agents", async ({ page }) => {
 test("restores cached review summaries and rows during delayed revisit reconciliation", async ({ page }) => {
   await page.goto("/agent");
   await expect(page.getByText("*hic* Excuse me.")).toBeVisible();
-  await page.getByRole("navigation").getByRole("link", { name: "Binding" }).click();
+  await page.getByRole("navigation", { name: "Workflow" }).getByRole("link", { name: "Binding" }).click();
   await page.evaluate(() => localStorage.setItem("e2e.delay-review-ms", "1200"));
-  await page.getByRole("navigation").getByRole("link", { name: "Review" }).click();
+  await page.getByRole("navigation", { name: "Workflow" }).getByRole("link", { name: "Review" }).click();
 
   await expect(page.getByText("*hic* Excuse me.")).toBeVisible({ timeout: 300 });
   await expect(page.getByText("120", { exact: true })).toBeVisible();

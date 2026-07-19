@@ -9,6 +9,7 @@
   import Button from "$lib/components/Button.svelte";
   import StatusBadge from "$lib/components/StatusBadge.svelte";
   import ErrorNotice from "$lib/components/ErrorNotice.svelte";
+  import WorkflowCallout from "$lib/components/WorkflowCallout.svelte";
   import type { GameLanguages } from "$lib/types";
 
   // Install setup: pick the game folder, persist it as the `game_dir` setting,
@@ -95,9 +96,15 @@
 
 <Section
   title="Setup"
-  description="Choose your Baldur's Gate II: Enhanced Edition install folder for the active profile. Use the Profile control in the header to create a demo sandbox without losing your main work."
+  description="Connect this profile to a Baldur's Gate II: Enhanced Edition install and choose the dialogue language to process."
 >
   <Card>
+    <div class="card-heading">
+      <div>
+        <h3>Game installation</h3>
+        <p class="subtle">Each profile can use its own install, language, and generated voice pack.</p>
+      </div>
+    </div>
     <div class="row">
       <Button onclick={chooseFolder}>Choose game folder…</Button>
       {#if gameDir}
@@ -119,7 +126,7 @@
     <Card><p>Reading install languages…</p></Card>
   {:else if languages}
     <Card>
-      <h3>Language</h3>
+      <h3>Dialogue language</h3>
       {#if languages.locales.length === 0}
         <p class="hint">
           No languages found under this folder's <code>lang/</code> directory. Is this a
@@ -137,6 +144,21 @@
       {/if}
     </Card>
   {/if}
+
+  {#if gameDir && locale}
+    <WorkflowCallout
+      tone="success"
+      title="Installation ready"
+      message="Your profile is connected. Configure spoken substitutions next, or move directly to Attribution if the defaults suit you."
+      href="/dictionary"
+      action="Continue to Dictionary"
+    />
+  {:else if !gameDir && !loading}
+    <WorkflowCallout
+      title="Start with your game folder"
+      message="Select the folder containing the game executable and lang directory. The app reads the current modded state without altering it."
+    />
+  {/if}
 </Section>
 
 <style>
@@ -146,6 +168,9 @@
     gap: var(--space-3);
     flex-wrap: wrap;
   }
+  .card-heading { display: flex; justify-content: space-between; gap: var(--space-4); margin-bottom: var(--space-4); }
+  .card-heading h3 { margin-bottom: var(--space-1); }
+  .subtle { margin: 0; color: var(--text-muted); font-size: 0.86rem; }
   .path {
     margin: var(--space-3) 0 0;
     font-family: ui-monospace, "Cascadia Code", monospace;

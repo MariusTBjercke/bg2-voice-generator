@@ -70,6 +70,11 @@ export const profileRegistry = {
   active_id: "1",
   profiles: [
     { id: "1", name: "Default", created_at: "0" },
+    ...Array.from({ length: 24 }, (_, index) => ({
+      id: String(index + 2),
+      name: `Campaign archive ${String(index + 1).padStart(2, "0")}`,
+      created_at: "0",
+    })),
   ],
 };
 

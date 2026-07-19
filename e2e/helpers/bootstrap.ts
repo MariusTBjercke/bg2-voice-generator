@@ -12,7 +12,7 @@ export async function bootstrapProject(page: Page): Promise<void> {
 
 /** Navigate via the pipeline nav after bootstrap. */
 export async function goTo(page: Page, label: string): Promise<void> {
-  await page.getByRole("navigation").getByRole("link", { name: label }).click();
+  await page.getByRole("navigation", { name: "Workflow" }).getByRole("link", { name: label }).click();
 }
 
 export const pipelineScreens = [
@@ -22,6 +22,7 @@ export const pipelineScreens = [
   { label: "Harvest", title: "Harvest" },
   { label: "Binding", title: "Binding" },
   { label: "Generation", title: "Generation" },
+  { label: "Review", title: "Dialogue Review" },
   { label: "Export", title: "Export" },
   { label: "Transfer", title: "Transfer" },
 ] as const;

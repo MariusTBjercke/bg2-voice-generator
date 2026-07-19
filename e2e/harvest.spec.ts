@@ -16,6 +16,7 @@ test.describe("Harvest manual-only fallback", () => {
   });
 
   test("fills uncovered exact-character voices without changing the safe action", async ({ page }) => {
+    await page.getByText("Advanced actions", { exact: true }).click();
     const fallback = page.getByRole("button", { name: "Fill gaps with manual-only" });
     await expect(fallback).toBeVisible();
     await expect(page.getByLabel("Only characters with no approved samples")).toBeChecked();
@@ -43,5 +44,40 @@ test.describe("Harvest manual-only fallback", () => {
       "/binding?identity=22570%3A1",
     );
     await expect(page).toHaveURL(/\/harvest$/);
+  });
+
+  test("aligns character filters and rows without horizontal overflow", async ({ page }) => {
+    await page.setViewportSize({ width: 960, height: 700 });
+    const filter = page.locator(".bar.compact");
+    const row = page.locator(".group-row").first();
+    const [filterBox, rowBox] = await Promise.all([filter.boundingBox(), row.boundingBox()]);
+    expect(filterBox).not.toBeNull();
+    expect(rowBox).not.toBeNull();
+    expect(Math.abs(filterBox!.x - rowBox!.x)).toBeLessThanOrEqual(1);
+    expect(Math.abs(filterBox!.width - rowBox!.width)).toBeLessThanOrEqual(1);
+
+    const viewport = await page.evaluate(() => ({
+      innerWidth: window.innerWidth,
+      scrollWidth: document.documentElement.scrollWidth,
+    }));
+    expect(viewport.scrollWidth).toBeLessThanOrEqual(viewport.innerWidth);
+  });
+
+  test("uses matching geometry for adjacent Harvest actions", async ({ page }) => {
+    const harvest = page.getByRole("button", { name: "Harvest references" });
+    const autoApprove = page.getByRole("button", { name: "Auto-approve remaining (automatic)" });
+    const advanced = page.getByText("Advanced actions", { exact: true }).locator("..");
+    const styles = await Promise.all(
+      [harvest, autoApprove, advanced].map((locator) =>
+        locator.evaluate((element) => {
+          const style = getComputedStyle(element);
+          return { height: element.getBoundingClientRect().height, fontSize: style.fontSize };
+        }),
+      ),
+    );
+    expect(styles[0].height).toBe(styles[1].height);
+    expect(styles[1].height).toBe(styles[2].height);
+    expect(styles[0].fontSize).toBe(styles[1].fontSize);
+    expect(styles[1].fontSize).toBe(styles[2].fontSize);
   });
 });

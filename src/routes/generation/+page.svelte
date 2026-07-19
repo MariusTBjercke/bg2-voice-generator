@@ -9,6 +9,7 @@
   import StatusBadge from "$lib/components/StatusBadge.svelte";
   import ErrorNotice from "$lib/components/ErrorNotice.svelte";
   import ProgressBar from "$lib/components/ProgressBar.svelte";
+  import WorkflowCallout from "$lib/components/WorkflowCallout.svelte";
   import Pager from "$lib/components/Pager.svelte";
   import SearchableMultiSelect from "$lib/components/SearchableMultiSelect.svelte";
   import SynthesisTextEditor from "$lib/components/SynthesisTextEditor.svelte";
@@ -1187,7 +1188,7 @@
 
 <Section
   title="Generation"
-  description="Start the OmniVoice engine, then synthesize audio for lines whose speaker has a bound clone. Live generation needs the local engine, its model, and (ideally) a GPU."
+  description="Start the local OmniVoice engine, choose the dialogue you want to process, and synthesize lines with ready voice bindings."
 >
   <Card>
     <div class="engine">
@@ -1291,9 +1292,7 @@
   </Card>
 
   {#if !dir}
-    <Card>
-      <p class="hint">Choose your game folder on the <a href="/">Setup</a> screen first.</p>
-    </Card>
+    <WorkflowCallout tone="warn" title="Voice bindings required" message="Connect and scan an installation, approve reference samples, and bind voices before generating dialogue." href="/binding" action="Open Binding" />
   {:else}
     <Card>
       <div class="lines-head">
@@ -1319,41 +1318,16 @@
             Generate missing ({missingLines.length})
           {/if}
         </Button>
-        <Button
-          variant="ghost"
-          onclick={() => generateAll("text_changed")}
-          disabled={!criticalReady || !canGenerate || genBusy || removing || textChangedReadyLines.length === 0}
-        >
-          Re-generate text-changed ({textChangedReadyLines.length})
-        </Button>
-        <Button
-          variant="ghost"
-          onclick={() => generateAll("voice_changed")}
-          disabled={!criticalReady || !canGenerate || genBusy || removing || voiceChangedReadyLines.length === 0}
-        >
-          Re-generate voice-changed ({voiceChangedReadyLines.length})
-        </Button>
-        <Button
-          variant="ghost"
-          onclick={() => generateAll("changed")}
-          disabled={!criticalReady || !canGenerate || genBusy || removing || changedReadyLines.length === 0}
-        >
-          Re-generate all changed ({changedReadyLines.length})
-        </Button>
-        <Button
-          variant="ghost"
-          onclick={() => generateAll("all")}
-          disabled={!criticalReady || !canGenerate || genBusy || removing || readyFilteredLines.length === 0}
-        >
-          Re-generate all ({readyFilteredLines.length})
-        </Button>
-        <Button
-          variant="ghost"
-          onclick={() => removeGenerated(savedFilteredLines.map((line) => line.id))}
-          disabled={!criticalReady || genBusy || removing || savedFilteredLines.length === 0}
-        >
-          {removing ? "Removing…" : `Remove filtered generated (${savedFilteredLines.length})`}
-        </Button>
+        <details class="batch-actions">
+          <summary>More batch actions</summary>
+          <div class="batch-actions-menu">
+            <Button variant="ghost" onclick={() => generateAll("text_changed")} disabled={!criticalReady || !canGenerate || genBusy || removing || textChangedReadyLines.length === 0}>Re-generate text-changed ({textChangedReadyLines.length})</Button>
+            <Button variant="ghost" onclick={() => generateAll("voice_changed")} disabled={!criticalReady || !canGenerate || genBusy || removing || voiceChangedReadyLines.length === 0}>Re-generate voice-changed ({voiceChangedReadyLines.length})</Button>
+            <Button variant="ghost" onclick={() => generateAll("changed")} disabled={!criticalReady || !canGenerate || genBusy || removing || changedReadyLines.length === 0}>Re-generate all changed ({changedReadyLines.length})</Button>
+            <Button variant="ghost" onclick={() => generateAll("all")} disabled={!criticalReady || !canGenerate || genBusy || removing || readyFilteredLines.length === 0}>Re-generate all ({readyFilteredLines.length})</Button>
+            <Button variant="danger" onclick={() => removeGenerated(savedFilteredLines.map((line) => line.id))} disabled={!criticalReady || genBusy || removing || savedFilteredLines.length === 0}>{removing ? "Removing…" : `Remove filtered generated (${savedFilteredLines.length})`}</Button>
+          </div>
+        </details>
         {#if !canGenerate}
           <StatusBadge tone="warn">Start the engine to generate</StatusBadge>
         {:else if !ready}
@@ -1928,6 +1902,39 @@
     gap: var(--space-3);
     flex-wrap: wrap;
     margin-bottom: var(--space-3);
+  }
+  .batch-actions { position: relative; }
+  .batch-actions > summary {
+    list-style: none;
+    cursor: pointer;
+    min-height: 2.35rem;
+    box-sizing: border-box;
+    padding: var(--space-2) var(--space-4);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--panel-2);
+    color: var(--text);
+    font-weight: 600;
+  }
+  .batch-actions > summary::-webkit-details-marker { display: none; }
+  .batch-actions > summary::after { content: " ▾"; color: var(--text-faint); }
+  .batch-actions[open] > summary { border-color: var(--accent); }
+  .batch-actions-menu {
+    position: absolute;
+    top: calc(100% + var(--space-2));
+    right: 0;
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-2);
+    width: max-content;
+    max-width: min(26rem, 80vw);
+    padding: var(--space-3);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    background: var(--panel-raised);
+    box-shadow: var(--shadow-lg);
   }
   .scope-editor {
     margin-bottom: var(--space-3);

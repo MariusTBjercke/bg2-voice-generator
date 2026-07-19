@@ -43,6 +43,7 @@
   import Card from "$lib/components/Card.svelte";
   import Button from "$lib/components/Button.svelte";
   import ErrorNotice from "$lib/components/ErrorNotice.svelte";
+  import WorkflowCallout from "$lib/components/WorkflowCallout.svelte";
   import SearchFilterBar from "$lib/components/SearchFilterBar.svelte";
   import StatusBadge from "$lib/components/StatusBadge.svelte";
   import SynthesisTextEditor from "$lib/components/SynthesisTextEditor.svelte";
@@ -782,13 +783,17 @@
 
 <Section
   title="Dialogue Review"
-  description="Review generation-only OmniVoice text and optional personal voice bindings. Original game text and exported subtitles never change."
+  description="Optionally refine generation text and voice bindings before export. Original dialogue and exported subtitles never change."
 >
   {#if !dir}
-    <Card>
-      <p>Choose and scan a game install on <a href="/">Setup</a> before reviewing dialogue.</p>
-    </Card>
+    <WorkflowCallout tone="warn" title="Dialogue scan required" message="Review is optional, but it needs attributed dialogue from a connected installation." href="/attribution" action="Open Attribution" />
   {:else}
+    <nav class="review-nav" aria-label="Review sections">
+      <a href="#review-progress">Progress</a>
+      <a href="#review-queue">Review queue</a>
+      <a href="#corpus-audit">Corpus audit</a>
+      <a href="#binding-audit">Voice bindings</a>
+    </nav>
     <Card>
       <div class="panel-head">
         <button
@@ -843,7 +848,7 @@
           onclick={() => (progressOpen = !progressOpen)}
         >
           <span class="chevron" class:collapsed={!progressOpen} aria-hidden="true">▼</span>
-          <h3>Review progress</h3>
+          <h3 id="review-progress">Review progress</h3>
           {#if summary}
             <span class="panel-summary"
               >{summary.remaining} remaining{#if auditSummary}
@@ -890,7 +895,7 @@
           onclick={() => (queueOpen = !queueOpen)}
         >
           <span class="chevron" class:collapsed={!queueOpen} aria-hidden="true">▼</span>
-          <h3>Review queue and decisions</h3>
+          <h3 id="review-queue">Review queue and decisions</h3>
           <span class="panel-summary">{kindTotal} in tab</span>
         </button>
         <Button
@@ -1198,7 +1203,7 @@
           onclick={() => (corpusAuditOpen = !corpusAuditOpen)}
         >
           <span class="chevron" class:collapsed={!corpusAuditOpen} aria-hidden="true">▼</span>
-          <h3>Corpus audit</h3>
+          <h3 id="corpus-audit">Corpus audit</h3>
         </button>
         <Button
           variant="ghost"
@@ -1255,7 +1260,7 @@
           onclick={() => (voiceBindingsOpen = !voiceBindingsOpen)}
         >
           <span class="chevron" class:collapsed={!voiceBindingsOpen} aria-hidden="true">▼</span>
-          <h3>Voice bindings</h3>
+          <h3 id="binding-audit">Voice bindings</h3>
           {#if bindingProgress}
             <span class="panel-summary"
               >{bindingProgress.remaining_personal} remaining · {bindingProgress.flagged} flagged</span
@@ -1425,6 +1430,17 @@
 </Section>
 
 <style>
+  .review-nav {
+    display: flex;
+    gap: var(--space-1);
+    overflow-x: auto;
+    padding: var(--space-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--panel-deep);
+  }
+  .review-nav a { padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); color: var(--text-muted); text-decoration: none; white-space: nowrap; }
+  .review-nav a:hover { color: var(--text); background: var(--panel-2); }
   h3,
   h4,
   p {

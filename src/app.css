@@ -1,20 +1,35 @@
 :root {
   color-scheme: dark;
-  font-family: system-ui, "Segoe UI", sans-serif;
+  font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+  --font-display: Georgia, "Times New Roman", serif;
 
   /* Palette (dark, built on the original #0c0d0b / #e6e6e6 / #2a2d27). */
   --bg: #0c0d0b;
-  --panel: #131512;
-  --panel-2: #191b17;
-  --text: #e6e6e6;
-  --text-muted: #9aa093;
+  --bg-soft: #10120f;
+  --panel-deep: #10120f;
+  --panel: #151813;
+  --panel-2: #1b1f19;
+  --panel-raised: #20241d;
+  --text: #ecebe6;
+  --text-muted: #aeb1a6;
+  --text-faint: #7f8578;
   --border: #2a2d27;
-  --accent: #c9a86a;
+  --border-strong: #41463b;
+  --accent: #d1ad62;
+  --accent-light: #ecd397;
   --accent-ink: #0c0d0b;
+  --accent-dim: color-mix(in srgb, var(--accent) 56%, var(--border));
+  --accent-wash: rgba(209, 173, 98, 0.1);
   --success: #7fb069;
   --danger: #d97b6c;
   --warn: #d9c26c;
-  --info: #6c9fd9;
+  --info: #7da8d9;
+  --success-wash: rgba(127, 176, 105, 0.1);
+  --danger-wash: rgba(217, 123, 108, 0.1);
+  --warn-wash: rgba(217, 194, 108, 0.1);
+  --info-wash: rgba(125, 168, 217, 0.1);
 
   /* Spacing + radius scale. */
   --space-1: 0.25rem;
@@ -23,17 +38,62 @@
   --space-4: 1rem;
   --space-5: 1.5rem;
   --space-6: 2rem;
-  --radius-sm: 4px;
-  --radius: 6px;
+  --radius-sm: 5px;
+  --radius: 8px;
+  --radius-lg: 12px;
+  --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.24);
+  --shadow-lg: 0 18px 45px rgba(0, 0, 0, 0.42);
+
+  /* Shared action geometry. */
+  --control-height: 2.375rem;
+  --control-font-size: 0.84rem;
+  --control-font-weight: 600;
+  --control-radius: var(--radius-sm);
+  --control-icon-gap: var(--space-2);
 }
+
+*,
+*::before,
+*::after { box-sizing: border-box; }
 
 html,
 body {
   margin: 0;
   padding: 0;
-  background: var(--bg);
+  min-width: 320px;
+  background:
+    radial-gradient(circle at 18% -10%, rgba(209, 173, 98, 0.07), transparent 31rem),
+    linear-gradient(145deg, rgba(255, 255, 255, 0.012) 25%, transparent 25%) 0 0 / 8px 8px,
+    var(--bg);
   color: var(--text);
+  accent-color: var(--accent);
+  text-rendering: optimizeLegibility;
 }
+
+button,
+input,
+select,
+textarea { font: inherit; }
+
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+select,
+textarea {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  color: var(--text);
+  transition: border-color 0.12s ease, box-shadow 0.12s ease, background 0.12s ease;
+}
+
+input::placeholder,
+textarea::placeholder { color: var(--text-faint); }
+
+:where(button, a, input, select, textarea, summary):focus-visible {
+  outline: 2px solid var(--accent-light);
+  outline-offset: 2px;
+}
+
+::selection { background: var(--accent); color: var(--accent-ink); }
 
 code,
 pre {
@@ -50,4 +110,23 @@ pre {
 
 a {
   color: var(--accent);
+  text-underline-offset: 0.16em;
+}
+
+a:hover { color: var(--accent-light); }
+
+h1,
+h2,
+h3,
+p { text-wrap: pretty; }
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
 }

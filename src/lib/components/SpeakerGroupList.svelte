@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { SpeakerGroup } from "$lib/types";
   import SpeakerGroupLabel from "$lib/components/SpeakerGroupLabel.svelte";
+  import Icon from "$lib/components/Icon.svelte";
   import { groupSummary } from "$lib/speakers/groups";
 
   type Props = {
@@ -40,17 +41,19 @@
         >
           <SpeakerGroupLabel group={g} />
         </button>
-        {#if showVariants && g.variant_count > 1}
-          <button
-            type="button"
-            class="expand"
-            aria-expanded={expanded[g.identity_key] ?? false}
-            aria-label={`${expanded[g.identity_key] ? "Collapse" : "Expand"} variants for ${g.display_name}`}
-            onclick={(e) => toggleExpand(g.identity_key, e)}
-          >
-            {expanded[g.identity_key] ? "▾" : "▸"}
-          </button>
-        {/if}
+        <span class="expand-slot">
+          {#if showVariants && g.variant_count > 1}
+            <button
+              type="button"
+              class="expand"
+              aria-expanded={expanded[g.identity_key] ?? false}
+              aria-label={`${expanded[g.identity_key] ? "Collapse" : "Expand"} variants for ${g.display_name}`}
+              onclick={(e) => toggleExpand(g.identity_key, e)}
+            >
+              <Icon name={expanded[g.identity_key] ? "chevron-down" : "chevron-right"} size={17} />
+            </button>
+          {/if}
+        </span>
       </div>
       {#if showVariants && g.variant_count > 1 && expanded[g.identity_key]}
         <ul class="variants">
@@ -81,20 +84,21 @@
     flex-direction: column;
     gap: var(--space-2);
   }
+  .groups { width: 100%; }
   .variants {
     margin: var(--space-1) 0 0 var(--space-3);
     gap: var(--space-1);
   }
   .group-row {
     width: 100%;
-    display: flex;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 2rem;
     align-items: center;
-    justify-content: space-between;
     gap: var(--space-2);
     background: var(--panel-2);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    padding: var(--space-1) var(--space-2) var(--space-1) var(--space-1);
+    padding: var(--space-2);
   }
   .group-row:hover {
     border-color: var(--accent-dim);
@@ -104,25 +108,29 @@
     box-shadow: 0 0 0 1px var(--accent-dim);
   }
   .group-select {
-    flex: 1;
+    width: 100%;
     min-width: 0;
     text-align: left;
     font: inherit;
     background: transparent;
     border: none;
-    padding: var(--space-1) var(--space-2);
+    padding: 0;
     cursor: pointer;
     color: inherit;
   }
   .expand {
-    flex-shrink: 0;
-    font: inherit;
+    display: grid;
+    place-items: center;
+    width: 2rem;
+    height: 2rem;
     background: transparent;
     border: none;
     color: var(--text-muted);
     cursor: pointer;
-    padding: 0 var(--space-1);
+    padding: 0;
   }
+  .expand:hover { color: var(--text); background: var(--panel-raised); }
+  .expand-slot { display: grid; place-items: center; width: 2rem; height: 2rem; }
   .variant {
     font-size: 0.8rem;
     color: var(--text-muted);
