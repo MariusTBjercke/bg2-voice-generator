@@ -1,5 +1,14 @@
 import type { DemographicGroup, EffectiveSpeakerBinding, GeneratableLine, Speaker } from "$lib/types";
 import { identityKey } from "$lib/speakers/groups";
+import {
+  localeText,
+  numberAsc,
+  numberDesc,
+  resolveSort,
+  sortItems,
+  thenBy,
+  type SortSpec,
+} from "./sort";
 
 export type GenerationRenderState =
   | "missing"
@@ -26,6 +35,10 @@ export interface GenerationScope {
   packAudio: GenerationPackAudio[];
   minLength: string;
   maxLength: string;
+  /** When true, only lines with generation diagnostic flags. */
+  needsReview: boolean;
+  /** Sort key for the line list (see generation sort specs). */
+  sort: string;
 }
 
 /** One already-loaded line joined to the metadata needed by the scope editor. */
@@ -38,6 +51,8 @@ export interface GenerationScopeItem {
   renderState: GenerationRenderState;
   /** All applicable render facets (a line can be both voice- and text-changed). */
   renderStates: GenerationRenderState[];
+  /** Count of generation diagnostic flags (0 when none / unknown). */
+  diagnosticFlagCount?: number;
 }
 
 export type GenerationScopeArrayKey =
@@ -52,7 +67,12 @@ export type GenerationScopeArrayKey =
   | "lineStates"
   | "packAudio";
 
-export type GenerationScopeChipKey = GenerationScopeArrayKey | "search" | "minLength" | "maxLength";
+export type GenerationScopeChipKey =
+  | GenerationScopeArrayKey
+  | "search"
+  | "minLength"
+  | "maxLength"
+  | "needsReview";
 
 export interface GenerationScopeChip {
   key: GenerationScopeChipKey;
@@ -61,6 +81,8 @@ export interface GenerationScopeChip {
 }
 
 export type GenerationScopeLabels = Partial<Record<GenerationScopeArrayKey, Record<string, string>>>;
+
+export const GENERATION_SORT_DEFAULT = "dlg_state";
 
 export function emptyGenerationScope(): GenerationScope {
   return {
@@ -77,6 +99,33 @@ export function emptyGenerationScope(): GenerationScope {
     packAudio: [],
     minLength: "",
     maxLength: "",
+    needsReview: false,
+    sort: GENERATION_SORT_DEFAULT,
+  };
+}
+
+/** IPC payload for `list_generatable_lines_page` / `list_generatable_line_ids`. */
+export function toGenerationListScope(
+  scope: GenerationScope,
+  sessionLineIds: number[] = [],
+): import("$lib/types").GenerationListScope {
+  return {
+    search: scope.search,
+    speakers: scope.speakers,
+    sexes: scope.sexes,
+    races: scope.races,
+    creatureCategories: scope.creatureCategories,
+    bindingModes: scope.bindingModes,
+    donors: scope.donors,
+    dlgs: scope.dlgs,
+    renderStates: scope.renderStates,
+    lineStates: scope.lineStates,
+    packAudio: scope.packAudio,
+    minLength: scope.minLength,
+    maxLength: scope.maxLength,
+    needsReview: scope.needsReview,
+    sort: scope.sort,
+    sessionLineIds: [...new Set(sessionLineIds.filter((id) => Number.isFinite(id)))],
   };
 }
 
@@ -109,6 +158,9 @@ export function normalizeGenerationScope(value: unknown): GenerationScope {
   scope.search = stringValue(source.search);
   scope.minLength = stringValue(source.minLength);
   scope.maxLength = stringValue(source.maxLength);
+  scope.needsReview = source.needsReview === true;
+  const sort = stringValue(source.sort);
+  scope.sort = sort || GENERATION_SORT_DEFAULT;
   for (const key of ARRAY_KEYS) {
     (scope[key] as string[]) = stringArray(source[key]);
   }
@@ -120,6 +172,7 @@ export function activeGenerationScopeCount(scope: GenerationScope): number {
   for (const key of ARRAY_KEYS) count += scope[key].length;
   if (scope.minLength.trim()) count += 1;
   if (scope.maxLength.trim()) count += 1;
+  if (scope.needsReview) count += 1;
   return count;
 }
 
@@ -136,6 +189,7 @@ export function generationScopeChips(
   }
   if (scope.minLength.trim()) chips.push({ key: "minLength", value: scope.minLength, label: `Length ≥ ${scope.minLength}` });
   if (scope.maxLength.trim()) chips.push({ key: "maxLength", value: scope.maxLength, label: `Length ≤ ${scope.maxLength}` });
+  if (scope.needsReview) chips.push({ key: "needsReview", value: "true", label: "Needs review" });
   return chips;
 }
 
@@ -146,6 +200,8 @@ export function removeGenerationScopeChip(
   const next = normalizeGenerationScope(scope);
   if (chip.key === "search" || chip.key === "minLength" || chip.key === "maxLength") {
     next[chip.key] = "";
+  } else if (chip.key === "needsReview") {
+    next.needsReview = false;
   } else {
     (next[chip.key] as string[]) = next[chip.key].filter((value) => value !== chip.value);
   }
@@ -231,6 +287,7 @@ export function matchesGenerationScope(item: GenerationScopeItem, scope: Generat
   }
   if (!matchesSelected(scope.lineStates, line.status)) return false;
   if (!matchesSelected(scope.packAudio, line.is_voiced || line.existing_sound_resref ? "present" : "absent")) return false;
+  if (scope.needsReview && (item.diagnosticFlagCount ?? 0) <= 0) return false;
 
   const min = numericBound(scope.minLength);
   const max = numericBound(scope.maxLength);
@@ -248,4 +305,56 @@ export function filterGenerationScope(
   scope: GenerationScope,
 ): GenerationScopeItem[] {
   return items.filter((item) => matchesGenerationScope(item, scope));
+}
+
+function dlgStateCompare(a: GenerationScopeItem, b: GenerationScopeItem): number {
+  return thenBy<GenerationScopeItem>(
+    (x, y) => localeText(x.line.dlg_resref, y.line.dlg_resref),
+    (x, y) => numberAsc(x.line.state_index, y.line.state_index),
+    (x, y) => numberAsc(x.line.strref, y.line.strref),
+  )(a, b);
+}
+
+export const generationSortSpecs: SortSpec<GenerationScopeItem>[] = [
+  {
+    key: "dlg_state",
+    label: "Dialogue order",
+    compare: dlgStateCompare,
+  },
+  {
+    key: "speaker_asc",
+    label: "Speaker A–Z",
+    compare: thenBy(
+      (a, b) => localeText(a.speaker?.display_name, b.speaker?.display_name),
+      dlgStateCompare,
+    ),
+  },
+  {
+    key: "strref_asc",
+    label: "Strref",
+    compare: (a, b) => numberAsc(a.line.strref, b.line.strref),
+  },
+  {
+    key: "text_len_desc",
+    label: "Longest text",
+    compare: thenBy(
+      (a, b) => numberDesc(a.line.text.length, b.line.text.length),
+      dlgStateCompare,
+    ),
+  },
+  {
+    key: "needs_review",
+    label: "Needs review first",
+    compare: thenBy(
+      (a, b) => numberDesc(a.diagnosticFlagCount ?? 0, b.diagnosticFlagCount ?? 0),
+      dlgStateCompare,
+    ),
+  },
+];
+
+export function sortGenerationScopeItems(
+  items: GenerationScopeItem[],
+  sortKey: string | undefined,
+): GenerationScopeItem[] {
+  return sortItems(items, resolveSort(generationSortSpecs, sortKey));
 }

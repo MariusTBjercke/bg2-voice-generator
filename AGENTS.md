@@ -231,7 +231,7 @@ build` — the latter won't embed the frontend.
 
 ## Versioning
 
-**Single source of truth: `package.json` `version`** (currently `0.1.0`). When bumping, also
+**Single source of truth: `package.json` `version`** (currently `0.2.0`). When bumping, also
 update `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml` to match; `build-portable.ps1`
 names the ZIP from `package.json`.
 

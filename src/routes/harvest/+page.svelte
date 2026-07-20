@@ -26,11 +26,13 @@
   import SearchFilterBar from "$lib/components/SearchFilterBar.svelte";
   import ExpandableText from "$lib/components/ExpandableText.svelte";
   import Icon from "$lib/components/Icon.svelte";
-  import { filterItems, type FilterConfig, type FilterValues } from "$lib/filters";
+  import { filterItems, sortItems, resolveSort, sortOptionsFromSpecs, type FilterConfig, type FilterValues, type SortSpec } from "$lib/filters";
+  import { localeText, numberDesc, thenBy } from "$lib/filters/sort";
   import {
     bestApprovedSampleForBinding,
     groupSamplesBySoundResref,
     parseSampleScore,
+    usageForSound,
     type SoundSampleGroup,
   } from "$lib/speakers/samples";
   import { formatApprovedSummary, groupSummary } from "$lib/speakers/groups";
@@ -61,6 +63,7 @@
     SampleScore,
     Speaker,
     SpeakerGroup,
+    SoundResrefUsageEntry,
     VerifySpeechResult,
   } from "$lib/types";
 
@@ -188,6 +191,8 @@
   const soundGroups = $derived(groupSamplesBySoundResref(samples));
   const autoBindPick = $derived(bestApprovedSampleForBinding(samples));
   let expandedSounds = $state<Record<string, boolean>>({});
+  let expandedUsage = $state<Record<string, boolean>>({});
+  let soundUsageByResref = $state<Map<string, SoundResrefUsageEntry>>(new Map());
   const clonesBySpeaker = $derived($results.binding.clonesBySpeaker);
   const boundSampleIds = $derived.by(() => {
     if (!selected) return new Set<number>();
@@ -257,11 +262,56 @@
   let filterValues = $state<FilterValues>({
     search: "",
     facets: { [SEX_FACET]: "all", [REVIEW_FACET]: "all" },
+    sort: "name_asc",
   });
   let filtersHydrated = $state(false);
+
+  const harvestSortSpecs: SortSpec<SpeakerGroup>[] = [
+    {
+      key: "name_asc",
+      label: "Name A–Z",
+      compare: (a, b) => localeText(a.display_name, b.display_name),
+    },
+    {
+      key: "name_desc",
+      label: "Name Z–A",
+      compare: (a, b) => localeText(b.display_name, a.display_name),
+    },
+    {
+      key: "lines_desc",
+      label: "Most lines",
+      compare: thenBy(
+        (a, b) => numberDesc(a.line_count, b.line_count),
+        (a, b) => localeText(a.display_name, b.display_name),
+      ),
+    },
+    {
+      key: "samples_desc",
+      label: "Most samples",
+      compare: thenBy(
+        (a, b) => numberDesc(a.sample_count, b.sample_count),
+        (a, b) => localeText(a.display_name, b.display_name),
+      ),
+    },
+    {
+      key: "needs_approval",
+      label: "Needs approval first",
+      compare: thenBy(
+        (a, b) =>
+          Number(b.sample_count > 0 && b.approved_sound_count === 0) -
+          Number(a.sample_count > 0 && a.approved_sound_count === 0),
+        (a, b) => localeText(a.display_name, b.display_name),
+      ),
+    },
+  ];
+  const harvestSortOptions = $derived(sortOptionsFromSpecs(harvestSortSpecs));
+
   const filteredGroups = $derived(filterItems(groups, filterConfig, filterValues));
+  const sortedGroups = $derived(
+    sortItems(filteredGroups, resolveSort(harvestSortSpecs, filterValues.sort)),
+  );
   const pagedGroups = $derived(
-    filteredGroups.slice(speakerPage * SPEAKER_PAGE_SIZE, (speakerPage + 1) * SPEAKER_PAGE_SIZE),
+    sortedGroups.slice(speakerPage * SPEAKER_PAGE_SIZE, (speakerPage + 1) * SPEAKER_PAGE_SIZE),
   );
   /** No speaker has `long_name_strref` — attribution was not re-scanned since grouping shipped. */
   const identityNotPopulated = $derived(
@@ -276,12 +326,17 @@
       filterValues = {
         search: saved.search,
         facets: { [SEX_FACET]: "all", [REVIEW_FACET]: "all", ...saved.facets },
+        sort: saved.sort ?? "name_asc",
       };
     }
     filtersHydrated = true;
   });
   $effect(() => {
-    const snapshot = { search: filterValues.search, facets: { ...filterValues.facets } };
+    const snapshot = {
+      search: filterValues.search,
+      facets: { ...filterValues.facets },
+      sort: filterValues.sort ?? "name_asc",
+    };
     if (!filtersHydrated) return;
     setSavedFilter("harvest", snapshot);
   });
@@ -290,6 +345,7 @@
   $effect(() => {
     void filterValues.search;
     void JSON.stringify(filterValues.facets);
+    void filterValues.sort;
     speakerPage = 0;
   });
 
@@ -328,6 +384,22 @@
     groups = identityGroups;
   }
 
+  async function loadSoundUsage() {
+    if (!dir) return;
+    try {
+      const rows = await invoke<SoundResrefUsageEntry[]>("list_sound_resref_usage", {
+        gameDir: dir,
+      });
+      const next = new Map<string, SoundResrefUsageEntry>();
+      for (const row of rows) {
+        next.set(row.source_sound_resref.trim().toLowerCase(), row);
+      }
+      soundUsageByResref = next;
+    } catch {
+      // Best-effort: usage badges are informational only.
+    }
+  }
+
   async function runHarvest() {
     if (!dir) {
       error = "Choose a game folder on the Setup screen first.";
@@ -347,7 +419,7 @@
       // A re-harvest can change the samples, so drop stale per-speaker caches.
       clearGroupSamples();
       invalidateSpeakerGroups(dir);
-      await loadGroups();
+      await Promise.all([loadGroups(), loadSoundUsage()]);
       if (selected) await selectGroup(selected);
     } catch (e) {
       error = String(e);
@@ -360,6 +432,7 @@
     selected = g;
     selectedKey = g.identity_key;
     expandedSounds = {};
+    expandedUsage = {};
     setSelectedIdentityKey(g.identity_key);
     if (dir) {
       updateInstallUiPreferences(dir, (current) => ({
@@ -421,7 +494,7 @@
         await invoke<boolean>("set_sample_decision", { sampleId: sample.id, decision });
       }
       invalidateGeneration("critical", "metadata");
-      await Promise.all([loadGroups(), loadClones()]);
+      await Promise.all([loadGroups(), loadClones(), loadSoundUsage()]);
     } catch (e) {
       error = String(e);
       setGroupSamples(key, previous);
@@ -430,6 +503,15 @@
 
   function toggleSoundExpand(soundResref: string) {
     expandedSounds = { ...expandedSounds, [soundResref]: !expandedSounds[soundResref] };
+  }
+
+  function toggleUsageExpand(soundResref: string) {
+    expandedUsage = { ...expandedUsage, [soundResref]: !expandedUsage[soundResref] };
+  }
+
+  function jumpToUsageCharacter(identityKey: string) {
+    const match = findGroupByIdentityParam(groups, identityKey);
+    if (match) void selectGroup(match);
   }
 
   // Auto-approve the best sample. With `onlyUnapproved`, groups that already have
@@ -449,7 +531,7 @@
       invalidateGeneration("critical", "metadata");
       clearGroupSamples();
       invalidateSpeakerGroups(dir);
-      await loadGroups();
+      await Promise.all([loadGroups(), loadSoundUsage()]);
       if (selected) await selectGroup(selected, true);
     } catch (e) {
       error = String(e);
@@ -471,7 +553,7 @@
       invalidateGeneration("critical", "metadata");
       clearGroupSamples();
       invalidateSpeakerGroups(dir);
-      await loadGroups();
+      await Promise.all([loadGroups(), loadSoundUsage()]);
       if (selected) await selectGroup(selected, true);
     } catch (e) {
       error = String(e);
@@ -499,7 +581,7 @@
       invalidateGeneration("critical", "metadata");
       await selectGroup(selected, true);
       invalidateSpeakerGroups(dir);
-      await loadGroups();
+      await Promise.all([loadGroups(), loadSoundUsage()]);
     } catch (e) {
       error = String(e);
     } finally {
@@ -523,7 +605,7 @@
       autoResult = null;
       clearGroupSamples();
       if (selected) await selectGroup(selected, true);
-      await loadGroups();
+      await Promise.all([loadGroups(), loadSoundUsage()]);
     } catch (e) {
       error = String(e);
     } finally {
@@ -547,7 +629,7 @@
       });
       invalidateGeneration("critical", "metadata");
       await selectGroup(selected, true);
-      await loadGroups();
+      await Promise.all([loadGroups(), loadSoundUsage()]);
     } catch (e) {
       error = String(e);
     } finally {
@@ -611,7 +693,10 @@
     selectionDir = gameDir;
     selected = null;
     selectedKey = null;
-    if (gameDir) void loadGroups();
+    if (gameDir) {
+      void loadGroups();
+      void loadSoundUsage();
+    }
   });
 
   $effect(() => {
@@ -633,6 +718,7 @@
         filterValues = {
           search: match.display_name,
           facets: { ...filterValues.facets, [REVIEW_FACET]: "all" },
+          sort: filterValues.sort ?? "name_asc",
         };
       }
       if (selected?.identity_key !== match.identity_key) {
@@ -888,11 +974,13 @@
             config={filterConfig}
             items={groups}
             bind:values={filterValues}
-            shown={filteredGroups.length}
+            shown={sortedGroups.length}
             total={groups.length}
             label="characters"
+            sortOptions={harvestSortOptions}
+            defaultSort="name_asc"
           />
-          {#if filteredGroups.length === 0}
+          {#if sortedGroups.length === 0}
             <p class="hint">No characters match your search.</p>
           {:else}
             <SpeakerGroupList
@@ -903,7 +991,7 @@
             <Pager
               bind:page={speakerPage}
               pageSize={SPEAKER_PAGE_SIZE}
-              total={filteredGroups.length}
+              total={sortedGroups.length}
               label="characters"
               compact
             />
@@ -962,6 +1050,8 @@
                 {@const tooShort = (score?.duration_secs ?? 0) < MIN_BIND_SECS}
                 {@const multi = group.siblings.length > 1}
                 {@const expanded = expandedSounds[group.soundResref] ?? false}
+                {@const usage = usageForSound(soundUsageByResref, group.soundResref)}
+                {@const usageOpen = expandedUsage[group.soundResref] ?? false}
                 {@const badgeDecision = group.decision ?? "pending"}
                 {@const anyDecided = group.siblings.some(
                   (s) => s.decision === "approved" || s.decision === "rejected",
@@ -995,9 +1085,6 @@
                         {#if prov.eligibility === "manual_only"}
                           <StatusBadge tone="warn">manual only</StatusBadge>
                         {/if}
-                        {#if prov.shared_source_count > 1}
-                          <span class="sub">shared by {prov.shared_source_count} identities</span>
-                        {/if}
                       {/if}
                       {#if multi}
                         <span class="sub">{group.siblings.length} variants</span>
@@ -1012,6 +1099,23 @@
                         </button>
                       {/if}
                     </div>
+                    {#if usage}
+                      <div class="usage-row">
+                        <span class="sub usage-summary">
+                          Used by {usage.character_count} characters{#if usage.bound_character_count > 0}
+                            · {usage.bound_character_count} bound{/if}
+                        </span>
+                        <button
+                          type="button"
+                          class="expand"
+                          aria-expanded={usageOpen}
+                          aria-label={`${usageOpen ? "Collapse" : "Expand"} characters using ${group.soundResref}`}
+                          onclick={() => toggleUsageExpand(group.soundResref)}
+                        >
+                          <Icon name={usageOpen ? "chevron-down" : "chevron-right"} size={17} />
+                        </button>
+                      </div>
+                    {/if}
                     {#if prov?.source_text}
                       <div class="transcript">
                         <ExpandableText text={prov.source_text} maxLength={160} />
@@ -1058,6 +1162,29 @@
                       {#if audioError[sample.id]}
                         <p class="audio-error">{audioError[sample.id]}</p>
                       {/if}
+                    {/if}
+                    {#if usage && usageOpen}
+                      <ul class="sound-usage">
+                        {#each usage.characters as ch (ch.identity_key)}
+                          <li class="sound-usage-row">
+                            <button
+                              type="button"
+                              class="usage-jump"
+                              onclick={() => jumpToUsageCharacter(ch.identity_key)}
+                            >
+                              {ch.display_name}
+                            </button>
+                            <span class="sub mono">{ch.cre_resref}</span>
+                            <StatusBadge tone={decisionTone[ch.decision]}>{ch.decision}</StatusBadge>
+                            {#if ch.eligibility === "manual_only"}
+                              <StatusBadge tone="warn">manual only</StatusBadge>
+                            {/if}
+                            {#if ch.bound}
+                              <StatusBadge tone="success">bound</StatusBadge>
+                            {/if}
+                          </li>
+                        {/each}
+                      </ul>
                     {/if}
                     {#if multi && expanded}
                       <ul class="sound-variants">
@@ -1389,6 +1516,43 @@
     padding: 0;
   }
   .expand:hover { color: var(--text); background: var(--panel-2); }
+  .usage-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+  }
+  .usage-summary {
+    color: var(--accent);
+  }
+  .sound-usage {
+    list-style: none;
+    margin: var(--space-2) 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .sound-usage-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    flex-wrap: wrap;
+    font-size: 0.85rem;
+  }
+  .usage-jump {
+    font: inherit;
+    background: transparent;
+    color: var(--accent);
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .usage-jump:hover {
+    color: var(--text);
+  }
   .sound-variants {
     list-style: none;
     margin: var(--space-2) 0 0;

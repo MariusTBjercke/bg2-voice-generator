@@ -9,12 +9,13 @@
 //! the fresh scores can be re-auditioned). Only local-derivative metadata is stored
 //! - never original audio (see `00-context.md`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::AppError;
 use crate::export::resref::is_pack_generated_resref;
+use crate::models::SampleDecision;
 use crate::voices::harvest::HarvestedSample;
 
 /// Speakers with Ready lines and few automatic samples may receive Attribution gap-fill.
@@ -1261,6 +1262,228 @@ pub fn auto_approve_manual_gaps(
     Ok(counts)
 }
 
+fn decision_rank(decision: SampleDecision) -> i32 {
+    match decision {
+        SampleDecision::Approved => 2,
+        SampleDecision::Pending => 1,
+        SampleDecision::Rejected => 0,
+    }
+}
+
+fn overall_score_of(scores_json: &str) -> f64 {
+    serde_json::from_str::<serde_json::Value>(scores_json)
+        .ok()
+        .and_then(|v| v.get("overall").and_then(|n| n.as_f64()))
+        .unwrap_or(-1.0)
+}
+
+fn eligibility_of(provenance_json: &str) -> Option<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(provenance_json) else {
+        return None;
+    };
+    v.get("eligibility")
+        .and_then(|e| e.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Project-wide reverse lookup: which display identity groups have / bind each sound resref.
+///
+/// Sample rows are per-speaker; this aggregates by `lower(source_sound_resref)` across
+/// display identity groups so the UI can show "Used by N characters · M bound".
+pub fn list_sound_resref_usage(
+    conn: &Connection,
+    project_id: i64,
+) -> Result<Vec<crate::models::SoundResrefUsageEntry>, AppError> {
+    use crate::models::{SoundResrefUsageCharacter, SoundResrefUsageEntry};
+    use crate::db::speaker_groups::{identity_key, is_player_prototype_identity, list_speaker_groups};
+
+    let groups = list_speaker_groups(conn, project_id)?;
+    let mut display_by_key: HashMap<String, String> = HashMap::new();
+    let mut cre_by_key: HashMap<String, String> = HashMap::new();
+    let mut identity_by_speaker: HashMap<i64, String> = HashMap::new();
+    for g in &groups {
+        display_by_key.insert(g.identity_key.clone(), g.display_name.clone());
+        if let Some(first) = g.variants.first() {
+            cre_by_key.insert(g.identity_key.clone(), first.cre_resref.clone());
+        }
+        for v in &g.variants {
+            identity_by_speaker.insert(v.speaker_id, g.identity_key.clone());
+        }
+    }
+
+    // speaker_id → lowercase sound resrefs from ready personal binds.
+    let mut bound_sounds_by_speaker: HashMap<i64, HashSet<String>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT s.id, lower(rs.source_sound_resref) \
+             FROM clone c \
+             JOIN speaker s ON s.id = c.speaker_id \
+             JOIN reference_sample rs ON rs.id = c.primary_sample_id \
+             WHERE s.project_id=?1 \
+               AND c.status='ready' \
+               AND c.binding_source IN ('default','override') \
+               AND rs.source_sound_resref IS NOT NULL \
+               AND trim(rs.source_sound_resref) != ''",
+        )?;
+        let rows = stmt.query_map(params![project_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (speaker_id, sound) = row?;
+            bound_sounds_by_speaker
+                .entry(speaker_id)
+                .or_default()
+                .insert(sound);
+        }
+    }
+
+    #[derive(Clone)]
+    struct Cand {
+        sample_id: i64,
+        decision: SampleDecision,
+        eligibility: Option<String>,
+        overall: f64,
+        cre_resref: String,
+    }
+
+    // sound_lc → identity_key → best candidate for that character.
+    let mut by_sound: BTreeMap<String, HashMap<String, Cand>> = BTreeMap::new();
+    // sound_lc → identity_key → bound?
+    let mut bound_by_sound: HashMap<String, HashMap<String, bool>> = HashMap::new();
+
+    {
+        let mut stmt = conn.prepare(
+            "SELECT rs.id, rs.source_sound_resref, rs.decision, rs.provenance_json, rs.scores_json, \
+                    s.id, s.cre_resref, s.display_name, s.long_name_strref, s.sex \
+             FROM reference_sample rs \
+             JOIN speaker s ON s.id = rs.speaker_id \
+             WHERE s.project_id=?1 \
+               AND rs.source_sound_resref IS NOT NULL \
+               AND trim(rs.source_sound_resref) != ''",
+        )?;
+        let rows = stmt.query_map(params![project_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, SampleDecision>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<i64>>(8)?,
+                r.get::<_, i64>(9)?,
+            ))
+        })?;
+        for row in rows {
+            let (
+                sample_id,
+                sound_raw,
+                decision,
+                provenance_json,
+                scores_json,
+                speaker_id,
+                cre_resref,
+                display_name,
+                long_name_strref,
+                sex,
+            ) = row?;
+            let group_display = display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .unwrap_or(cre_resref.as_str());
+            if is_player_prototype_identity(Some(group_display)) {
+                continue;
+            }
+            let sound = sound_raw.trim().to_ascii_lowercase();
+            if sound.is_empty() {
+                continue;
+            }
+            let key = identity_by_speaker
+                .get(&speaker_id)
+                .cloned()
+                .unwrap_or_else(|| identity_key(long_name_strref, sex, speaker_id));
+            let cand = Cand {
+                sample_id,
+                decision,
+                eligibility: eligibility_of(&provenance_json),
+                overall: overall_score_of(&scores_json),
+                cre_resref: cre_resref.clone(),
+            };
+            let bucket = by_sound.entry(sound.clone()).or_default();
+            match bucket.get(&key) {
+                None => {
+                    bucket.insert(key.clone(), cand);
+                }
+                Some(existing) => {
+                    let better = decision_rank(cand.decision) > decision_rank(existing.decision)
+                        || (decision_rank(cand.decision) == decision_rank(existing.decision)
+                            && (cand.overall > existing.overall
+                                || (cand.overall == existing.overall
+                                    && cand.sample_id < existing.sample_id)));
+                    if better {
+                        bucket.insert(key.clone(), cand);
+                    }
+                }
+            }
+            let is_bound = bound_sounds_by_speaker
+                .get(&speaker_id)
+                .is_some_and(|set| set.contains(&sound));
+            let bound_bucket = bound_by_sound.entry(sound).or_default();
+            let entry = bound_bucket.entry(key).or_insert(false);
+            *entry |= is_bound;
+        }
+    }
+
+    let mut out = Vec::new();
+    for (sound, chars) in by_sound {
+        let bound_map = bound_by_sound.get(&sound);
+        let mut characters: Vec<SoundResrefUsageCharacter> = chars
+            .into_iter()
+            .map(|(identity_key, cand)| {
+                let bound = bound_map
+                    .and_then(|m| m.get(&identity_key))
+                    .copied()
+                    .unwrap_or(false);
+                let display_name = display_by_key
+                    .get(&identity_key)
+                    .cloned()
+                    .unwrap_or_else(|| cand.cre_resref.clone());
+                let cre_resref = cre_by_key
+                    .get(&identity_key)
+                    .cloned()
+                    .unwrap_or(cand.cre_resref);
+                SoundResrefUsageCharacter {
+                    identity_key,
+                    display_name,
+                    cre_resref,
+                    decision: cand.decision,
+                    eligibility: cand.eligibility,
+                    bound,
+                    sample_id: cand.sample_id,
+                }
+            })
+            .collect();
+        characters.sort_by(|a, b| {
+            a.display_name
+                .to_ascii_lowercase()
+                .cmp(&b.display_name.to_ascii_lowercase())
+                .then_with(|| a.identity_key.cmp(&b.identity_key))
+        });
+        let bound_character_count = characters.iter().filter(|c| c.bound).count() as i64;
+        let character_count = characters.len() as i64;
+        out.push(SoundResrefUsageEntry {
+            source_sound_resref: sound,
+            character_count,
+            bound_character_count,
+            characters,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2365,5 +2588,73 @@ mod tests {
             .unwrap();
         assert_eq!(status, "ready");
         assert_eq!(primary, Some(sample_id));
+    }
+
+    #[test]
+    fn list_sound_resref_usage_groups_characters_and_marks_bounds() {
+        let conn = mem_db();
+        let pid = project(&conn);
+        let assassin = speaker_with_strref(&conn, pid, "assass1", Some(100));
+        let thief = speaker_with_strref(&conn, pid, "thief01", Some(200));
+        let guard = speaker_with_strref(&conn, pid, "guard01", Some(300));
+        conn.execute(
+            "UPDATE speaker SET display_name='Assassin' WHERE id=?1",
+            params![assassin],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE speaker SET display_name='Thief' WHERE id=?1",
+            params![thief],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE speaker SET display_name='Guard' WHERE id=?1",
+            params![guard],
+        )
+        .unwrap();
+
+        let a_sample = sample_with_overall(&conn, assassin, "sthma06", 0.82);
+        let t_sample = sample_with_overall(&conn, thief, "STHMA06", 0.5);
+        let _g_sample = sample_with_overall(&conn, guard, "guard01", 0.9);
+        set_decision(&conn, a_sample, "approved").unwrap();
+        // thief stays pending
+
+        let clone_id = crate::db::generation::upsert_clone(
+            &conn,
+            assassin,
+            a_sample,
+            crate::models::BindingSource::Default,
+        )
+        .unwrap();
+        crate::db::generation::set_clone_status(
+            &conn,
+            clone_id,
+            crate::models::CloneStatus::Ready,
+        )
+        .unwrap();
+
+        let usage = list_sound_resref_usage(&conn, pid).unwrap();
+        let shared = usage
+            .iter()
+            .find(|e| e.source_sound_resref == "sthma06")
+            .expect("sthma06 entry");
+        assert_eq!(shared.character_count, 2);
+        assert_eq!(shared.bound_character_count, 1);
+        assert_eq!(shared.characters.len(), 2);
+        assert_eq!(shared.characters[0].display_name, "Assassin");
+        assert!(shared.characters[0].bound);
+        assert_eq!(shared.characters[0].decision, SampleDecision::Approved);
+        assert_eq!(shared.characters[0].sample_id, a_sample);
+        assert_eq!(shared.characters[1].display_name, "Thief");
+        assert!(!shared.characters[1].bound);
+        assert_eq!(shared.characters[1].decision, SampleDecision::Pending);
+        assert_eq!(shared.characters[1].sample_id, t_sample);
+
+        let guard_only = usage
+            .iter()
+            .find(|e| e.source_sound_resref == "guard01")
+            .expect("guard01 entry");
+        assert_eq!(guard_only.character_count, 1);
+        assert_eq!(guard_only.bound_character_count, 0);
     }
 }

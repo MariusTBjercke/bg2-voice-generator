@@ -186,8 +186,8 @@ describe("generation scope", () => {
   });
 
   test("counts selections, builds labelled chips, and removes one chip without mutating the source", () => {
-    const scope = scoped({ search: "voice", speakers: ["1", "2"], renderStates: ["missing"], minLength: "5" });
-    expect(activeGenerationScopeCount(scope)).toBe(5);
+    const scope = scoped({ search: "voice", speakers: ["1", "2"], renderStates: ["missing"], minLength: "5", needsReview: true });
+    expect(activeGenerationScopeCount(scope)).toBe(6);
     const chips = generationScopeChips(scope, { speakers: { "1": "Xzar", "2": "Montaron" } });
     expect(chips.map((chip) => chip.label)).toEqual([
       "Search: voice",
@@ -195,9 +195,19 @@ describe("generation scope", () => {
       "Montaron",
       "missing",
       "Length ≥ 5",
+      "Needs review",
     ]);
     const next = removeGenerationScopeChip(scope, chips[1]);
     expect(next.speakers).toEqual(["2"]);
     expect(scope.speakers).toEqual(["1", "2"]);
+    const cleared = removeGenerationScopeChip(scope, { key: "needsReview", value: "true" });
+    expect(cleared.needsReview).toBe(false);
+  });
+
+  test("needsReview filter keeps only lines with diagnostic flags", () => {
+    const flagged = { ...rows[0], diagnosticFlagCount: 2 };
+    const clean = { ...rows[1], diagnosticFlagCount: 0 };
+    const mixed = [flagged, clean, rows[2]];
+    expect(filterGenerationScope(mixed, scoped({ needsReview: true })).map((r) => r.line.id)).toEqual([1]);
   });
 });

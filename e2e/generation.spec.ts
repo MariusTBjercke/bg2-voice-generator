@@ -24,7 +24,7 @@ test.describe("Generation screen", () => {
 
   test("identity query filters the speaker scope", async ({ page }) => {
     await page.goto("/generation?identity=33001");
-    await expect(page.getByRole("heading", { name: /Generatable lines \(1 of 104\)/ })).toBeVisible();
+    await expect(page.getByRole("heading", { name: /Generatable lines \(1\)/ })).toBeVisible();
     await expect(page.getByText("#33001")).toBeVisible();
     await expect(page).toHaveURL(/\/generation$/);
   });
@@ -80,20 +80,36 @@ test.describe("Generation screen", () => {
 
   test("combines filters, removes chips, and clears the full scope", async ({ page }) => {
     await page.getByRole("button", { name: "More filters" }).click();
-    const speakers = page.locator("details").filter({ has: page.locator("summary", { hasText: "Speakers" }) });
+    const speakers = page.locator("#generation-more-filters details").filter({ hasText: "Speakers" }).first();
     await speakers.locator("summary").click();
     await speakers.getByRole("checkbox", { name: /Xzar/ }).check();
 
     const packAudio = page.getByRole("group", { name: "Attached pack audio" });
     await packAudio.getByLabel("Present", { exact: true }).check();
-    await expect(page.getByRole("heading", { name: "Generatable lines (1 of 104)" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Generatable lines (1)" })).toBeVisible();
     await expect(page.getByText("#22571")).toBeVisible();
 
     await page.getByRole("button", { name: "Remove filter Pack audio present" }).click();
-    await expect(page.getByRole("heading", { name: "Generatable lines (103 of 104)" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Generatable lines (103)" })).toBeVisible();
 
     await page.getByRole("button", { name: "Clear all", exact: true }).click();
     await expect(page.getByRole("heading", { name: "Generatable lines (104)" })).toBeVisible();
+  });
+
+  test("defaults to dialogue order and can filter or sort needs-review lines", async ({ page }) => {
+    await expect(page.getByLabel("Sort", { exact: true })).toHaveValue("dlg_state");
+    // Ready lines only: montdlg (#33001) sorts before xzardlg (#22570).
+    await expect(page.locator(".line").first().getByText("#33001")).toBeVisible();
+
+    await page.getByRole("button", { name: "More filters" }).click();
+    await page.getByRole("group", { name: "Diagnostics" }).getByLabel("Needs review").check();
+    await expect(page.getByRole("heading", { name: "Generatable lines (1)" })).toBeVisible();
+    await expect(page.getByText("#22570")).toBeVisible();
+    await expect(page.getByText("needs review", { exact: true })).toBeVisible();
+
+    await page.getByRole("button", { name: "Clear all", exact: true }).click();
+    await page.getByLabel("Sort", { exact: true }).selectOption("needs_review");
+    await expect(page.locator(".line").first().getByText("#22570")).toBeVisible();
   });
 
   test("restores the advanced-filter panel without restoring pagination", async ({ page }) => {
@@ -107,7 +123,7 @@ test.describe("Generation screen", () => {
   test("batch actions target every filtered line, including lines beyond the current page", async ({ page }) => {
     await page.getByRole("button", { name: "Start engine" }).click();
     await page.getByRole("button", { name: "More filters" }).click();
-    const speakers = page.locator("details").filter({ has: page.locator("summary", { hasText: "Speakers" }) });
+    const speakers = page.locator("#generation-more-filters details").filter({ hasText: "Speakers" }).first();
     await speakers.locator("summary").click();
     await speakers.getByRole("checkbox", { name: /Xzar/ }).check();
     await page.getByRole("group", { name: "Attached pack audio" }).getByLabel("Absent", { exact: true }).check();
@@ -208,7 +224,7 @@ test.describe("Generation screen", () => {
     await banner.getByRole("button", { name: "Show them" }).click();
     await page.getByText("More batch actions", { exact: true }).click();
 
-    await expect(page.getByRole("heading", { name: /Generatable lines \(1 of 105\)/ })).toBeVisible();
+    await expect(page.getByRole("heading", { name: /Generatable lines \(1\)/ })).toBeVisible();
     const row = page.locator(".line").filter({ hasText: "#99448" });
     await expect(row.getByText("blocked", { exact: true })).toBeVisible();
     await expect(row.getByText("voice changed", { exact: true })).toBeVisible();

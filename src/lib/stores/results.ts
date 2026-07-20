@@ -49,16 +49,31 @@ export interface CachedGenerationState {
 type RevisionMap<K extends string> = Record<K, number>;
 
 export interface GenerationScreenCache {
+  /** Current page lines only (not a full-project inventory). */
   lines: GeneratableLine[];
   linesLoaded: boolean;
+  lineTotal: number;
+  summary: {
+    missing: number;
+    voice_changed_ready: number;
+    text_changed_ready: number;
+    changed_ready: number;
+    regeneratable: number;
+    saved: number;
+    orphan_clips: number;
+  };
   states: Record<number, CachedGenerationState>;
   diagnostics: Record<number, GenerationDiagnostics>;
   candidates: Record<number, RenderCandidate>;
+  /** Short-lived page previews; not a durable full-corpus cache. */
   synthesisPreviews: Record<number, SynthesisPreview>;
   speakers: Speaker[];
   identityGroups: SpeakerGroup[];
   demographics: DemographicGroup[];
   effectiveBindings: EffectiveSpeakerBinding[];
+  filterDlgs: string[];
+  filterDonors: Array<{ value: string; label: string }>;
+  filterLineStates: string[];
   linePage: number;
   lineSettings: Record<number, OmniVoiceRenderSettingsPatch>;
   audioRevisions: Record<number, number>;
@@ -153,10 +168,34 @@ function unappliedRevisions<K extends string>(keys: K[]): Record<K, number> {
 
 function emptyGeneration(): GenerationScreenCache {
   return {
-    lines: [], linesLoaded: false, states: {}, diagnostics: {}, candidates: {},
-    synthesisPreviews: {}, speakers: [], identityGroups: [], demographics: [],
-    effectiveBindings: [], linePage: 0, lineSettings: {}, audioRevisions: {},
-    dirty: revisions(generationDomains), applied: unappliedRevisions(generationDomains),
+    lines: [],
+    linesLoaded: false,
+    lineTotal: 0,
+    summary: {
+      missing: 0,
+      voice_changed_ready: 0,
+      text_changed_ready: 0,
+      changed_ready: 0,
+      regeneratable: 0,
+      saved: 0,
+      orphan_clips: 0,
+    },
+    states: {},
+    diagnostics: {},
+    candidates: {},
+    synthesisPreviews: {},
+    speakers: [],
+    identityGroups: [],
+    demographics: [],
+    effectiveBindings: [],
+    filterDlgs: [],
+    filterDonors: [],
+    filterLineStates: [],
+    linePage: 0,
+    lineSettings: {},
+    audioRevisions: {},
+    dirty: revisions(generationDomains),
+    applied: unappliedRevisions(generationDomains),
     epochs: revisions(generationDomains),
   };
 }
@@ -309,8 +348,8 @@ export function invalidateGeneration(...domains: GenerationCacheDomain[]): void 
 
 /**
  * True when the Generation screen must refetch `domain` from the backend.
- * Warm tab hops skip when the domain was applied at the current dirty revision
- * (and critical has been loaded at least once). Pass `force` for explicit Refresh.
+ * Critical (paged list) always refreshes on mount so filter/page data stays live;
+ * metadata may skip when dirty revision still matches applied.
  */
 export function generationDomainNeedsRefresh(
   domain: GenerationCacheDomain,
@@ -318,7 +357,7 @@ export function generationDomainNeedsRefresh(
 ): boolean {
   if (opts?.force) return true;
   const c = get(results).generation;
-  if (domain === "critical" && !c.linesLoaded) return true;
+  if (domain === "critical") return true;
   return c.dirty[domain] !== c.applied[domain];
 }
 

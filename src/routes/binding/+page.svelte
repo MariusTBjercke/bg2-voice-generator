@@ -23,12 +23,14 @@
   import Pager from "$lib/components/Pager.svelte";
   import SearchFilterBar from "$lib/components/SearchFilterBar.svelte";
   import SearchableSelect from "$lib/components/SearchableSelect.svelte";
-  import { filterItems, type FilterConfig, type FilterValues } from "$lib/filters";
+  import { filterItems, sortItems, resolveSort, sortOptionsFromSpecs, type FilterConfig, type FilterValues, type SortSpec } from "$lib/filters";
+  import { localeText, numberDesc, thenBy } from "$lib/filters/sort";
   import {
     defaultVoiceLibraryFilter,
-    sortVoiceLibraryProfiles,
     voiceLibraryFilterConfig,
+    voiceLibrarySortSpecs,
     VOICE_LIBRARY_PAGE_SIZE,
+    VOICE_LIBRARY_SORT_DEFAULT,
   } from "$lib/filters/voiceLibrary";
   import {
     ensureFiltersGameDir,
@@ -62,7 +64,7 @@
     groupHasDemographicMismatch,
     rankCrossDemographicDonors,
   } from "$lib/speakers/demographics";
-  import { bestApprovedSampleForBinding, groupSamplesBySoundResref, formatSoundSampleOptionLabel, pickSampleIdForSoundGroup } from "$lib/speakers/samples";
+  import { bestApprovedSampleForBinding, groupSamplesBySoundResref, formatSoundSampleOptionLabel, pickSampleIdForSoundGroup, usageForSound } from "$lib/speakers/samples";
   import { invalidateSpeakerGroups, loadSpeakerGroups } from "$lib/stores/speakerGroups";
   import { progress } from "$lib/stores/progress";
   import type {
@@ -88,7 +90,9 @@
     SetSpeakerGroupExcludedResult,
     SpeakerGroup,
     Speaker,
+    SoundResrefUsageEntry,
     VoiceProfile,
+    VoiceProfileUsageEntry,
     ImportedVoiceClipInput,
     DesignVoiceAttributes,
     DesignedVoiceCandidate,
@@ -147,6 +151,10 @@
   let speakers = $state<Speaker[]>([]);
   let identityGroups = $state<SpeakerGroup[]>([]);
   let selected = $state<SpeakerGroup | null>(null);
+  let expandedUsage = $state<Record<string, boolean>>({});
+  let soundUsageByResref = $state<Map<string, SoundResrefUsageEntry>>(new Map());
+  let expandedProfileUsage = $state<Record<number, boolean>>({});
+  let profileUsageById = $state<Map<number, VoiceProfileUsageEntry>>(new Map());
   let selectedKey = $state<string | null>(null);
   let loadingSamples = $state(false);
   let binding = $state(false);
@@ -219,6 +227,7 @@
   let expandedGroupDataKey = $state<string | null>(null);
   let groupPage = $state(0);
   let groupFilter = $state("");
+  let groupSort = $state("label_asc");
   let donorPickId = $state<number | "">("");
   let suggestingDonors = $state(false);
   let applyingMetadata = $state(false);
@@ -260,11 +269,18 @@
   const harvestedVoiceCount = $derived(
     voiceProfiles.filter((profile) => profile.origin === "harvested").length,
   );
+  const librarySortOptions = $derived(sortOptionsFromSpecs(voiceLibrarySortSpecs));
   const filteredVoiceProfiles = $derived(
-    filterItems(sortVoiceLibraryProfiles(voiceProfiles), voiceLibraryFilterConfig, libraryFilterValues),
+    filterItems(voiceProfiles, voiceLibraryFilterConfig, libraryFilterValues),
+  );
+  const sortedVoiceProfiles = $derived(
+    sortItems(
+      filteredVoiceProfiles,
+      resolveSort(voiceLibrarySortSpecs, libraryFilterValues.sort ?? VOICE_LIBRARY_SORT_DEFAULT),
+    ),
   );
   const pagedVoiceProfiles = $derived(
-    filteredVoiceProfiles.slice(
+    sortedVoiceProfiles.slice(
       libraryPage * VOICE_LIBRARY_PAGE_SIZE,
       (libraryPage + 1) * VOICE_LIBRARY_PAGE_SIZE,
     ),
@@ -656,6 +672,40 @@
     finally { libraryLoading = false; }
   }
 
+  async function loadVoiceProfileUsage() {
+    if (!dir) return;
+    try {
+      const rows = await invoke<VoiceProfileUsageEntry[]>("list_voice_profile_usage", {
+        gameDir: dir,
+      });
+      const next = new Map<number, VoiceProfileUsageEntry>();
+      for (const row of rows) next.set(row.voice_profile_id, row);
+      profileUsageById = next;
+    } catch {
+      // Best-effort: usage badges are informational only.
+    }
+  }
+
+  function toggleProfileUsageExpand(profileId: number) {
+    expandedProfileUsage = {
+      ...expandedProfileUsage,
+      [profileId]: !expandedProfileUsage[profileId],
+    };
+  }
+
+  function profileUsageSummary(usage: VoiceProfileUsageEntry): string {
+    const parts: string[] = [];
+    if (usage.character_count > 0) {
+      parts.push(
+        `Used by ${usage.character_count} character${usage.character_count === 1 ? "" : "s"}`,
+      );
+    }
+    if (usage.pool_count > 0) {
+      parts.push(`in ${usage.pool_count} pool${usage.pool_count === 1 ? "" : "s"}`);
+    }
+    return parts.join(" · ");
+  }
+
   async function chooseImportedClips() {
     try {
       const paths = await invoke<string[]>("select_voice_reference_files");
@@ -673,7 +723,7 @@
         gameDir: dir, displayName: importName, clips: importClips,
       });
       importName = ""; importClips = [];
-      await loadVoiceProfiles();
+      await Promise.all([loadVoiceProfiles(), loadVoiceProfileUsage()]);
     } catch (e) { error = String(e); }
     finally { libraryBusy = false; }
   }
@@ -701,7 +751,7 @@
         text: designText, attributes: designAttributes,
       });
       designName = ""; designCandidates = []; selectedDesignPreview = null;
-      await loadVoiceProfiles();
+      await Promise.all([loadVoiceProfiles(), loadVoiceProfileUsage()]);
     } catch (e) { error = String(e); }
     finally { libraryBusy = false; }
   }
@@ -738,7 +788,7 @@
       await invoke<DeleteVoiceProfileResult>("delete_voice_profile", {
         gameDir: dir, voiceProfileId: profile.id, dryRun: false,
       });
-      await Promise.all([loadVoiceProfiles(), loadClones(), loadDemographics()]);
+      await Promise.all([loadVoiceProfiles(), loadVoiceProfileUsage(), loadClones(), loadDemographics()]);
       invalidateGeneration("critical", "metadata");
     } catch (e) { error = String(e); }
   }
@@ -764,6 +814,7 @@
     try {
       await invoke<void>("add_metadata_profile", { gameDir: dir, sex: g.sex, race: g.race, creatureCategory: g.creature_category, voiceProfileId: profilePoolPick });
       profilePoolPick = ""; await loadDemographics({ silent: true }); await reloadEligibleDonors(g); await afterPoolChange();
+      await loadVoiceProfileUsage();
     } catch (e) { error = String(e); }
   }
 
@@ -772,6 +823,7 @@
     try {
       await invoke<void>("remove_metadata_profile", { gameDir: dir, sex: g.sex, race: g.race, creatureCategory: g.creature_category, voiceProfileId: profileId });
       await loadDemographics({ silent: true }); await reloadEligibleDonors(g); await afterPoolChange();
+      await loadVoiceProfileUsage();
     } catch (e) { error = String(e); }
   }
 
@@ -781,7 +833,7 @@
     try {
       await invoke<VoiceProfile>("bind_speaker_voice_profile", { gameDir: dir, speakerId: representativeSpeakerId, voiceProfileId: speakerProfilePick });
       speakerProfilePick = "";
-      await Promise.all([loadClones(), loadDemographics(), loadSpeakersWithLines()]);
+      await Promise.all([loadClones(), loadDemographics(), loadSpeakersWithLines(), loadVoiceProfileUsage()]);
       invalidateGeneration("critical", "metadata");
     } catch (e) { error = String(e); }
     finally { binding = false; }
@@ -799,8 +851,28 @@
     }),
   );
 
+  const demographicSortSpecs: SortSpec<DemographicGroup>[] = [
+    {
+      key: "label_asc",
+      label: "Name A–Z",
+      compare: (a, b) => localeText(groupLabel(a), groupLabel(b)),
+    },
+    {
+      key: "member_count_desc",
+      label: "Most speakers",
+      compare: thenBy(
+        (a, b) => numberDesc(a.speaker_count, b.speaker_count),
+        (a, b) => localeText(groupLabel(a), groupLabel(b)),
+      ),
+    },
+  ];
+  const demographicSortOptions = $derived(sortOptionsFromSpecs(demographicSortSpecs));
+  const sortedDemographicGroups = $derived(
+    sortItems(filteredDemographicGroups, resolveSort(demographicSortSpecs, groupSort)),
+  );
+
   const pagedDemographicGroups = $derived(
-    filteredDemographicGroups.slice(groupPage * GROUP_PAGE_SIZE, (groupPage + 1) * GROUP_PAGE_SIZE),
+    sortedDemographicGroups.slice(groupPage * GROUP_PAGE_SIZE, (groupPage + 1) * GROUP_PAGE_SIZE),
   );
 
   function repSpeakerForGroup(g: SpeakerGroup): Speaker | undefined {
@@ -873,6 +945,7 @@
     selectedKey = preferences.selectedIdentityKey;
     skipGroupPageReset = true;
     groupFilter = preferences.demographicSearch;
+    groupSort = preferences.demographicSort || "label_asc";
     groupPage = preferences.demographicGroupPage;
     previewText = preferences.previewText;
     previewA = freshPreviewSlot(preferences.previewA.settingsSource, preferences.previewA.reference);
@@ -888,6 +961,7 @@
       expandedGroupKey,
       selectedIdentityKey: selected?.identity_key ?? selectedKey,
       demographicSearch: groupFilter,
+      demographicSort: groupSort,
       demographicGroupPage: groupPage,
       previewText,
       previewA: { settingsSource: previewA.settingsSource, reference: previewA.reference },
@@ -1074,7 +1148,7 @@
   /** Queue every playable effective voice in the current filtered character list. */
   async function playFilteredEffectiveVoices() {
     if (!audio) return;
-    const queue = filteredIdentityGroups
+    const queue = sortedIdentityGroups
       .map((g) => {
         const rep = repSpeakerForGroup(g);
         return rep ? effectiveBySpeaker[rep.id] : undefined;
@@ -1127,7 +1201,11 @@
     [VOICE_MATCH_FACET]: "all",
     [DEMO_MATCH_FACET]: "all",
   };
-  let filterValues = $state<FilterValues>({ search: "", facets: { ...defaultIdentityFacets } });
+  let filterValues = $state<FilterValues>({
+    search: "",
+    facets: { ...defaultIdentityFacets },
+    sort: "name_asc",
+  });
   // Guards the filter write-back so the initial default never clobbers a saved filter
   // before hydration restores it (same pattern as Harvest/Attribution/Generation).
   let filtersHydrated = $state(false);
@@ -1136,6 +1214,44 @@
     const rep = repSpeakerForGroup(g);
     return rep ? effectiveBySpeaker[rep.id] : undefined;
   }
+
+  const identitySortSpecs: SortSpec<SpeakerGroup>[] = [
+    {
+      key: "name_asc",
+      label: "Name A–Z",
+      compare: (a, b) => localeText(a.display_name, b.display_name),
+    },
+    {
+      key: "lines_desc",
+      label: "Most lines",
+      compare: thenBy(
+        (a, b) => numberDesc(a.line_count, b.line_count),
+        (a, b) => localeText(a.display_name, b.display_name),
+      ),
+    },
+    {
+      key: "binding_gap",
+      label: "Needs binding first",
+      compare: thenBy(
+        (a, b) => {
+          const aGap = Number(!a.excluded && groupCloneStatusOf(a) === "unbound");
+          const bGap = Number(!b.excluded && groupCloneStatusOf(b) === "unbound");
+          return bGap - aGap;
+        },
+        (a, b) => localeText(a.display_name, b.display_name),
+      ),
+    },
+    {
+      key: "clone_failed",
+      label: "Failed first",
+      compare: thenBy(
+        (a, b) =>
+          Number(groupCloneStatusOf(b) === "failed") - Number(groupCloneStatusOf(a) === "failed"),
+        (a, b) => localeText(a.display_name, b.display_name),
+      ),
+    },
+  ];
+  const identitySortOptions = $derived(sortOptionsFromSpecs(identitySortSpecs));
 
   const identityFilterConfig = $derived.by((): FilterConfig<SpeakerGroup> => ({
     textPlaceholder: "character name or resref…",
@@ -1222,7 +1338,11 @@
     ensureFiltersGameDir(dir);
     const saved = getSavedFilter(get(filterCache), "bindingLibrary");
     libraryFilterValues = saved
-      ? { search: saved.search, facets: { ...defaultVoiceLibraryFilter().facets, ...saved.facets } }
+      ? {
+          search: saved.search,
+          facets: { ...defaultVoiceLibraryFilter().facets, ...saved.facets },
+          sort: saved.sort ?? VOICE_LIBRARY_SORT_DEFAULT,
+        }
       : defaultVoiceLibraryFilter();
     libraryFiltersHydrated = true;
   });
@@ -1230,6 +1350,7 @@
     const snapshot = {
       search: libraryFilterValues.search,
       facets: { ...libraryFilterValues.facets },
+      sort: libraryFilterValues.sort ?? VOICE_LIBRARY_SORT_DEFAULT,
     };
     if (!libraryFiltersHydrated) return;
     setSavedFilter("bindingLibrary", snapshot);
@@ -1237,6 +1358,7 @@
   $effect(() => {
     void libraryFilterValues.search;
     void JSON.stringify(libraryFilterValues.facets);
+    void libraryFilterValues.sort;
     libraryPage = 0;
   });
   // Filter persistence across tab navigation + restarts: restore this screen's
@@ -1249,17 +1371,25 @@
       filterValues = {
         search: saved.search,
         facets: { ...defaultIdentityFacets, ...saved.facets },
+        sort: saved.sort ?? "name_asc",
       };
     }
     filtersHydrated = true;
   });
   $effect(() => {
-    const snapshot = { search: filterValues.search, facets: { ...filterValues.facets } };
+    const snapshot = {
+      search: filterValues.search,
+      facets: { ...filterValues.facets },
+      sort: filterValues.sort ?? "name_asc",
+    };
     if (!filtersHydrated) return;
     setSavedFilter("binding", snapshot);
   });
   const filteredIdentityGroups = $derived(
     filterItems(identityGroups, identityFilterConfig, filterValues),
+  );
+  const sortedIdentityGroups = $derived(
+    sortItems(filteredIdentityGroups, resolveSort(identitySortSpecs, filterValues.sort)),
   );
   const genderMismatchGroups = $derived(
     identityGroups.filter(
@@ -1269,10 +1399,10 @@
     ),
   );
   const playableFilteredCount = $derived(
-    filteredIdentityGroups.filter((g) => canPlayEffective(effectiveForGroup(g))).length,
+    sortedIdentityGroups.filter((g) => canPlayEffective(effectiveForGroup(g))).length,
   );
   const pagedIdentityGroups = $derived(
-    filteredIdentityGroups.slice(
+    sortedIdentityGroups.slice(
       speakerPage * SPEAKER_PAGE_SIZE,
       (speakerPage + 1) * SPEAKER_PAGE_SIZE,
     ),
@@ -1287,6 +1417,7 @@
   $effect(() => {
     void filterValues.search;
     void JSON.stringify(filterValues.facets);
+    void filterValues.sort;
     speakerPage = 0;
   });
 
@@ -1299,6 +1430,7 @@
         [STATUS_FACET]: "all",
         [VOICE_MATCH_FACET]: "mismatch",
       },
+      sort: filterValues.sort ?? "name_asc",
     };
     charactersListOpen = true;
   }
@@ -1331,12 +1463,38 @@
     }
   }
 
+  async function loadSoundUsage() {
+    if (!dir) return;
+    try {
+      const rows = await invoke<SoundResrefUsageEntry[]>("list_sound_resref_usage", {
+        gameDir: dir,
+      });
+      const next = new Map<string, SoundResrefUsageEntry>();
+      for (const row of rows) {
+        next.set(row.source_sound_resref.trim().toLowerCase(), row);
+      }
+      soundUsageByResref = next;
+    } catch {
+      // Best-effort: usage badges are informational only.
+    }
+  }
+
+  function toggleUsageExpand(soundResref: string) {
+    expandedUsage = { ...expandedUsage, [soundResref]: !expandedUsage[soundResref] };
+  }
+
+  function jumpToUsageCharacter(identityKey: string) {
+    const match = findGroupByIdentityParam(identityGroups, identityKey);
+    if (match) void selectGroup(match);
+  }
+
   function applyIdentityDeepLink(match: SpeakerGroup) {
     const statusAll = filterValues.facets[STATUS_FACET] === "all";
     if (filterValues.search !== match.display_name || !statusAll) {
       filterValues = {
         search: match.display_name,
         facets: { ...filterValues.facets, [STATUS_FACET]: "all" },
+        sort: filterValues.sort ?? "name_asc",
       };
     }
     const strip = () =>
@@ -1413,6 +1571,7 @@
   async function selectGroup(g: SpeakerGroup) {
     selected = g;
     selectedKey = g.identity_key;
+    expandedUsage = {};
     error = null;
     tuningNotice = null;
     const preferences = dir ? getInstallUiPreferences(dir).binding : null;
@@ -1630,6 +1789,8 @@
         loadSpeakersWithLines(),
         loadVoiceProfiles(),
         loadDemographics(),
+        loadSoundUsage(),
+        loadVoiceProfileUsage(),
       ]);
     } catch (e) {
       error = String(e);
@@ -1689,6 +1850,8 @@
         loadSpeakersWithLines(),
         loadVoiceProfiles(),
         loadDemographics(),
+        loadSoundUsage(),
+        loadVoiceProfileUsage(),
       ]);
       invalidateGeneration("critical", "metadata");
     } catch (e) {
@@ -2033,6 +2196,8 @@
       void loadSpeakersWithLines();
       void loadDemographics();
       void loadVoiceProfiles();
+      void loadSoundUsage();
+      void loadVoiceProfileUsage();
     }
   });
 
@@ -2058,6 +2223,7 @@
 
   $effect(() => {
     void groupFilter;
+    void groupSort;
     if (skipGroupPageReset) {
       skipGroupPageReset = false;
       return;
@@ -2159,20 +2325,24 @@
             config={voiceLibraryFilterConfig}
             items={voiceProfiles}
             bind:values={libraryFilterValues}
-            shown={filteredVoiceProfiles.length}
+            shown={sortedVoiceProfiles.length}
             total={voiceProfiles.length}
             label="voices"
+            sortOptions={librarySortOptions}
+            defaultSort={VOICE_LIBRARY_SORT_DEFAULT}
           />
           {#if libraryLoading}
             <p class="hint">Loading voice profiles…</p>
           {:else if voiceProfiles.length === 0}
             <p class="hint">No reusable voices yet. Import or design a custom voice, or approve samples in Harvest.</p>
-          {:else if filteredVoiceProfiles.length === 0}
+          {:else if sortedVoiceProfiles.length === 0}
             <p class="hint">No voices match these library filters.</p>
           {:else}
             <ul class="profile-list">
               {#each pagedVoiceProfiles as profile (profile.id)}
                 {@const primaryReference = profilePrimaryReference(profile)}
+                {@const usage = profileUsageById.get(profile.id) ?? null}
+                {@const usageOpen = expandedProfileUsage[profile.id] ?? false}
                 <li class="profile-row">
                   <div class="profile-summary">
                     <div class="profile-name">
@@ -2200,6 +2370,46 @@
                       <Button variant="danger" onclick={() => deleteProfile(profile)}>Delete…</Button>
                     {/if}
                   </div>
+                  <div class="usage-row">
+                    {#if usage && (usage.character_count > 0 || usage.pool_count > 0)}
+                      <span class="sub usage-summary">{profileUsageSummary(usage)}</span>
+                      <button
+                        type="button"
+                        class="usage-expand"
+                        aria-expanded={usageOpen}
+                        aria-label={`${usageOpen ? "Collapse" : "Expand"} usage for ${profile.display_name}`}
+                        onclick={() => toggleProfileUsageExpand(profile.id)}
+                      >
+                        {usageOpen ? "▾" : "▸"}
+                      </button>
+                    {:else}
+                      <span class="sub usage-unused">Not bound to any characters or pools</span>
+                    {/if}
+                  </div>
+                  {#if usage && usageOpen}
+                    <ul class="sound-usage profile-usage">
+                      {#each usage.characters as ch (ch.identity_key)}
+                        <li class="sound-usage-row">
+                          <button
+                            type="button"
+                            class="usage-jump"
+                            onclick={() => jumpToUsageCharacter(ch.identity_key)}
+                          >
+                            {ch.display_name}
+                          </button>
+                          <span class="sub mono">{ch.cre_resref}</span>
+                          <StatusBadge tone={ch.clone_status === "ready" ? "success" : ch.clone_status === "failed" ? "danger" : "neutral"}
+                            >{ch.binding_source} · {ch.clone_status}</StatusBadge
+                          >
+                        </li>
+                      {/each}
+                      {#each usage.pools as pool (`${pool.sex}-${pool.race}-${pool.creature_category}`)}
+                        <li class="sound-usage-row">
+                          <span class="sub">Pool: {pool.sex_label} / {pool.race_label} / {pool.creature_category_label}</span>
+                        </li>
+                      {/each}
+                    </ul>
+                  {/if}
                   <details class="profile-details">
                     <summary>Reference details</summary>
                     {#if profile.design}
@@ -2226,7 +2436,7 @@
                 </li>
               {/each}
             </ul>
-            <Pager bind:page={libraryPage} total={filteredVoiceProfiles.length} pageSize={VOICE_LIBRARY_PAGE_SIZE} />
+            <Pager bind:page={libraryPage} total={sortedVoiceProfiles.length} pageSize={VOICE_LIBRARY_PAGE_SIZE} />
           {/if}
         </div>
       {/if}
@@ -2360,13 +2570,23 @@
             </p>
           {/if}
         {:else}
-          <input
-            class="group-search"
-            type="search"
-            placeholder="filter groups…"
-            bind:value={groupFilter}
-          />
-          {#if filteredDemographicGroups.length === 0}
+          <div class="group-tools">
+            <input
+              class="group-search"
+              type="search"
+              placeholder="filter groups…"
+              bind:value={groupFilter}
+            />
+            <label class="group-sort">
+              <span class="field-label">Sort</span>
+              <select aria-label="Sort demographic groups" bind:value={groupSort}>
+                {#each demographicSortOptions as option (option.key)}
+                  <option value={option.key}>{option.label}</option>
+                {/each}
+              </select>
+            </label>
+          </div>
+          {#if sortedDemographicGroups.length === 0}
             <p class="hint">No groups match the filter.</p>
           {:else}
             <ul class="groups">
@@ -2587,7 +2807,7 @@
             <Pager
               bind:page={groupPage}
               pageSize={GROUP_PAGE_SIZE}
-              total={filteredDemographicGroups.length}
+              total={sortedDemographicGroups.length}
               label="groups"
               compact
             />
@@ -2672,7 +2892,7 @@
             <h3 id="characters-list-heading">Characters ({identityGroups.length})</h3>
             {#if !charactersListOpen && identityGroups.length > 0}
               <span class="panel-summary">
-                {selected ? selected.display_name : `${filteredIdentityGroups.length} shown`}
+                {selected ? selected.display_name : `${sortedIdentityGroups.length} shown`}
               </span>
             {/if}
           </button>
@@ -2697,9 +2917,11 @@
             config={identityFilterConfig}
             items={identityGroups}
             bind:values={filterValues}
-            shown={filteredIdentityGroups.length}
+            shown={sortedIdentityGroups.length}
             total={identityGroups.length}
             label="characters"
+            sortOptions={identitySortOptions}
+            defaultSort="name_asc"
           >
             <Button
               variant="ghost"
@@ -2716,7 +2938,7 @@
               >
             {/if}
           </SearchFilterBar>
-          {#if filteredIdentityGroups.length === 0}
+          {#if sortedIdentityGroups.length === 0}
             <p class="hint">No characters match the current filter.</p>
           {:else}
             <ul class="speakers">
@@ -2783,7 +3005,7 @@
             <Pager
               bind:page={speakerPage}
               pageSize={SPEAKER_PAGE_SIZE}
-              total={filteredIdentityGroups.length}
+              total={sortedIdentityGroups.length}
               label="characters"
               compact
             />
@@ -2971,6 +3193,8 @@
                   {@const prov = provenanceOf(sample)}
                   {@const isBound = group.siblings.some((s) => s.id === boundSampleId)}
                   {@const multi = group.siblings.length > 1}
+                  {@const usage = usageForSound(soundUsageByResref, group.soundResref)}
+                  {@const usageOpen = expandedUsage[group.soundResref] ?? false}
                   <li class="pick" class:bound={isBound}>
                     <div class="pick-main">
                       <div class="pick-meta">
@@ -2989,8 +3213,54 @@
                           <span class="sub">{group.siblings.length} variants</span>
                         {/if}
                       </div>
+                      {#if usage}
+                        <div class="usage-row">
+                          <span class="sub usage-summary">
+                            Used by {usage.character_count} characters{#if usage.bound_character_count > 0}
+                              · {usage.bound_character_count} bound{/if}
+                          </span>
+                          <button
+                            type="button"
+                            class="usage-expand"
+                            aria-expanded={usageOpen}
+                            aria-label={`${usageOpen ? "Collapse" : "Expand"} characters using ${group.soundResref}`}
+                            onclick={() => toggleUsageExpand(group.soundResref)}
+                          >
+                            {usageOpen ? "▾" : "▸"}
+                          </button>
+                        </div>
+                      {/if}
                       {#if prov?.source_text}
                         <p class="pick-transcript sub">{prov.source_text}</p>
+                      {/if}
+                      {#if usage && usageOpen}
+                        <ul class="sound-usage">
+                          {#each usage.characters as ch (ch.identity_key)}
+                            <li class="sound-usage-row">
+                              <button
+                                type="button"
+                                class="usage-jump"
+                                onclick={() => jumpToUsageCharacter(ch.identity_key)}
+                              >
+                                {ch.display_name}
+                              </button>
+                              <span class="sub mono">{ch.cre_resref}</span>
+                              <StatusBadge
+                                tone={ch.decision === "approved"
+                                  ? "success"
+                                  : ch.decision === "rejected"
+                                    ? "danger"
+                                    : "neutral"}>{ch.decision}</StatusBadge
+                              >
+                              {#if ch.eligibility === "manual_only"}
+                                <StatusBadge tone="warn">manual only</StatusBadge>
+                              {/if}
+                              {#if ch.bound}
+                                <StatusBadge tone="success">bound</StatusBadge>
+                              {/if}
+                            </li>
+                          {/each}
+                        </ul>
                       {/if}
                       {#if audioError[sample.id]}
                         <p class="audio-error">{audioError[sample.id]}</p>
@@ -3651,15 +3921,42 @@
     font-size: 0.9rem;
     color: var(--text-muted);
   }
-  .group-search {
-    width: 100%;
+  .group-tools {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+    align-items: flex-end;
     margin-bottom: var(--space-3);
+  }
+  .group-search {
+    flex: 1 1 14rem;
+    min-width: 10rem;
+    margin-bottom: 0;
     padding: var(--space-2) var(--space-3);
     border-radius: var(--radius-sm);
     border: 1px solid var(--border);
     background: var(--panel-2);
     color: var(--text);
     font: inherit;
+  }
+  .group-sort {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    flex: 0 1 12rem;
+    min-width: 9rem;
+  }
+  .group-sort .field-label {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+  }
+  .group-sort select {
+    font: inherit;
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: var(--space-1) var(--space-2);
   }
   .groups {
     list-style: none;
@@ -3998,7 +4295,7 @@
   }
   .pick {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
     gap: var(--space-4);
     border: 1px solid var(--border);
@@ -4020,6 +4317,62 @@
     align-items: center;
     gap: var(--space-3);
     flex-wrap: wrap;
+  }
+  .usage-summary {
+    color: var(--accent);
+  }
+  .usage-unused {
+    color: var(--text-muted);
+  }
+  .usage-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+  }
+  .profile-usage {
+    margin-top: 0;
+    margin-bottom: var(--space-2);
+  }
+  .usage-expand {
+    font: inherit;
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    padding: 0 var(--space-1);
+    line-height: 1;
+  }
+  .usage-expand:hover {
+    color: var(--text);
+  }
+  .sound-usage {
+    list-style: none;
+    margin: var(--space-1) 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+  .sound-usage-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+    font-size: 0.85rem;
+  }
+  .usage-jump {
+    font: inherit;
+    background: transparent;
+    color: var(--accent);
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .usage-jump:hover {
+    color: var(--text);
   }
   .pick-transcript {
     margin: 0;

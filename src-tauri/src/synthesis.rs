@@ -423,6 +423,126 @@ pub fn shared_line_count(conn: &Connection, source_text: &str) -> Result<usize, 
     )? as usize)
 }
 
+/// Resolve synthesis previews for many lines with rules loaded once.
+pub fn list_line_synthesis_previews(
+    conn: &Connection,
+    line_ids: &[i64],
+    mapper_enabled: bool,
+) -> Result<Vec<crate::models::LineSynthesisPreviewRow>, AppError> {
+    use crate::models::{LineSynthesisPreviewRow, SynthesisPreview, SynthesisTextSource};
+
+    if line_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let reps = crate::extractor::token_resolve::read_token_replacements(conn)?;
+    let dictionary_rules = crate::dictionary::load_enabled_rules(conn)?;
+    let tag_rules = crate::tag_rules::load_enabled_rules(conn)?;
+
+    let placeholders = (0..line_ids.len())
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id, text, original_text FROM line WHERE id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(line_ids.iter().copied()), |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut by_id: std::collections::HashMap<i64, (String, String)> =
+        std::collections::HashMap::with_capacity(rows.len());
+    for (id, text, original) in rows {
+        by_id.insert(id, (text, original));
+    }
+
+    let mut display_by_line: Vec<(i64, String)> = Vec::with_capacity(line_ids.len());
+    for id in line_ids {
+        let Some((stored, original)) = by_id.get(id) else {
+            continue;
+        };
+        let display = crate::extractor::token_resolve::effective_spoken_text(
+            original, stored, &reps,
+        );
+        display_by_line.push((*id, display));
+    }
+
+    let unique_displays: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        display_by_line
+            .iter()
+            .map(|(_, d)| d.trim().to_string())
+            .filter(|d| seen.insert(d.clone()))
+            .collect()
+    };
+    let mut shared_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::with_capacity(unique_displays.len());
+    if !unique_displays.is_empty() {
+        let ph = (0..unique_displays.len())
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let count_sql = format!(
+            "SELECT trim(text), count(*) FROM line WHERE trim(text) IN ({ph}) GROUP BY trim(text)"
+        );
+        let mut count_stmt = conn.prepare(&count_sql)?;
+        for row in count_stmt.query_map(
+            rusqlite::params_from_iter(unique_displays.iter()),
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize)),
+        )? {
+            let (text, count) = row?;
+            shared_counts.insert(text, count);
+        }
+    }
+
+    let mut out = Vec::with_capacity(display_by_line.len());
+    for (line_id, display_text) in display_by_line {
+        let resolved = if let Some(text) = stored_override(conn, &display_text)? {
+            ResolvedSynthesisText {
+                text,
+                source: SynthesisTextSource::Override,
+                applied_rules: vec![],
+                applied_tag_rules: vec![],
+            }
+        } else {
+            let (text, applied_rules, applied_tag_rules) =
+                mapped_with_rules(&display_text, mapper_enabled, &dictionary_rules, &tag_rules);
+            ResolvedSynthesisText {
+                text,
+                source: if mapper_enabled {
+                    SynthesisTextSource::Mapper
+                } else {
+                    SynthesisTextSource::Plain
+                },
+                applied_rules,
+                applied_tag_rules,
+            }
+        };
+        let shared_line_count = shared_counts
+            .get(display_text.trim())
+            .copied()
+            .unwrap_or(1);
+        out.push(LineSynthesisPreviewRow {
+            line_id,
+            preview: SynthesisPreview {
+                shared_line_count,
+                display_text,
+                resolved_text: resolved.text,
+                source: resolved.source,
+                applied_rules: resolved.applied_rules,
+                applied_tag_rules: resolved.applied_tag_rules,
+            },
+        });
+    }
+    Ok(out)
+}
+
 fn project_texts(conn: &Connection, project_id: Option<i64>) -> Result<Vec<String>, AppError> {
     let sql = if project_id.is_some() {
         "SELECT DISTINCT trim(text) FROM line WHERE project_id=?1 AND trim(text)<>''"

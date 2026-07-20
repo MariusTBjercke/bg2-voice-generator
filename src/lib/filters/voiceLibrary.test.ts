@@ -51,9 +51,13 @@ const rows = [
 ];
 
 describe("voice library filters", () => {
-  test("defaults to the combined imported and designed custom origin", () => {
+  test("defaults to custom origin and exposes a Sort control", () => {
     const values = defaultVoiceLibraryFilter();
-    expect(values).toEqual({ search: "", facets: { origin: "custom", availability: "all" } });
+    expect(values).toEqual({
+      search: "",
+      facets: { origin: "custom", availability: "all" },
+      sort: "library_default",
+    });
     expect(filterItems(rows, voiceLibraryFilterConfig, values).map((row) => row.id)).toEqual([1, 2, 4]);
   });
 

@@ -233,6 +233,7 @@ pub async fn list_blocked_lines_page(
     limit: Option<usize>,
     query: Option<String>,
     reason: Option<String>,
+    sort: Option<String>,
 ) -> Result<BlockedLinesPage, AppError> {
     let path = state.db_path();
     tokio::task::spawn_blocking(move || {
@@ -271,13 +272,42 @@ pub async fn list_blocked_lines_page(
         });
         let offset = offset.unwrap_or(0);
         let limit = limit.unwrap_or(100).clamp(1, 200);
-        let all = filtered.collect::<Vec<_>>();
+        let mut all = filtered.collect::<Vec<_>>();
+        sort_blocked_lines(&mut all, sort.as_deref().unwrap_or("dlg_state"));
         let total = all.len();
         let rows = all.into_iter().skip(offset).take(limit).collect();
         Ok(BlockedLinesPage { rows, total, token_total })
     })
     .await
     .map_err(|e| AppError::Other(format!("blocked-line read task failed: {e}")))?
+}
+
+fn dlg_state_key(line: &Line) -> (String, i64, i64) {
+    (
+        line.dlg_resref.clone().unwrap_or_default(),
+        line.state_index.unwrap_or(i64::MAX),
+        line.strref,
+    )
+}
+
+fn sort_blocked_lines(rows: &mut [Line], sort: &str) {
+    match sort {
+        "strref_asc" => rows.sort_by_key(|line| line.strref),
+        "strref_desc" => rows.sort_by_key(|line| std::cmp::Reverse(line.strref)),
+        "text_asc" => rows.sort_by(|a, b| {
+            a.text.to_lowercase().cmp(&b.text.to_lowercase()).then_with(|| dlg_state_key(a).cmp(&dlg_state_key(b)))
+        }),
+        "text_desc" => rows.sort_by(|a, b| {
+            b.text.to_lowercase().cmp(&a.text.to_lowercase()).then_with(|| dlg_state_key(a).cmp(&dlg_state_key(b)))
+        }),
+        "reason" => rows.sort_by(|a, b| {
+            blocked_reason(a)
+                .cmp(blocked_reason(b))
+                .then_with(|| dlg_state_key(a).cmp(&dlg_state_key(b)))
+        }),
+        // "dlg_state" and unknown keys
+        _ => rows.sort_by_key(dlg_state_key),
+    }
 }
 
 /// Re-run token stand-ins on every tokenized line in the project, using the current
@@ -328,6 +358,7 @@ fn ensure_project(
 mod tests {
     use super::*;
     use crate::db::schema;
+    use crate::models::LineStatus;
     use rusqlite::Connection;
 
     fn mem_db() -> Connection {
@@ -344,5 +375,54 @@ mod tests {
         assert_eq!(a, b, "same game_dir must reuse the project row");
         let c = ensure_project(&conn, r"D:\Other", None).unwrap();
         assert_ne!(a, c, "a different game_dir gets a new project");
+    }
+
+    fn sample_line(id: i64, strref: i64, dlg: &str, state: i64, text: &str, has_tokens: bool) -> Line {
+        Line {
+            id,
+            project_id: 1,
+            strref,
+            dlg_resref: Some(dlg.into()),
+            state_index: Some(state),
+            text: text.into(),
+            original_text: String::new(),
+            flags: 0,
+            existing_sound_resref: None,
+            kind: LineKind::State,
+            is_voiced: false,
+            has_tokens,
+            token_mask: 0,
+            shared_group_id: None,
+            speaker_id: None,
+            attribution_confidence: 0.0,
+            status: LineStatus::Blocked,
+        }
+    }
+
+    #[test]
+    fn sort_blocked_lines_orders_by_requested_key() {
+        let mut rows = vec![
+            sample_line(1, 300, "zdialog", 1, "Zebra", false),
+            sample_line(2, 100, "adialog", 2, "Apple", true),
+            sample_line(3, 200, "adialog", 1, "Mango", false),
+        ];
+        sort_blocked_lines(&mut rows, "strref_asc");
+        assert_eq!(rows.iter().map(|l| l.strref).collect::<Vec<_>>(), vec![100, 200, 300]);
+
+        sort_blocked_lines(&mut rows, "text_asc");
+        assert_eq!(
+            rows.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+            vec!["Apple", "Mango", "Zebra"]
+        );
+
+        sort_blocked_lines(&mut rows, "reason");
+        assert_eq!(blocked_reason(&rows[0]), "dynamic token");
+        assert_eq!(rows[0].strref, 100);
+
+        sort_blocked_lines(&mut rows, "dlg_state");
+        assert_eq!(
+            rows.iter().map(|l| (l.dlg_resref.as_deref(), l.state_index)).collect::<Vec<_>>(),
+            vec![(Some("adialog"), Some(1)), (Some("adialog"), Some(2)), (Some("zdialog"), Some(1))]
+        );
     }
 }

@@ -23,6 +23,7 @@
     TagRulesPreview,
     TagRuleWriteResult,
   } from "$lib/types";
+  import { localeText, resolveSort, sortItems, sortOptionsFromSpecs, type SortSpec } from "$lib/filters";
 
   let tab = $state<DictionaryTab>("placeholders");
   let rules = $state<DictionaryRule[]>([]);
@@ -34,6 +35,8 @@
   let note = $state<string | null>(null);
   let search = $state("");
   let tagSearch = $state("");
+  let pronunciationSort = $state("find_asc");
+  let tagSort = $state("find_asc");
   let testText = $state("B-b-b-but... I... I... wwaaAAAAHHHH!");
   let tagTestText = $state("Bah! *sigh* This is annoying.");
   let preview = $state<DictionaryPreview | null>(null);
@@ -47,6 +50,43 @@
   let tagEditMatch = $state<TagMatchKind>("whole_word");
   let preferencesHydrated = $state(false);
 
+  const pronunciationSortSpecs: SortSpec<DictionaryRule>[] = [
+    {
+      key: "find_asc",
+      label: "Find text A–Z",
+      compare: (a, b) => localeText(a.find_text, b.find_text),
+    },
+    {
+      key: "replacement_asc",
+      label: "Speak-as A–Z",
+      compare: (a, b) => localeText(a.speak_as, b.speak_as) || localeText(a.find_text, b.find_text),
+    },
+    {
+      key: "enabled_first",
+      label: "Enabled first",
+      compare: (a, b) => Number(b.enabled) - Number(a.enabled) || localeText(a.find_text, b.find_text),
+    },
+  ];
+  const tagSortSpecs: SortSpec<TagRule>[] = [
+    {
+      key: "find_asc",
+      label: "Find text A–Z",
+      compare: (a, b) => localeText(a.find_text, b.find_text),
+    },
+    {
+      key: "replacement_asc",
+      label: "Tag A–Z",
+      compare: (a, b) => localeText(a.tag, b.tag) || localeText(a.find_text, b.find_text),
+    },
+    {
+      key: "enabled_first",
+      label: "Enabled first",
+      compare: (a, b) => Number(b.enabled) - Number(a.enabled) || localeText(a.find_text, b.find_text),
+    },
+  ];
+  const pronunciationSortOptions = $derived(sortOptionsFromSpecs(pronunciationSortSpecs));
+  const tagSortOptions = $derived(sortOptionsFromSpecs(tagSortSpecs));
+
   const enabledCount = $derived(rules.filter((rule) => rule.enabled).length);
   const tagEnabledCount = $derived(tagRules.filter((rule) => rule.enabled).length);
   const filteredRules = $derived(
@@ -59,6 +99,9 @@
       );
     }),
   );
+  const sortedRules = $derived(
+    sortItems(filteredRules, resolveSort(pronunciationSortSpecs, pronunciationSort)),
+  );
   const filteredTagRules = $derived(
     tagRules.filter((rule) => {
       const query = tagSearch.trim().toLowerCase();
@@ -70,12 +113,17 @@
       );
     }),
   );
+  const sortedTagRules = $derived(
+    sortItems(filteredTagRules, resolveSort(tagSortSpecs, tagSort)),
+  );
 
   onMount(async () => {
     const preferences = get(uiPreferences).dictionary;
     tab = preferences.tab;
     search = preferences.pronunciationSearch;
     tagSearch = preferences.tagSearch;
+    pronunciationSort = preferences.pronunciationSort || "find_asc";
+    tagSort = preferences.tagSort || "find_asc";
     testText = preferences.pronunciationTestText;
     tagTestText = preferences.tagTestText;
     preferencesHydrated = true;
@@ -83,13 +131,23 @@
   });
 
   $effect(() => {
-    const snapshot = { tab, search, tagSearch, testText, tagTestText };
+    const snapshot = {
+      tab,
+      search,
+      tagSearch,
+      pronunciationSort,
+      tagSort,
+      testText,
+      tagTestText,
+    };
     if (!preferencesHydrated) return;
     updateDictionaryUiPreferences((current) => ({
       ...current,
       tab: snapshot.tab,
       pronunciationSearch: snapshot.search,
       tagSearch: snapshot.tagSearch,
+      pronunciationSort: snapshot.pronunciationSort,
+      tagSort: snapshot.tagSort,
       pronunciationTestText: snapshot.testText,
       tagTestText: snapshot.tagTestText,
     }));
@@ -404,6 +462,14 @@
       <Card>
         <div class="toolbar">
           <input class="search" aria-label="Search rules" placeholder="Search rules…" bind:value={search} />
+          <label class="sort-field">
+            <span class="field-label">Sort</span>
+            <select aria-label="Sort pronunciation rules" bind:value={pronunciationSort}>
+              {#each pronunciationSortOptions as option (option.key)}
+                <option value={option.key}>{option.label}</option>
+              {/each}
+            </select>
+          </label>
           <Button variant="ghost" onclick={resetDefaults} disabled={busy}>Reset defaults</Button>
           <Button onclick={startAdd} disabled={busy}>+ Add rule</Button>
         </div>
@@ -422,7 +488,7 @@
 
         <div class="rule-table">
           <div class="rule-head"><span>Find</span><span>Speak as</span><span>Match</span><span>Enabled</span><span>Actions</span></div>
-          {#each filteredRules as rule (rule.id)}
+          {#each sortedRules as rule (rule.id)}
             <div class="rule-row">
               <span>{rule.find_text}{#if rule.is_default}<small>default</small>{/if}</span>
               <span>{rule.speak_as}</span>
@@ -486,6 +552,14 @@
     <Card>
       <div class="toolbar">
         <input class="search" aria-label="Search tag rules" placeholder="Search tag rules…" bind:value={tagSearch} />
+        <label class="sort-field">
+          <span class="field-label">Sort</span>
+          <select aria-label="Sort tag rules" bind:value={tagSort}>
+            {#each tagSortOptions as option (option.key)}
+              <option value={option.key}>{option.label}</option>
+            {/each}
+          </select>
+        </label>
         <Button variant="ghost" onclick={resetTagDefaults} disabled={busy}>Reset defaults</Button>
         <Button onclick={startAddTag} disabled={busy}>+ Add tag rule</Button>
       </div>
@@ -517,7 +591,7 @@
 
       <div class="rule-table tag-table">
         <div class="rule-head"><span>Find</span><span>Tag</span><span>Match</span><span>Enabled</span><span>Actions</span></div>
-        {#each filteredTagRules as rule (rule.id)}
+        {#each sortedTagRules as rule (rule.id)}
           <div class="rule-row">
             <span>{rule.find_text}{#if rule.is_default}<small>default</small>{/if}</span>
             <span class="mono">{rule.tag}</span>
@@ -651,6 +725,24 @@
   }
   .search {
     margin-right: auto;
+  }
+  .sort-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    min-width: 9rem;
+  }
+  .sort-field .field-label {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+  }
+  .sort-field select {
+    font: inherit;
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 0.35rem 0.5rem;
   }
   .rule-table {
     overflow-x: auto;

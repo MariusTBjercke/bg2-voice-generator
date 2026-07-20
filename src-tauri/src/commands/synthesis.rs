@@ -83,6 +83,19 @@ pub async fn get_line_synthesis_preview(
     })
 }
 
+/// Batched synthesis previews for the visible Generation page (rules loaded once).
+#[tauri::command]
+pub async fn list_line_synthesis_previews(
+    state: State<'_, AppState>,
+    line_ids: Vec<i64>,
+) -> Result<Vec<crate::models::LineSynthesisPreviewRow>, AppError> {
+    let capped: Vec<i64> = line_ids.into_iter().take(200).collect();
+    run_read(&state, move |conn| {
+        crate::synthesis::list_line_synthesis_previews(conn, &capped, mapper_enabled())
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn set_line_synthesis_override(
     state: State<'_, AppState>,

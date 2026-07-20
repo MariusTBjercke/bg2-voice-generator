@@ -153,10 +153,19 @@
   // Search over strref / dlg:state / text, plus a facet on the derived reason so a
   // user can isolate e.g. every tokenized line. Config drives <SearchFilterBar>.
   const REASON_FACET = "reason";
-  let filterValues = $state<FilterValues>({ search: "", facets: { [REASON_FACET]: "all" } });
+  let filterValues = $state<FilterValues>({ search: "", facets: { [REASON_FACET]: "all" }, sort: "dlg_state" });
   // Guards the filter write-back so the initial default never clobbers a saved filter
   // before hydration restores it (see the effects below).
   let filtersHydrated = $state(false);
+
+  const attributionSortOptions = [
+    { key: "dlg_state", label: "Dialogue order" },
+    { key: "strref_asc", label: "Strref ascending" },
+    { key: "strref_desc", label: "Strref descending" },
+    { key: "text_asc", label: "Text A–Z" },
+    { key: "text_desc", label: "Text Z–A" },
+    { key: "reason", label: "Blocked reason" },
+  ];
 
   // Filter persistence across tab navigation: restore this screen's saved filter on
   // mount (or install change), then write every later change back. Keyed by gameDir
@@ -166,11 +175,21 @@
     void $project.gameDir;
     ensureFiltersGameDir($project.gameDir);
     const saved = getSavedFilter(get(filterCache), "attribution");
-    if (saved) filterValues = { search: saved.search, facets: { ...saved.facets } };
+    if (saved) {
+      filterValues = {
+        search: saved.search,
+        facets: { ...saved.facets },
+        sort: saved.sort ?? "dlg_state",
+      };
+    }
     filtersHydrated = true;
   });
   $effect(() => {
-    const snapshot = { search: filterValues.search, facets: { ...filterValues.facets } };
+    const snapshot = {
+      search: filterValues.search,
+      facets: { ...filterValues.facets },
+      sort: filterValues.sort ?? "dlg_state",
+    };
     if (!filtersHydrated) return;
     setSavedFilter("attribution", snapshot);
   });
@@ -192,6 +211,7 @@
   $effect(() => {
     void filterValues.search;
     void JSON.stringify(filterValues.facets);
+    void filterValues.sort;
     blockedPage = 0;
   });
 
@@ -205,6 +225,7 @@
         limit: BLOCKED_PAGE_SIZE,
         query: filterValues.search.trim() || undefined,
         reason: filterValues.facets[REASON_FACET] ?? "all",
+        sort: filterValues.sort ?? "dlg_state",
       });
       if (request !== blockedRequest || $project.gameDir !== dir) return;
       blockedTotal = result.total;
@@ -224,6 +245,7 @@
     void blockedPage;
     void filterValues.search;
     void filterValues.facets[REASON_FACET];
+    void filterValues.sort;
     if (!dir || !scanned || !filtersHydrated) return;
     const timer = setTimeout(() => void loadBlockedPage(dir), 250);
     return () => clearTimeout(timer);
@@ -383,6 +405,8 @@
           shown={blockedTotal}
           total={counts?.blocked_lines ?? blockedTotal}
           label="blocked lines"
+          sortOptions={attributionSortOptions}
+          defaultSort="dlg_state"
         />
         {#if blockedTotal === 0}
           <p class="hint">No blocked lines match the current filter.</p>

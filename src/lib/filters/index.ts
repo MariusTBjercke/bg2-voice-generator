@@ -45,6 +45,8 @@ export interface FilterValues {
   search: string;
   /** facet key -> selected token, or "all" for no selection. */
   facets: Record<string, string>;
+  /** Optional sort key for screens that expose a Sort dropdown. */
+  sort?: string;
 }
 
 /** The sentinel a facet holds when nothing is selected. */
@@ -110,3 +112,15 @@ export function facetOptions<T>(facet: FacetSpec<T>, items: T[]): FacetOption<T>
     .map(([value, label]) => ({ value, label }))
     .sort((a, b) => a.label.localeCompare(b.label));
 }
+
+export {
+  localeText,
+  numberAsc,
+  numberDesc,
+  resolveSort,
+  sortItems,
+  sortOptionsFromSpecs,
+  thenBy,
+  type SortOption,
+  type SortSpec,
+} from "./sort";

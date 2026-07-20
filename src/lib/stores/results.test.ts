@@ -87,7 +87,8 @@ describe("screen result caches", () => {
 
     const token = beginGenerationRequest("critical");
     expect(setGenerationCache({ linesLoaded: true, lines: [] }, token)).toBe(true);
-    expect(generationDomainNeedsRefresh("critical")).toBe(false);
+    // Critical always refreshes so paged list data stays live (no stale full inventory).
+    expect(generationDomainNeedsRefresh("critical")).toBe(true);
     expect(generationDomainNeedsRefresh("critical", { force: true })).toBe(true);
 
     invalidateGeneration("critical");

@@ -51,8 +51,20 @@ import type {
   SharedStrrefGroup,
   Line,
   GeneratableLine,
+  GenerationListScope,
+  GeneratableLinePageRow,
+  GeneratableLinesPage,
+  GeneratableLinesPageSummary,
+  GenerationFilterDonorOption,
+  GenerationFilterOptions,
+  LineSynthesisPreviewRow,
   BlockedLinesPage,
   ReferenceSample,
+  SoundResrefUsageCharacter,
+  SoundResrefUsageEntry,
+  VoiceProfileUsageCharacter,
+  VoiceProfileUsageEntry,
+  VoiceProfileUsagePool,
   Clone,
   CloneReference,
   BindingPreview,
@@ -205,8 +217,50 @@ describe('TS<->Rust model contract (mirror of models.rs contract_tests)', () => 
       .toEqual(want('id', 'project_id', 'strref', 'dlg_resref', 'state_index', 'text', 'flags', 'existing_sound_resref', 'kind', 'is_voiced', 'has_tokens', 'token_mask', 'shared_group_id', 'speaker_id', 'attribution_confidence', 'status'));
     expect(keys(s<BlockedLinesPage>({ rows: [], total: 0, token_total: 0 })))
       .toEqual(want('rows', 'total', 'token_total'));
+    expect(keys(s<GenerationListScope>({
+      search: '', speakers: [], sexes: [], races: [], creatureCategories: [], bindingModes: [],
+      donors: [], dlgs: [], renderStates: [], lineStates: [], packAudio: [], minLength: '',
+      maxLength: '', needsReview: false, sort: '', sessionLineIds: [],
+    }))).toEqual(want(
+      'search', 'speakers', 'sexes', 'races', 'creatureCategories', 'bindingModes', 'donors', 'dlgs',
+      'renderStates', 'lineStates', 'packAudio', 'minLength', 'maxLength', 'needsReview', 'sort',
+      'sessionLineIds',
+    ));
+    expect(keys(s<GeneratableLinePageRow>({
+      line: { id: 0, project_id: 0, strref: 0, dlg_resref: null, state_index: null, text: '', flags: 0, existing_sound_resref: null, kind: 'state', is_voiced: false, has_tokens: false, token_mask: 0, shared_group_id: null, speaker_id: null, attribution_confidence: 0, status: 'pending' },
+      output_path: null, voice_changed: false, text_changed: false, diagnostic_flag_count: 0, has_ready_clone: false,
+    }))).toEqual(want('line', 'output_path', 'voice_changed', 'text_changed', 'diagnostic_flag_count', 'has_ready_clone'));
+    expect(keys(s<GeneratableLinesPageSummary>({
+      missing: 0, voice_changed_ready: 0, text_changed_ready: 0, changed_ready: 0,
+      regeneratable: 0, saved: 0, orphan_clips: 0,
+    }))).toEqual(want('missing', 'voice_changed_ready', 'text_changed_ready', 'changed_ready', 'regeneratable', 'saved', 'orphan_clips'));
+    expect(keys(s<GeneratableLinesPage>({ rows: [], total: 0, summary: { missing: 0, voice_changed_ready: 0, text_changed_ready: 0, changed_ready: 0, regeneratable: 0, saved: 0, orphan_clips: 0 } })))
+      .toEqual(want('rows', 'total', 'summary'));
+    expect(keys(s<GenerationFilterDonorOption>({ value: '', label: '' })))
+      .toEqual(want('value', 'label'));
+    expect(keys(s<GenerationFilterOptions>({ dlgs: [], donors: [], line_states: [] })))
+      .toEqual(want('dlgs', 'donors', 'line_states'));
+    expect(keys(s<LineSynthesisPreviewRow>({
+      line_id: 0,
+      preview: { display_text: '', resolved_text: '', source: 'plain', shared_line_count: 0, applied_rules: [], applied_tag_rules: [] },
+    }))).toEqual(want('line_id', 'preview'));
     expect(keys(s<ReferenceSample>({ id: 0, speaker_id: 0, source_strref: null, source_sound_resref: null, provenance_json: '', scores_json: '', decision: 'pending', local_derivative_path: null })))
       .toEqual(want('id', 'speaker_id', 'source_strref', 'source_sound_resref', 'provenance_json', 'scores_json', 'decision', 'local_derivative_path'));
+    expect(keys(s<SoundResrefUsageCharacter>({
+      identity_key: '', display_name: '', cre_resref: '', decision: 'pending', eligibility: null, bound: false, sample_id: 0,
+    }))).toEqual(want('identity_key', 'display_name', 'cre_resref', 'decision', 'eligibility', 'bound', 'sample_id'));
+    expect(keys(s<SoundResrefUsageEntry>({
+      source_sound_resref: '', character_count: 0, bound_character_count: 0, characters: [],
+    }))).toEqual(want('source_sound_resref', 'character_count', 'bound_character_count', 'characters'));
+    expect(keys(s<VoiceProfileUsageCharacter>({
+      identity_key: '', display_name: '', cre_resref: '', binding_source: 'default', clone_status: 'pending',
+    }))).toEqual(want('identity_key', 'display_name', 'cre_resref', 'binding_source', 'clone_status'));
+    expect(keys(s<VoiceProfileUsagePool>({
+      sex: 0, race: 0, creature_category: 0, sex_label: '', race_label: '', creature_category_label: '',
+    }))).toEqual(want('sex', 'race', 'creature_category', 'sex_label', 'race_label', 'creature_category_label'));
+    expect(keys(s<VoiceProfileUsageEntry>({
+      voice_profile_id: 0, character_count: 0, pool_count: 0, characters: [], pools: [],
+    }))).toEqual(want('voice_profile_id', 'character_count', 'pool_count', 'characters', 'pools'));
     expect(keys(s<Clone>({ id: 0, speaker_id: 0, primary_sample_id: null, voice_profile_id: null, follow_speaker_id: null, binding_source: 'default', status: 'pending', render_settings_json: '' })))
       .toEqual(want('id', 'speaker_id', 'primary_sample_id', 'voice_profile_id', 'follow_speaker_id', 'binding_source', 'status', 'render_settings_json'));
     expect(keys(s<CloneReference>({ clone_id: 0, sample_id: 0, sort_order: 0 })))

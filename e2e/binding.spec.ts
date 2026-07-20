@@ -1,5 +1,16 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { bootstrapProject, goTo } from "./helpers/bootstrap";
+
+/** Name A–Z puts fixture groups first; filter so the real Male pool is on-screen. */
+async function openMaleHumanGroup(page: Page) {
+  await page.getByPlaceholder("filter groups…").fill("Male / Human");
+  await page
+    .locator("#demographic-groups-panel li.group-row")
+    .filter({ hasText: "Male / Human / Humanoid" })
+    .getByRole("button")
+    .first()
+    .click();
+}
 
 test.describe("Guided voice binding", () => {
   test.beforeEach(async ({ page }) => {
@@ -19,6 +30,7 @@ test.describe("Guided voice binding", () => {
     await expect(page.getByRole("button", { name: /Voice library/ })).toContainText("28 custom · 1 harvested");
     await expect(page.getByRole("heading", { name: "Demographic defaults" })).toBeVisible();
     await expect(page.getByRole("heading", { name: /Speaker overrides/ })).toBeVisible();
+    await page.getByPlaceholder("filter groups…").fill("Male / Human");
     await expect(page.getByText("Male / Human / Humanoid")).toBeVisible();
     await expect(page.getByLabel("Effective voice readiness")).toContainText("1 demographic defaults");
     await expect(page.getByRole("button", { name: "Apply defaults" })).toBeVisible();
@@ -98,7 +110,7 @@ test.describe("Guided voice binding", () => {
   });
 
   test("uses imported and designed profiles in pools and personal overrides", async ({ page }) => {
-    await page.getByText("Male / Human / Humanoid").click();
+    await openMaleHumanGroup(page);
     const group = page.locator("li.group-row").filter({ hasText: "Male / Human / Humanoid" });
     await expect(group.getByText("Weathered traveler")).toBeVisible();
     await expect(group.getByText("Young Amnian noble")).toBeVisible();
@@ -131,7 +143,7 @@ test.describe("Guided voice binding", () => {
   });
 
   test("can expand a group pool editor with suggest and play", async ({ page }) => {
-    await page.getByText("Male / Human / Humanoid").click();
+    await openMaleHumanGroup(page);
     const group = page.locator("li.group-row").filter({ hasText: "Male / Human / Humanoid" });
     await expect(page.getByRole("button", { name: "Suggest harvested voice" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Clear pool", exact: true })).toBeVisible();
@@ -143,7 +155,7 @@ test.describe("Guided voice binding", () => {
   });
 
   test("renders mirrored harvested memberships once and keeps legacy donors as fallbacks", async ({ page }) => {
-    await page.getByText("Male / Human / Humanoid").click();
+    await openMaleHumanGroup(page);
     const group = page.locator("li.group-row").filter({ hasText: "Male / Human / Humanoid" });
     const xzarRows = group.locator("li.donor-row").filter({ hasText: "Xzar" });
     await expect(xzarRows).toHaveCount(1);
@@ -243,15 +255,15 @@ test.describe("Guided voice binding", () => {
 
   test("keeps the demographic page after an in-group action refreshes data", async ({ page }) => {
     const groupsPanel = page.locator("#demographic-groups-panel");
-    await groupsPanel.getByRole("button", { name: "Next page" }).click();
-    await expect(groupsPanel.getByText("2 / 2", { exact: true })).toBeVisible();
+    // Name A–Z: fixture groups fill page 1; mutate one there so the page stays put.
+    await expect(groupsPanel.getByText("1 / 2", { exact: true })).toBeVisible();
 
     const group = groupsPanel.locator("li.group-row").filter({ hasText: "Fixture sex 30" });
     await group.getByRole("button").first().click();
     await group.locator("select.donor-select").first().selectOption("1");
     await group.getByRole("button", { name: "Add", exact: true }).click();
 
-    await expect(groupsPanel.getByText("2 / 2", { exact: true })).toBeVisible();
+    await expect(groupsPanel.getByText("1 / 2", { exact: true })).toBeVisible();
     await expect(group).toBeVisible();
   });
 
@@ -268,8 +280,11 @@ test.describe("Guided voice binding", () => {
   });
 
   test("persists panels and the expanded demographic group across navigation and reload", async ({ page }) => {
-    await page.getByText("Male / Human / Humanoid").click();
-    await page.getByRole("button", { name: /Xzar/ }).first().click();
+    // Name A–Z lists Montaron first; his "Play effective voice for Xzar" button
+    // would win getByRole(/Xzar/).first() — target the speaker-select control instead.
+    await page.getByRole("button", { name: /Xzar \d+ lines/ }).click();
+    await expect(page.getByRole("heading", { name: "Xzar" })).toBeVisible();
+    await openMaleHumanGroup(page);
     await page.getByPlaceholder("filter groups…").fill("Male");
     await page.getByLabel("Preview dialogue").fill("Persistent preview text");
     await page.getByRole("button", { name: /Characters \(2\)/ }).click();
@@ -278,6 +293,9 @@ test.describe("Guided voice binding", () => {
     await goTo(page, "Binding");
     await expect(page.getByRole("button", { name: /Characters \(2\)/ })).toHaveAttribute("aria-expanded", "false");
     await expect(page.getByRole("button", { name: "Suggest harvested voice" })).toBeVisible();
+    await expect(page.getByPlaceholder("filter groups…")).toHaveValue("Male");
+    await expect(page.getByRole("heading", { name: "Xzar" })).toBeVisible();
+    await expect(page.getByLabel("Preview dialogue")).toHaveValue("Persistent preview text");
 
     await page.reload();
     await expect(page.getByRole("button", { name: /Characters \(2\)/ })).toHaveAttribute("aria-expanded", "false");
@@ -369,5 +387,29 @@ test.describe("Guided voice binding", () => {
     expect(styles.overflowY).toBe("visible");
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
     await expect(page.locator(".layout")).toHaveScreenshot("binding-layout-narrow.png", { animations: "disabled" });
+  });
+
+  test("shows shared sound usage on approved samples", async ({ page }) => {
+    await page.getByRole("button", { name: /Xzar \d+ lines/ }).click();
+    await expect(page.getByRole("heading", { name: "Xzar" })).toBeVisible();
+    await expect(page.getByText("Used by 2 characters")).toBeVisible();
+    await page.getByRole("button", { name: /Expand characters using sthma06/ }).click();
+    await expect(page.locator(".sound-usage .usage-jump").filter({ hasText: "Montaron" })).toBeVisible();
+  });
+
+  test("shows voice library profile usage with jump links", async ({ page }) => {
+    const library = page.locator("#voice-library-panel");
+    await expect(library.getByText("Weathered traveler")).toBeVisible();
+    const imported = library.locator("li.profile-row").filter({ hasText: "Weathered traveler" });
+    await expect(imported.getByText("in 1 pool")).toBeVisible();
+    await imported.getByRole("button", { name: /Expand usage for Weathered traveler/ }).click();
+    await expect(imported.getByText("Pool: Male / Human / Humanoid")).toBeVisible();
+
+    await library.getByLabel("Origin").selectOption("harvested");
+    const harvested = library.locator("li.profile-row").filter({ hasText: "Xzar — harvested" });
+    await expect(harvested.getByText("Used by 2 characters")).toBeVisible();
+    await harvested.getByRole("button", { name: /Expand usage for Xzar/ }).click();
+    await harvested.locator(".usage-jump").filter({ hasText: "Montaron" }).click();
+    await expect(page.getByRole("heading", { name: "Montaron" })).toBeVisible();
   });
 });

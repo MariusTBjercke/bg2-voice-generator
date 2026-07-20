@@ -17,7 +17,9 @@ export function normalizeSimpleFilter(value: unknown): FilterValues | null {
   for (const [key, entry] of Object.entries(source.facets as Record<string, unknown>)) {
     if (typeof entry === "string") facets[key] = entry;
   }
-  return { search: source.search, facets };
+  const filter: FilterValues = { search: source.search, facets };
+  if (typeof source.sort === "string" && source.sort.length > 0) filter.sort = source.sort;
+  return filter;
 }
 
 /** Pure v1 migration: retain simple screens and drop the incompatible Generation facet. */

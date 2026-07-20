@@ -3,9 +3,10 @@
   // passes a `FilterConfig<T>` (its search fields + facet specs) and the data
   // being filtered (`items`, for deriving facet options), and binds a
   // `FilterValues`. The bar renders a free-text input + one dropdown per facet +
-  // a result count + a Clear button. It owns NO data and performs NO IO — the
-  // screen still runs `filterItems` over its own `$derived` (ADR 0003). This
-  // replaces the per-page filter markup so screens configure instead of fork.
+  // an optional Sort dropdown + a result count + a Clear button. It owns NO data
+  // and performs NO IO — the screen still runs `filterItems` / `sortItems` over
+  // its own `$derived` (ADR 0003). This replaces the per-page filter markup so
+  // screens configure instead of fork.
   import type { Snippet } from "svelte";
   import Button from "$lib/components/Button.svelte";
   import {
@@ -15,6 +16,7 @@
     FACET_ALL,
     type FilterConfig,
     type FilterValues,
+    type SortOption,
   } from "$lib/filters";
 
   type Props = {
@@ -32,6 +34,10 @@
      * facets in a responsive grid, optional trailing actions via children.
      */
     compact?: boolean;
+    /** When set, render a Sort dropdown bound to `values.sort`. */
+    sortOptions?: SortOption[];
+    /** Fallback when `values.sort` is unset (screen default). */
+    defaultSort?: string;
     children?: Snippet;
   };
 
@@ -43,15 +49,31 @@
     total,
     label = "items",
     compact = false,
+    sortOptions,
+    defaultSort,
     children,
   }: Props = $props();
 
   const facets = $derived(config.facets ?? []);
   const active = $derived(!isEmpty(values));
   const hasCount = $derived(shown !== undefined && total !== undefined);
+  const hasSort = $derived((sortOptions?.length ?? 0) > 0);
+  const effectiveSort = $derived(
+    values.sort
+      ?? defaultSort
+      ?? sortOptions?.[0]?.key
+      ?? "",
+  );
 
   function clear() {
-    values = emptyValues(config);
+    const next = emptyValues(config);
+    if (values.sort !== undefined) next.sort = values.sort;
+    values = next;
+  }
+
+  function onSortChange(event: Event) {
+    const next = (event.currentTarget as HTMLSelectElement).value;
+    values = { ...values, sort: next };
   }
 </script>
 
@@ -79,6 +101,17 @@
         </label>
       {/each}
     </div>
+  {/if}
+
+  {#if hasSort && sortOptions}
+    <label class="field sort">
+      <span class="field-label">Sort</span>
+      <select aria-label="Sort" value={effectiveSort} onchange={onSortChange}>
+        {#each sortOptions as option (option.key)}
+          <option value={option.key}>{option.label}</option>
+        {/each}
+      </select>
+    </label>
   {/if}
 
   <div class="tail">
@@ -125,6 +158,10 @@
   .field.search {
     flex: 1 1 16rem;
     min-width: 12rem;
+  }
+  .field.sort {
+    flex: 0 1 12rem;
+    min-width: 9rem;
   }
   .field-label {
     font-size: 0.8rem;
@@ -181,6 +218,10 @@
     border-radius: var(--radius-sm);
   }
   .bar.compact .field.search {
+    flex: none;
+    min-width: 0;
+  }
+  .bar.compact .field.sort {
     flex: none;
     min-width: 0;
   }

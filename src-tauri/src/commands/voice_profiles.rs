@@ -189,6 +189,43 @@ pub async fn list_voice_profiles(
     .map_err(|e| AppError::Other(format!("voice profile read failed: {e}")))?
 }
 
+/// Project-wide reverse lookup: which characters and demographic pools use each voice profile.
+#[tauri::command]
+pub async fn list_voice_profile_usage(
+    state: State<'_, AppState>,
+    game_dir: String,
+) -> Result<Vec<crate::models::VoiceProfileUsageEntry>, AppError> {
+    let path = state.db_path();
+    tokio::task::spawn_blocking(move || {
+        use crate::extractor::ids::DemographicLabelMaps;
+        let conn = crate::db::open_read_db(&path)?;
+        let Some(project_id) = conn
+            .query_row(
+                "SELECT id FROM project WHERE game_root=?1",
+                [&game_dir],
+                |r| r.get(0),
+            )
+            .optional()?
+        else {
+            return Ok(Vec::new());
+        };
+        let maps = DemographicLabelMaps::load(Path::new(&game_dir)).ok();
+        crate::db::voice_profiles::list_voice_profile_usage(&conn, project_id, |sex, race, cat| {
+            if let Some(ref maps) = maps {
+                maps.resolve(sex, race, cat)
+            } else {
+                (
+                    format!("sex {sex}"),
+                    format!("race {race}"),
+                    format!("category {cat}"),
+                )
+            }
+        })
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("voice profile usage read failed: {e}")))?
+}
+
 #[tauri::command]
 pub async fn select_voice_reference_files(app: AppHandle) -> Result<Vec<String>, AppError> {
     let selected = app

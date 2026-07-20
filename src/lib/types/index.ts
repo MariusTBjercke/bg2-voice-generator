@@ -380,6 +380,67 @@ export interface BlockedLinesPage {
   token_total: number;
 }
 
+/** Mirror of `models::GenerationListScope` (camelCase IPC params). */
+export interface GenerationListScope {
+  search: string;
+  speakers: string[];
+  sexes: string[];
+  races: string[];
+  creatureCategories: string[];
+  bindingModes: string[];
+  donors: string[];
+  dlgs: string[];
+  renderStates: string[];
+  lineStates: string[];
+  packAudio: string[];
+  minLength: string;
+  maxLength: string;
+  needsReview: boolean;
+  sort: string;
+  sessionLineIds: number[];
+}
+
+/** Mirror of `models::GeneratableLinePageRow`. */
+export interface GeneratableLinePageRow {
+  line: GeneratableLine;
+  output_path: string | null;
+  voice_changed: boolean;
+  text_changed: boolean;
+  diagnostic_flag_count: number;
+  has_ready_clone: boolean;
+}
+
+/** Mirror of `models::GeneratableLinesPageSummary`. */
+export interface GeneratableLinesPageSummary {
+  missing: number;
+  voice_changed_ready: number;
+  text_changed_ready: number;
+  changed_ready: number;
+  regeneratable: number;
+  saved: number;
+  orphan_clips: number;
+}
+
+/** Mirror of `models::GeneratableLinesPage`. */
+export interface GeneratableLinesPage {
+  rows: GeneratableLinePageRow[];
+  total: number;
+  summary: GeneratableLinesPageSummary;
+}
+
+/** Mirror of `models::GenerationFilterDonorOption`. */
+export interface GenerationFilterDonorOption {
+  value: string;
+  label: string;
+}
+
+/** Mirror of `models::GenerationFilterOptions`. */
+export interface GenerationFilterOptions {
+  dlgs: string[];
+  donors: GenerationFilterDonorOption[];
+  line_states: string[];
+}
+
 /** Mirror of `models::ReferenceSample`. */
 export interface ReferenceSample {
   id: number;
@@ -390,6 +451,53 @@ export interface ReferenceSample {
   scores_json: string;
   decision: SampleDecision;
   local_derivative_path: string | null;
+}
+
+/** Mirror of `models::SoundResrefUsageCharacter`. */
+export interface SoundResrefUsageCharacter {
+  identity_key: string;
+  display_name: string;
+  cre_resref: string;
+  decision: SampleDecision;
+  eligibility: string | null;
+  bound: boolean;
+  sample_id: number;
+}
+
+/** Mirror of `models::SoundResrefUsageEntry`. */
+export interface SoundResrefUsageEntry {
+  source_sound_resref: string;
+  character_count: number;
+  bound_character_count: number;
+  characters: SoundResrefUsageCharacter[];
+}
+
+/** Mirror of `models::VoiceProfileUsageCharacter`. */
+export interface VoiceProfileUsageCharacter {
+  identity_key: string;
+  display_name: string;
+  cre_resref: string;
+  binding_source: BindingSource;
+  clone_status: CloneStatus;
+}
+
+/** Mirror of `models::VoiceProfileUsagePool`. */
+export interface VoiceProfileUsagePool {
+  sex: number;
+  race: number;
+  creature_category: number;
+  sex_label: string;
+  race_label: string;
+  creature_category_label: string;
+}
+
+/** Mirror of `models::VoiceProfileUsageEntry`. */
+export interface VoiceProfileUsageEntry {
+  voice_profile_id: number;
+  character_count: number;
+  pool_count: number;
+  characters: VoiceProfileUsageCharacter[];
+  pools: VoiceProfileUsagePool[];
 }
 
 /** Mirror of `models::Clone`. */
@@ -1044,6 +1152,12 @@ export interface SynthesisPreview {
   shared_line_count: number;
   applied_rules: DictionaryAppliedRule[];
   applied_tag_rules: TagAppliedRule[];
+}
+
+/** Mirror of `models::LineSynthesisPreviewRow`. */
+export interface LineSynthesisPreviewRow {
+  line_id: number;
+  preview: SynthesisPreview;
 }
 
 export interface SynthesisWriteResult {

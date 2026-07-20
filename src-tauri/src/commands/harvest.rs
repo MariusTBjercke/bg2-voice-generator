@@ -393,6 +393,29 @@ pub async fn list_group_reference_samples(
     Ok(out)
 }
 
+/// Project-wide reverse lookup: which characters have / bind each sound resref.
+#[tauri::command]
+pub async fn list_sound_resref_usage(
+    state: State<'_, AppState>,
+    game_dir: String,
+) -> Result<Vec<crate::models::SoundResrefUsageEntry>, AppError> {
+    run_db_read(&state, move |conn| {
+        use rusqlite::OptionalExtension;
+        let project_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM project WHERE game_root=?1",
+                params![game_dir],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(project_id) = project_id else {
+            return Ok(Vec::new());
+        };
+        crate::db::harvest::list_sound_resref_usage(conn, project_id)
+    })
+    .await
+}
+
 /// Record an audition decision (approve/reject/pending) for one sample.
 #[tauri::command]
 pub async fn set_sample_decision(

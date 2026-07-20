@@ -21,16 +21,17 @@
   import {
     activeGenerationScopeCount,
     emptyGenerationScope,
-    filterGenerationScope,
     generationScopeChips,
+    generationSortSpecs,
     normalizeGenerationScope,
     removeGenerationScopeChip,
     speakerIdentityKey,
+    toGenerationListScope,
     type GenerationScope,
     type GenerationScopeArrayKey,
-    type GenerationScopeItem,
     type GenerationScopeLabels,
   } from "$lib/filters/generation";
+  import { sortOptionsFromSpecs } from "$lib/filters";
   import {
     pathWithoutGenerationFocus,
     readGenerationFocusParam,
@@ -48,7 +49,6 @@
     generationDomainNeedsRefresh,
     generationRequestIsCurrent,
     results,
-    rotateCompletedAudioRevisions,
     setGenerationCache,
     type CachedGenerationState,
   } from "$lib/stores/results";
@@ -62,13 +62,15 @@
   import { getInstallUiPreferences, updateInstallUiPreferences } from "$lib/stores/uiPreferences";
   import type {
     BatchGenResult,
-    CompletedGeneration,
     DemographicGroup,
     EffectiveSpeakerBinding,
     EngineStatus,
-    GenerationDiagnosticsRow,
+    GenerationFilterOptions,
+    GenerationDiagnostics,
     InstallResult,
     GeneratableLine,
+    GeneratableLinesPage,
+    GeneratableLinesPageSummary,
     LineResult,
     LineRenderOverrideWriteResult,
     OmniVoiceRenderSettingsPatch,
@@ -77,6 +79,7 @@
     SpeakerGroup,
     Speaker,
     SynthesisPreview,
+    LineSynthesisPreviewRow,
     SynthesisTextSource,
     SynthesisWriteResult,
   } from "$lib/types";
@@ -128,8 +131,13 @@
   let linesError = $state<string | null>(null);
   let criticalReady = $state(false);
   let linePage = $state(0);
+  let lineTotal = $state(0);
+  let pageSummary = $state<GeneratableLinesPageSummary>({
+    missing: 0, voice_changed_ready: 0, text_changed_ready: 0, changed_ready: 0,
+    regeneratable: 0, saved: 0, orphan_clips: 0,
+  });
   let gen = $state<Record<number, GenState>>({});
-  let diagnostics = $state<Record<number, GenerationDiagnosticsRow["diagnostics"]>>({});
+  let diagnostics = $state<Record<number, GenerationDiagnostics>>({});
   let genAll = $state(false);
   let removing = $state(false);
   // Cancel is one-shot per run: disabled once clicked so the cooperative stop is not
@@ -154,6 +162,9 @@
   let identityGroups = $state<SpeakerGroup[]>([]);
   let demographics = $state<DemographicGroup[]>([]);
   let effectiveBindings = $state<EffectiveSpeakerBinding[]>([]);
+  let filterDlgs = $state<string[]>([]);
+  let filterDonors = $state<Array<{ value: string; label: string }>>([]);
+  let filterLineStates = $state<string[]>([]);
   let scope = $state<GenerationScope>(emptyGenerationScope());
   let moreFiltersOpen = $state(false);
   // Race has dozens of IE values; collapse to ~neighbor-filter height until expanded.
@@ -257,49 +268,6 @@
   const lineHasReadyBinding = (line: GeneratableLine): boolean =>
     line.speaker_id !== null && bindingBySpeaker.get(line.speaker_id)?.clone_status === "ready";
 
-  function demographicFor(speaker: Speaker | null): DemographicGroup | null {
-    if (!speaker) return null;
-    return demographics.find((group) =>
-      group.sex === speaker.sex &&
-      group.race === speaker.race &&
-      group.creature_category === speaker.creature_category
-    ) ?? null;
-  }
-
-  const scopeItems = $derived<GenerationScopeItem[]>(lines.map((line) => {
-    const speaker = line.speaker_id === null ? null : (speakerById.get(line.speaker_id) ?? null);
-    const current = gen[line.id]?.status;
-    const textChanged = gen[line.id]?.textChanged === true || current === "text_stale";
-    const voiceChanged = current === "stale";
-    const renderStates: GenerationScopeItem["renderStates"] = [];
-    if (current === "running") renderStates.push("running");
-    else if (current === "failed") renderStates.push("failed");
-    else if (current === "done" || current === "stale" || current === "text_stale") {
-      renderStates.push("generated");
-      if (voiceChanged) renderStates.push("voice_changed");
-      if (textChanged) renderStates.push("text_changed");
-    } else {
-      renderStates.push("missing");
-    }
-    const renderState = voiceChanged
-      ? "voice_changed"
-      : textChanged
-        ? "text_changed"
-        : current === "done"
-          ? "generated"
-          : current === "running" || current === "failed"
-            ? current
-            : "missing";
-    return {
-      line,
-      speaker,
-      demographic: demographicFor(speaker),
-      binding: line.speaker_id === null ? null : (bindingBySpeaker.get(line.speaker_id) ?? null),
-      renderState,
-      renderStates,
-    };
-  }));
-
   function uniqueOptions(
     entries: Array<{ value: string; label: string; detail?: string }>,
   ): Array<{ value: string; label: string; detail?: string }> {
@@ -310,12 +278,8 @@
   const speakerOptions = $derived(uniqueOptions(
     identityGroups
       .filter((g) =>
-        // Speakers with generatable lines, plus any currently selected filter
-        // (so deep-links / stale caches still show a real name, not a bare id).
         scope.speakers.includes(g.identity_key) ||
-        scopeItems.some((item) =>
-          item.speaker && groupBySpeakerId.get(item.speaker.id)?.identity_key === g.identity_key,
-        )
+        g.line_count > 0
       )
       .map((g) => ({
         value: g.identity_key,
@@ -323,14 +287,12 @@
         detail: groupSummary(g),
       })),
   ));
-  const sexOptions = $derived(uniqueOptions(scopeItems.flatMap((item) => item.speaker ? [{
-    value: String(item.speaker.sex),
-    label: item.demographic?.sex_label ?? `Sex ${item.speaker.sex}`,
-  }] : [])));
-  const raceOptions = $derived(uniqueOptions(scopeItems.flatMap((item) => item.speaker ? [{
-    value: String(item.speaker.race),
-    label: item.demographic?.race_label ?? `Race ${item.speaker.race}`,
-  }] : [])));
+  const sexOptions = $derived(uniqueOptions(demographics.map((group) => ({
+    value: String(group.sex), label: group.sex_label,
+  }))));
+  const raceOptions = $derived(uniqueOptions(demographics.map((group) => ({
+    value: String(group.race), label: group.race_label,
+  }))));
   /** Collapsed race list keeps selected values visible even when they fall past the limit. */
   const visibleRaceOptions = $derived((() => {
     if (racesExpanded || raceOptions.length <= RACE_COLLAPSE_LIMIT) return raceOptions;
@@ -343,26 +305,11 @@
     return [...head, ...pinned];
   })());
   const collapsedRaceExtra = $derived(Math.max(0, raceOptions.length - RACE_COLLAPSE_LIMIT));
-  const creatureOptions = $derived(uniqueOptions(scopeItems.flatMap((item) => item.speaker ? [{
-    value: String(item.speaker.creature_category),
-    label: item.demographic?.creature_category_label ?? `Category ${item.speaker.creature_category}`,
-  }] : [])));
-  const donorOptions = $derived(uniqueOptions(scopeItems.flatMap((item) => {
-    if (!item.binding?.clone_id) return [];
-    const id = item.binding.donor_speaker_id ?? item.line.speaker_id;
-    if (id === null) return [];
-    const donor = speakerById.get(id);
-    const donorGroup = groupBySpeakerId.get(id);
-    return [{
-      value: String(id),
-      label: item.binding.donor_display_name ?? donorGroup?.display_name ?? donor?.display_name ?? donor?.cre_resref ?? `Speaker #${id}`,
-      detail: donorGroup ? groupSummary(donorGroup) : donor?.cre_resref,
-    }];
-  })));
-  const dlgOptions = $derived(uniqueOptions(lines.flatMap((line) => line.dlg_resref ? [{
-    value: line.dlg_resref,
-    label: line.dlg_resref,
-  }] : [])));
+  const creatureOptions = $derived(uniqueOptions(demographics.map((group) => ({
+    value: String(group.creature_category), label: group.creature_category_label,
+  }))));
+  const donorOptions = $derived(uniqueOptions(filterDonors));
+  const dlgOptions = $derived(uniqueOptions(filterDlgs.map((value) => ({ value, label: value }))));
 
   function labelRecord(options: Array<{ value: string; label: string }>): Record<string, string> {
     return Object.fromEntries(options.map((option) => [option.value, option.label]));
@@ -397,17 +344,11 @@
   });
   const filterCount = $derived(activeGenerationScopeCount(scope));
   const filterChips = $derived(generationScopeChips(scope, scopeLabels));
-  const filteredLines = $derived(filterGenerationScope(scopeItems, scope).map((item) => item.line));
+  const generationSortOptions = $derived(sortOptionsFromSpecs(generationSortSpecs));
   /** Blocked/skipped lines stay listed when they still have clips; batch regen skips them. */
   function lineIsRegeneratable(line: GeneratableLine): boolean {
     return line.status === "ready" || line.status === "exported";
   }
-  const readyFilteredLines = $derived(
-    filteredLines.filter((l) => lineIsRegeneratable(l) && lineHasReadyBinding(l)),
-  );
-  const orphanClipLines = $derived(
-    lines.filter((l) => !lineIsRegeneratable(l) && isPlayableGen(gen[l.id])),
-  );
   const effectiveCharnameStandIn = $derived(
     charnameStandIn.trim() || DEFAULT_CHARNAME_STANDIN,
   );
@@ -418,37 +359,6 @@
   function isPlayableGen(state: GenState | undefined): boolean {
     return state?.status === "done" || state?.status === "stale" || state?.status === "text_stale";
   }
-
-  // Filtered regeneratable lines with no clip yet - the default batch button's target set.
-  const missingLines = $derived(
-    filteredLines.filter((l) => lineIsRegeneratable(l) && !isPlayableGen(gen[l.id])),
-  );
-
-  const voiceChangedLines = $derived(
-    filteredLines.filter((l) => lineIsRegeneratable(l) && gen[l.id]?.status === "stale"),
-  );
-  const textChangedLines = $derived(
-    filteredLines.filter((l) => {
-      if (!lineIsRegeneratable(l)) return false;
-      const state = gen[l.id];
-      return state?.status === "text_stale" || state?.textChanged === true;
-    }),
-  );
-  function lineHasReadyClone(line: GeneratableLine): boolean {
-    if (line.speaker_id === null) return false;
-    return bindingBySpeaker.get(line.speaker_id)?.clone_status === "ready";
-  }
-  const voiceChangedReadyLines = $derived(voiceChangedLines.filter(lineHasReadyClone));
-  const textChangedReadyLines = $derived(textChangedLines.filter(lineHasReadyClone));
-  const changedLines = $derived(
-    filteredLines.filter((l) => {
-      if (!lineIsRegeneratable(l)) return false;
-      const state = gen[l.id];
-      return state?.status === "stale" || state?.status === "text_stale" || state?.textChanged === true;
-    }),
-  );
-  const changedReadyLines = $derived(changedLines.filter(lineHasReadyClone));
-  const savedFilteredLines = $derived(filteredLines.filter((l) => isPlayableGen(gen[l.id])));
 
   function orphanLineHint(line: GeneratableLine): string | null {
     if (line.status === "blocked") {
@@ -467,15 +377,23 @@
     });
     moreFiltersOpen = true;
   }
-  const prioritizedLines = $derived([...filteredLines].sort((a, b) => Number((diagnostics[b.id]?.flags.length ?? 0) > 0) - Number((diagnostics[a.id]?.flags.length ?? 0))));
-  const pagedLines = $derived(
-    prioritizedLines.slice(linePage * LINE_PAGE_SIZE, (linePage + 1) * LINE_PAGE_SIZE),
-  );
-  // Generation/status refreshes preserve the current page. Reset only when the
-  // user changes filters; Pager clamps if refreshed data removes the last page.
+  // Reset to the first page when filters change. Avoid writing linePage when it is
+  // already 0 — unconditional writes can re-trigger effects every flush.
+  let scopePageKey = $state("");
   $effect(() => {
+    const key = JSON.stringify(scope);
+    if (key === scopePageKey) return;
+    scopePageKey = key;
+    if (linePage !== 0) linePage = 0;
+  });
+
+  $effect(() => {
+    const gameDir = dir;
     void JSON.stringify(scope);
-    linePage = 0;
+    void linePage;
+    if (!gameDir || !cacheHydrated || !filtersHydrated) return;
+    const timer = setTimeout(() => void loadPage(gameDir), 250);
+    return () => clearTimeout(timer);
   });
 
   function toggleScopeValue(key: GenerationScopeArrayKey, value: string, checked: boolean) {
@@ -566,68 +484,92 @@
     }
   }
 
-  // Best-effort scope metadata. Bindings are loaded with critical data (not here)
-  // so we do not double-fetch list_effective_speaker_bindings on every refresh.
-  // A failed auxiliary read never blocks generation; its category simply has fewer
-  // labels/options until Refresh or remount.
   async function loadScopeMetadata() {
     if (!dir) return;
     const token = beginGenerationRequest("metadata");
-    const [speakerResult, groupResult, demographicResult] = await Promise.allSettled([
+    const [speakerResult, groupResult, demographicResult, bindingResult, filterResult] = await Promise.allSettled([
       invoke<Speaker[]>("list_speakers", { gameDir: dir }),
       loadSpeakerGroups(dir),
       invoke<DemographicGroup[]>("list_demographic_groups", { gameDir: dir }),
+      invoke<EffectiveSpeakerBinding[]>("list_effective_speaker_bindings", { gameDir: dir }),
+      invoke<GenerationFilterOptions>("list_generation_filter_options", { gameDir: dir }),
     ]);
     if (!generationRequestIsCurrent(token)) return;
     if (speakerResult.status === "fulfilled") speakers = speakerResult.value;
     if (groupResult.status === "fulfilled") identityGroups = groupResult.value;
     if (demographicResult.status === "fulfilled") demographics = demographicResult.value;
-    setGenerationCache({ speakers, identityGroups, demographics }, token);
+    if (bindingResult.status === "fulfilled") effectiveBindings = bindingResult.value;
+    if (filterResult.status === "fulfilled") {
+      filterDlgs = filterResult.value.dlgs;
+      filterDonors = filterResult.value.donors;
+      filterLineStates = filterResult.value.line_states;
+    }
+    setGenerationCache({ speakers, identityGroups, demographics, effectiveBindings, filterDlgs, filterDonors, filterLineStates }, token);
   }
 
-  /** Explicit Refresh: always reload every domain (bypasses the warm-cache gate). */
   async function refreshLinesAndGenerations() {
-    const critical = refreshCritical();
-    void loadScopeMetadata();
-    await critical;
-    await Promise.all([loadCandidates(), loadDiagnostics()]);
+    await Promise.all([loadPage(dir), loadScopeMetadata()]);
   }
 
-  async function refreshCritical() {
-    if (!dir) return;
+  async function loadPage(gameDir: string | null = dir) {
+    if (!gameDir) return;
     const token = beginGenerationRequest("critical");
     loadingLines = true;
     linesError = null;
     criticalReady = false;
     try {
-      const [nextLines, nextBindings, done] = await Promise.all([
-        invoke<GeneratableLine[]>("list_generatable_lines", { gameDir: dir }),
-        invoke<EffectiveSpeakerBinding[]>("list_effective_speaker_bindings", { gameDir: dir }),
-        invoke<CompletedGeneration[]>("list_completed_generations", { gameDir: dir }),
-      ]);
+      const sessionLineIds = Object.entries(gen)
+        .filter(([, state]) => state.status === "running" || state.status === "failed")
+        .map(([id]) => Number(id));
+      const wantsSession = scope.renderStates.some((state) => state === "running" || state === "failed");
+      const sessionIds = wantsSession
+        ? sessionLineIds.filter((id) => {
+          const state = gen[id]?.status;
+          return (scope.renderStates.includes("running") && state === "running")
+            || (scope.renderStates.includes("failed") && state === "failed");
+        })
+        : [];
+      const result = await invoke<GeneratableLinesPage>("list_generatable_lines_page", {
+        gameDir,
+        scope: toGenerationListScope(scope, sessionIds),
+        offset: linePage * LINE_PAGE_SIZE,
+        limit: LINE_PAGE_SIZE,
+      });
       if (!generationRequestIsCurrent(token)) return;
-      const next: Record<number, GenState> = {};
-      for (const completed of done) {
-        next[completed.line_id] = {
-          status: completed.voice_changed ? "stale" : completed.text_changed ? "text_stale" : "done",
-          textChanged: completed.text_changed,
-          result: { generation_id: 0, output_path: completed.output_path, resumed: true },
+      const next = { ...gen };
+      const diagnosticsNext: Record<number, GenerationDiagnostics> = {};
+      for (const row of result.rows) {
+        if (next[row.line.id]?.status !== "running" && next[row.line.id]?.status !== "failed") {
+          if (row.output_path) {
+            next[row.line.id] = {
+              status: row.voice_changed ? "stale" : row.text_changed ? "text_stale" : "done",
+              textChanged: row.text_changed,
+              result: { generation_id: 0, output_path: row.output_path, resumed: true },
+            };
+          } else {
+            delete next[row.line.id];
+          }
+        }
+        diagnosticsNext[row.line.id] = {
+          duration_secs: 0, voiced_fraction: null, speech_ratio: null, silence_fraction: 0,
+          clipping_fraction: 0, flags: Array(row.diagnostic_flag_count).fill("short"),
         };
       }
-      const bumped = rotateCompletedAudioRevisions(done.map((item) => item.line_id));
-      lines = nextLines;
+      lines = result.rows.map((row) => row.line);
+      lineTotal = result.total;
+      pageSummary = result.summary;
       linesLoaded = true;
-      effectiveBindings = nextBindings;
       gen = next;
-      audioCacheBust = { ...audioCacheBust, ...bumped };
+      diagnostics = diagnosticsNext;
       criticalReady = true;
       setGenerationCache({
-        lines: nextLines,
+        lines,
         linesLoaded: true,
-        effectiveBindings: nextBindings,
+        lineTotal, summary: pageSummary,
         states: next,
-        audioRevisions: audioCacheBust,
+        diagnostics,
       }, token);
+      await Promise.all([loadCandidates(lines.map((line) => line.id)), loadSynthesisPreviews(lines.map((line) => line.id))]);
     } catch (e) {
       if (generationRequestIsCurrent(token)) linesError = String(e);
     } finally {
@@ -635,22 +577,11 @@
     }
   }
 
-  async function loadDiagnostics() {
-    if (!dir) return;
-    const token = beginGenerationRequest("diagnostics");
-    try {
-      const rows = await invoke<GenerationDiagnosticsRow[]>("list_generation_diagnostics", { gameDir: dir });
-      if (!generationRequestIsCurrent(token)) return;
-      diagnostics = Object.fromEntries(rows.map((row) => [row.line_id, row.diagnostics]));
-      setGenerationCache({ diagnostics }, token);
-    } catch { /* retain cached diagnostics */ }
-  }
-
-  async function loadCandidates() {
+  async function loadCandidates(lineIds: number[] = lines.map((line) => line.id)) {
     if (!dir) return;
     const token = beginGenerationRequest("candidates");
     try {
-      const rows = await invoke<RenderCandidate[]>("list_render_candidates", { gameDir: dir });
+      const rows = await invoke<RenderCandidate[]>("list_render_candidates_for_lines", { lineIds });
       if (!generationRequestIsCurrent(token)) return;
       candidates = Object.fromEntries(rows.map((row) => [row.line_id, row]));
       setGenerationCache({ candidates }, token);
@@ -790,31 +721,30 @@
   // per-line synthesis if a batch fails - so this is faster than serial while staying
   // resumable. Respecting the filter lets the user generate just one character's
   // lines. Per-line status is updated from the returned outcomes.
-  type BatchMode = "missing" | "all" | "text_changed" | "voice_changed" | "changed";
+  type BatchMode = "missing" | "all" | "text_changed" | "voice_changed" | "changed" | "saved";
   async function generateAll(mode: BatchMode) {
-    const targets =
-      mode === "missing"
-        ? missingLines
-        : mode === "all"
-          ? readyFilteredLines
-          : mode === "text_changed"
-            ? textChangedReadyLines
-            : mode === "voice_changed"
-              ? voiceChangedReadyLines
-              : changedReadyLines;
+    if (!dir) return;
+    const sessionLineIds = Object.entries(gen)
+      .filter(([, state]) => state.status === "running" || state.status === "failed")
+      .map(([id]) => Number(id));
+    const targets = await invoke<number[]>("list_generatable_line_ids", {
+      gameDir: dir,
+      scope: toGenerationListScope(scope, sessionLineIds),
+      mode,
+    });
     const force = mode !== "missing";
     if (targets.length === 0) return;
     const previous = { ...gen };
     genAll = true;
     cancelling = false;
-    for (const l of targets) stopPlayback(l.id);
+    for (const lineId of targets) stopPlayback(lineId);
     // Reflect the pending batch immediately so every targeted line shows "generating".
     const running: Record<number, GenState> = {};
-    for (const l of targets) running[l.id] = { status: "running" };
+    for (const lineId of targets) running[lineId] = { status: "running" };
     gen = { ...gen, ...running };
     try {
       const res = await invoke<BatchGenResult>("generate_lines_batched", {
-        lineIds: targets.map((l) => l.id),
+        lineIds: targets,
         force,
       });
       const next = { ...gen };
@@ -841,19 +771,19 @@
       audioCacheBust = nextBust;
       // Any targeted line the backend never reported on (e.g. cancelled before its
       // batch ran) falls back from "running" to no state so it can be retried.
-      for (const l of targets) {
-        if (next[l.id]?.status === "running") {
-          if (previous[l.id]) next[l.id] = previous[l.id];
-          else delete next[l.id];
+      for (const lineId of targets) {
+        if (next[lineId]?.status === "running") {
+          if (previous[lineId]) next[lineId] = previous[lineId];
+          else delete next[lineId];
         }
       }
       gen = next;
     } catch (e) {
       const next = { ...gen };
-      for (const l of targets) {
-        if (next[l.id]?.status === "running") {
-          const prior = previous[l.id];
-          next[l.id] = prior && isPlayableGen(prior)
+      for (const lineId of targets) {
+        if (next[lineId]?.status === "running") {
+          const prior = previous[lineId];
+          next[lineId] = prior && isPlayableGen(prior)
             ? { ...prior, error: String(e) }
             : { status: "failed", error: String(e) };
         }
@@ -882,12 +812,22 @@
       const next = { ...gen };
       for (const lineId of lineIds) delete next[lineId];
       gen = next;
-      await refreshCritical();
+      await loadPage();
     } catch (e) {
       linesError = String(e);
     } finally {
       removing = false;
     }
+  }
+
+  async function removeFilteredGenerated() {
+    if (!dir) return;
+    const ids = await invoke<number[]>("list_generatable_line_ids", {
+      gameDir: dir,
+      scope: toGenerationListScope(scope),
+      mode: "saved",
+    });
+    await removeGenerated(ids);
   }
 
   // Cooperatively cancel a running batched generation (stops the NEXT batch; the
@@ -971,38 +911,22 @@
     return synthesisPreviews[lineId];
   }
 
-  async function loadSynthesisPreview(lineId: number) {
-    const existing = synthesisPreviews[lineId];
-    if (existing && existing !== "error") return;
-    synthesisPreviews = { ...synthesisPreviews, [lineId]: "loading" };
-    const gameDir = dir;
+  async function loadSynthesisPreviews(lineIds: number[]) {
+    if (!dir) return;
+    const token = beginGenerationRequest("synthesis");
+    synthesisPreviews = Object.fromEntries(lineIds.map((lineId) => [lineId, "loading"]));
     try {
-      const result = await invoke<SynthesisPreview>("get_line_synthesis_preview", { lineId });
-      if (dir !== gameDir || get(results).gameDir !== gameDir) return;
-      synthesisPreviews = { ...synthesisPreviews, [lineId]: result };
-      setGenerationCache({ synthesisPreviews: {
-        ...get(results).generation.synthesisPreviews,
-        [lineId]: result,
-      } });
+      const rows = await invoke<LineSynthesisPreviewRow[]>("list_line_synthesis_previews", { lineIds });
+      if (!generationRequestIsCurrent(token)) return;
+      synthesisPreviews = Object.fromEntries(rows.map((row) => [row.line_id, row.preview]));
+      setGenerationCache({ synthesisPreviews: synthesisPreviews as Record<number, SynthesisPreview> }, token);
     } catch {
-      synthesisPreviews = { ...synthesisPreviews, [lineId]: "error" };
+      synthesisPreviews = Object.fromEntries(lineIds.map((lineId) => [lineId, "error"]));
     }
   }
 
   async function reloadSynthesisPreview(lineId: number) {
-    synthesisPreviews = { ...synthesisPreviews, [lineId]: "loading" };
-    const gameDir = dir;
-    try {
-      const result = await invoke<SynthesisPreview>("get_line_synthesis_preview", { lineId });
-      if (dir !== gameDir || get(results).gameDir !== gameDir) return;
-      synthesisPreviews = { ...synthesisPreviews, [lineId]: result };
-      setGenerationCache({ synthesisPreviews: {
-        ...get(results).generation.synthesisPreviews,
-        [lineId]: result,
-      } });
-    } catch {
-      synthesisPreviews = { ...synthesisPreviews, [lineId]: "error" };
-    }
+    await loadSynthesisPreviews([lineId]);
   }
 
   async function synthesisChanged(
@@ -1017,14 +941,8 @@
       ...synthesisNotes,
       [lineId]: action === "saved" ? `Override saved.${detail}` : `Override cleared.${detail}`,
     };
-    await Promise.all([reloadSynthesisPreview(lineId), refreshCritical()]);
+    await Promise.all([reloadSynthesisPreview(lineId), loadPage()]);
   }
-
-  $effect(() => {
-    for (const line of pagedLines) {
-      void loadSynthesisPreview(line.id);
-    }
-  });
 
   // Poll the engine status while this screen is mounted so the panel self-heals
   // (e.g. if the engine dies or a start finishes loading the model).
@@ -1042,6 +960,8 @@
       const cached = get(results).generation;
       lines = cached.lines;
       linesLoaded = cached.linesLoaded;
+      lineTotal = cached.lineTotal;
+      pageSummary = cached.summary;
       gen = cached.states;
       diagnostics = cached.diagnostics;
       candidates = cached.candidates;
@@ -1050,37 +970,20 @@
       identityGroups = cached.identityGroups;
       demographics = cached.demographics;
       effectiveBindings = cached.effectiveBindings;
-      linePage = cached.linePage;
+      filterDlgs = cached.filterDlgs;
+      filterDonors = cached.filterDonors;
+      filterLineStates = cached.filterLineStates;
+      linePage = 0;
       lineSettings = cached.lineSettings;
       audioCacheBust = cached.audioRevisions;
       cacheHydrated = true;
 
-      // Warm revisits skip domains whose dirty revision still matches applied.
-      // Mutations on other screens call invalidateGeneration so dirty advances.
-      const needCritical = generationDomainNeedsRefresh("critical");
-      const needMeta = generationDomainNeedsRefresh("metadata");
-      const needCand = generationDomainNeedsRefresh("candidates");
-      const needDiag = generationDomainNeedsRefresh("diagnostics");
-
-      if (needCritical) {
-        criticalReady = false;
-      } else if (cached.linesLoaded) {
-        criticalReady = true;
-        loadingLines = false;
-      } else {
-        criticalReady = false;
-      }
-
-      const criticalWork = needCritical ? refreshCritical() : Promise.resolve();
-      if (needMeta) void loadScopeMetadata();
-      // Candidates/diagnostics are optional chrome — wait for critical paint first.
-      void criticalWork.then(() => {
-        if (needCand) void loadCandidates();
-        if (needDiag) void loadDiagnostics();
-      });
+      // Debounced scope/page effect owns list fetches; only refresh metadata here.
+      if (generationDomainNeedsRefresh("metadata")) void loadScopeMetadata();
     }
   });
 
+  // Persist UI cache without echoing synthesis "loading" placeholders.
   $effect(() => {
     if (!cacheHydrated || !dir) return;
     const previews: Record<number, SynthesisPreview> = {};
@@ -1088,8 +991,8 @@
       if (value !== "loading" && value !== "error") previews[Number(id)] = value;
     }
     setGenerationCache({
-      lines, linesLoaded, states: gen, diagnostics, candidates, synthesisPreviews: previews,
-      speakers, identityGroups, demographics, effectiveBindings, linePage, lineSettings,
+      lines, linesLoaded, lineTotal, summary: pageSummary, states: gen, diagnostics, candidates, synthesisPreviews: previews,
+      speakers, identityGroups, demographics, effectiveBindings, filterDlgs, filterDonors, filterLineStates, linePage, lineSettings,
       audioRevisions: audioCacheBust,
     });
   });
@@ -1099,7 +1002,7 @@
   $effect(() => {
     const busy = blockingOperation !== null;
     if (wasBlocking && !busy && dir) {
-      void refreshCritical();
+      void loadPage();
     }
     wasBlocking = busy;
   });
@@ -1113,7 +1016,7 @@
   $effect(() => {
     const busy = genBusy;
     if (wasGenerationBusy && !busy && dir) {
-      void refreshCritical();
+      void loadPage();
     }
     wasGenerationBusy = busy;
   });
@@ -1299,10 +1202,8 @@
         <h3>
           {#if loadingLines}
             Generatable lines
-          {:else if filteredLines.length !== lines.length}
-            Generatable lines ({filteredLines.length} of {lines.length})
           {:else}
-            Generatable lines ({lines.length})
+            Generatable lines ({lineTotal})
           {/if}
         </h3>
         <Button variant="ghost" onclick={refreshLinesAndGenerations} disabled={loadingLines}>
@@ -1310,22 +1211,22 @@
         </Button>
         <Button
           onclick={() => generateAll("missing")}
-          disabled={!criticalReady || !canGenerate || genBusy || removing || missingLines.length === 0}
+          disabled={!criticalReady || !canGenerate || genBusy || removing || pageSummary.missing === 0}
         >
           {#if genBusy}
             Generating…
           {:else}
-            Generate missing ({missingLines.length})
+            Generate missing ({pageSummary.missing})
           {/if}
         </Button>
         <details class="batch-actions">
           <summary>More batch actions</summary>
           <div class="batch-actions-menu">
-            <Button variant="ghost" onclick={() => generateAll("text_changed")} disabled={!criticalReady || !canGenerate || genBusy || removing || textChangedReadyLines.length === 0}>Re-generate text-changed ({textChangedReadyLines.length})</Button>
-            <Button variant="ghost" onclick={() => generateAll("voice_changed")} disabled={!criticalReady || !canGenerate || genBusy || removing || voiceChangedReadyLines.length === 0}>Re-generate voice-changed ({voiceChangedReadyLines.length})</Button>
-            <Button variant="ghost" onclick={() => generateAll("changed")} disabled={!criticalReady || !canGenerate || genBusy || removing || changedReadyLines.length === 0}>Re-generate all changed ({changedReadyLines.length})</Button>
-            <Button variant="ghost" onclick={() => generateAll("all")} disabled={!criticalReady || !canGenerate || genBusy || removing || readyFilteredLines.length === 0}>Re-generate all ({readyFilteredLines.length})</Button>
-            <Button variant="danger" onclick={() => removeGenerated(savedFilteredLines.map((line) => line.id))} disabled={!criticalReady || genBusy || removing || savedFilteredLines.length === 0}>{removing ? "Removing…" : `Remove filtered generated (${savedFilteredLines.length})`}</Button>
+            <Button variant="ghost" onclick={() => generateAll("text_changed")} disabled={!criticalReady || !canGenerate || genBusy || removing || pageSummary.text_changed_ready === 0}>Re-generate text-changed ({pageSummary.text_changed_ready})</Button>
+            <Button variant="ghost" onclick={() => generateAll("voice_changed")} disabled={!criticalReady || !canGenerate || genBusy || removing || pageSummary.voice_changed_ready === 0}>Re-generate voice-changed ({pageSummary.voice_changed_ready})</Button>
+            <Button variant="ghost" onclick={() => generateAll("changed")} disabled={!criticalReady || !canGenerate || genBusy || removing || pageSummary.changed_ready === 0}>Re-generate all changed ({pageSummary.changed_ready})</Button>
+            <Button variant="ghost" onclick={() => generateAll("all")} disabled={!criticalReady || !canGenerate || genBusy || removing || pageSummary.regeneratable === 0}>Re-generate all ({pageSummary.regeneratable})</Button>
+            <Button variant="danger" onclick={removeFilteredGenerated} disabled={!criticalReady || genBusy || removing || pageSummary.saved === 0}>{removing ? "Removing…" : `Remove filtered generated (${pageSummary.saved})`}</Button>
           </div>
         </details>
         {#if !canGenerate}
@@ -1335,7 +1236,7 @@
         {/if}
       </div>
 
-      {#if lines.length > 0}
+      {#if lineTotal > 0}
         <div class="scope-editor">
           <div class="scope-toolbar">
             <label class="scope-search">
@@ -1346,6 +1247,14 @@
                 bind:value={scope.search}
               />
             </label>
+            <label class="scope-sort">
+              <span>Sort</span>
+              <select aria-label="Sort" bind:value={scope.sort}>
+                {#each generationSortOptions as option (option.key)}
+                  <option value={option.key}>{option.label}</option>
+                {/each}
+              </select>
+            </label>
             <Button
               variant="ghost"
               onclick={() => (moreFiltersOpen = !moreFiltersOpen)}
@@ -1354,7 +1263,7 @@
             >
               {moreFiltersOpen ? "Fewer filters" : "More filters"}{filterCount > 0 ? ` (${filterCount})` : ""}
             </Button>
-            <span class="scope-count">{filteredLines.length} of {lines.length} lines</span>
+            <span class="scope-count">{lineTotal} lines</span>
             {#if filterCount > 0}
               <Button variant="ghost" onclick={() => { scope = emptyGenerationScope(); racesExpanded = false; }}>Clear all</Button>
             {/if}
@@ -1428,15 +1337,18 @@
                 </fieldset>
                 <fieldset>
                   <legend>Line state</legend>
-                  <label><input type="checkbox" checked={scope.lineStates.includes("ready")} onchange={(event) => toggleScopeValue("lineStates", "ready", event.currentTarget.checked)} /> Ready</label>
-                  <label><input type="checkbox" checked={scope.lineStates.includes("exported")} onchange={(event) => toggleScopeValue("lineStates", "exported", event.currentTarget.checked)} /> Exported</label>
-                  <label><input type="checkbox" checked={scope.lineStates.includes("blocked")} onchange={(event) => toggleScopeValue("lineStates", "blocked", event.currentTarget.checked)} /> Blocked</label>
-                  <label><input type="checkbox" checked={scope.lineStates.includes("skipped")} onchange={(event) => toggleScopeValue("lineStates", "skipped", event.currentTarget.checked)} /> Skipped</label>
+                  {#each filterLineStates as state (state)}
+                    <label><input type="checkbox" checked={scope.lineStates.includes(state)} onchange={(event) => toggleScopeValue("lineStates", state, event.currentTarget.checked)} /> {state}</label>
+                  {/each}
                 </fieldset>
                 <fieldset>
                   <legend>Attached pack audio</legend>
                   <label><input type="checkbox" checked={scope.packAudio.includes("absent")} onchange={(event) => toggleScopeValue("packAudio", "absent", event.currentTarget.checked)} /> Absent</label>
                   <label><input type="checkbox" checked={scope.packAudio.includes("present")} onchange={(event) => toggleScopeValue("packAudio", "present", event.currentTarget.checked)} /> Present</label>
+                </fieldset>
+                <fieldset>
+                  <legend>Diagnostics</legend>
+                  <label><input type="checkbox" checked={scope.needsReview} onchange={(event) => (scope = { ...scope, needsReview: event.currentTarget.checked })} /> Needs review</label>
                 </fieldset>
                 <fieldset class="length-filter">
                   <legend>Text length</legend>
@@ -1461,11 +1373,11 @@
         </div>
       {/if}
 
-      {#if orphanClipLines.length > 0}
+      {#if pageSummary.orphan_clips > 0}
         <div class="warn-box" role="status">
-          {orphanClipLines.length} generated clip{orphanClipLines.length === 1 ? " is" : "s are"} on
-          blocked or skipped lines and {orphanClipLines.length === 1 ? "is" : "are"} not included in
-          Re-generate all. Export may still pack {orphanClipLines.length === 1 ? "it" : "them"}.
+          {pageSummary.orphan_clips} generated clip{pageSummary.orphan_clips === 1 ? " is" : "s are"} on
+          blocked or skipped lines and {pageSummary.orphan_clips === 1 ? "is" : "are"} not included in
+          Re-generate all. Export may still pack {pageSummary.orphan_clips === 1 ? "it" : "them"}.
           <button type="button" class="linkish" onclick={showOrphanClips}>Show them</button>
         </div>
       {/if}
@@ -1561,27 +1473,17 @@
         </p>
       {:else if !linesLoaded}
         <p class="hint">Preparing line list…</p>
-      {:else if lines.length === 0}
+      {:else if lineTotal === 0}
         <p class="hint">
           No generatable lines yet. You need an <a href="/attribution">Attribution</a>
           scan, a bound clone on <a href="/binding">Binding</a>, and at least one
           ready line for that speaker. Harvest is only required to create the
           reference clip the clone is built from.
         </p>
-      {:else if filteredLines.length === 0}
-        <p class="hint">
-          No lines match the current filter.
-          <button
-            type="button"
-            class="link"
-            onclick={() => { scope = emptyGenerationScope(); racesExpanded = false; }}
-            >Clear filters</button
-          > to see all {lines.length}.
-        </p>
       {:else}
         {#if charnameLineCount > 0}
           <p class="placeholder-note">
-            {charnameLineCount} line{charnameLineCount === 1 ? "" : "s"} use the
+            {charnameLineCount} line{charnameLineCount === 1 ? "" : "s"} on this page use the
             <code>&lt;CHARNAME&gt;</code> stand-in
             <strong>{effectiveCharnameStandIn}</strong>. The app cannot read your save file, so
             generation speaks that configured name. Set your preferred PC name on
@@ -1590,7 +1492,7 @@
           </p>
         {/if}
         <ul class="lines">
-          {#each pagedLines as line (line.id)}
+          {#each lines as line (line.id)}
             {@const g = gen[line.id]}
             <li class="line">
               <div class="line-main">
@@ -1772,7 +1674,7 @@
             </li>
           {/each}
         </ul>
-        <Pager bind:page={linePage} pageSize={LINE_PAGE_SIZE} total={filteredLines.length} label="lines" />
+        <Pager bind:page={linePage} pageSize={LINE_PAGE_SIZE} total={lineTotal} label="lines" />
       {/if}
     </Card>
   {/if}
@@ -1958,7 +1860,17 @@
     color: var(--text-muted);
     font-size: 0.8rem;
   }
+  .scope-sort {
+    flex: 0 1 12rem;
+    min-width: 9rem;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    color: var(--text-muted);
+    font-size: 0.8rem;
+  }
   .scope-search input,
+  .scope-sort select,
   .length-filter input {
     box-sizing: border-box;
     width: 100%;
@@ -1970,6 +1882,7 @@
     font: inherit;
   }
   .scope-search input:focus,
+  .scope-sort select:focus,
   .length-filter input:focus {
     outline: none;
     border-color: var(--accent);
@@ -2131,15 +2044,6 @@
   }
   .lines-head h3 {
     margin-right: auto;
-  }
-  .link {
-    font: inherit;
-    background: none;
-    border: none;
-    padding: 0;
-    color: var(--accent);
-    cursor: pointer;
-    text-decoration: underline;
   }
   .lines {
     list-style: none;

@@ -11,8 +11,9 @@ use crate::export::manifest::sha256_hex;
 use crate::generator::clone::{validate_decoded, REFERENCE_SAMPLE_RATE};
 use crate::generator::reference::{ResolvedReference, COMPOSITE_JOIN_SILENCE_SECS};
 use crate::models::{
-    BindingSource, DeleteVoiceProfileResult, DesignVoiceAttributes, VoiceProfile,
-    VoiceProfileAvailability, VoiceProfileOrigin, VoiceProfileReference,
+    BindingSource, CloneStatus, DeleteVoiceProfileResult, DesignVoiceAttributes, VoiceProfile,
+    VoiceProfileAvailability, VoiceProfileOrigin, VoiceProfileReference, VoiceProfileUsageCharacter,
+    VoiceProfileUsageEntry, VoiceProfileUsagePool,
 };
 
 fn reference_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<VoiceProfileReference> {
@@ -518,6 +519,196 @@ pub fn delete_profile(
     Ok((result, managed_paths))
 }
 
+fn binding_source_rank(source: BindingSource) -> i32 {
+    match source {
+        BindingSource::Override => 3,
+        BindingSource::Default => 2,
+        BindingSource::Generic => 1,
+        BindingSource::Follow => 0,
+    }
+}
+
+/// Project-wide reverse lookup: which display groups and demographic pools use each
+/// voice profile. Only profiles with at least one character bind or pool membership
+/// are returned (unused profiles are omitted so the payload stays small).
+pub fn list_voice_profile_usage(
+    conn: &Connection,
+    project_id: i64,
+    label_resolver: impl Fn(i64, i64, i64) -> (String, String, String),
+) -> Result<Vec<VoiceProfileUsageEntry>, AppError> {
+    use std::collections::{BTreeMap, HashMap};
+    use crate::db::speaker_groups::{identity_key, is_player_prototype_identity, list_speaker_groups};
+
+    let groups = list_speaker_groups(conn, project_id)?;
+    let mut display_by_key: HashMap<String, String> = HashMap::new();
+    let mut cre_by_key: HashMap<String, String> = HashMap::new();
+    let mut identity_by_speaker: HashMap<i64, String> = HashMap::new();
+    for g in &groups {
+        display_by_key.insert(g.identity_key.clone(), g.display_name.clone());
+        if let Some(first) = g.variants.first() {
+            cre_by_key.insert(g.identity_key.clone(), first.cre_resref.clone());
+        }
+        for v in &g.variants {
+            identity_by_speaker.insert(v.speaker_id, g.identity_key.clone());
+        }
+    }
+
+    #[derive(Clone)]
+    struct Cand {
+        binding_source: BindingSource,
+        clone_status: CloneStatus,
+        cre_resref: String,
+    }
+
+    // profile_id → identity_key → best candidate
+    let mut by_profile: BTreeMap<i64, HashMap<String, Cand>> = BTreeMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT c.voice_profile_id, c.binding_source, c.status, \
+                    s.id, s.cre_resref, s.display_name, s.long_name_strref, s.sex \
+             FROM clone c \
+             JOIN speaker s ON s.id = c.speaker_id \
+             WHERE s.project_id=?1 AND c.voice_profile_id IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![project_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, BindingSource>(1)?,
+                r.get::<_, CloneStatus>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, i64>(7)?,
+            ))
+        })?;
+        for row in rows {
+            let (
+                profile_id,
+                binding_source,
+                clone_status,
+                speaker_id,
+                cre_resref,
+                display_name,
+                long_name_strref,
+                sex,
+            ) = row?;
+            let group_display = display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .unwrap_or(cre_resref.as_str());
+            if is_player_prototype_identity(Some(group_display)) {
+                continue;
+            }
+            let key = identity_by_speaker
+                .get(&speaker_id)
+                .cloned()
+                .unwrap_or_else(|| identity_key(long_name_strref, sex, speaker_id));
+            let cand = Cand {
+                binding_source,
+                clone_status,
+                cre_resref: cre_resref.clone(),
+            };
+            let bucket = by_profile.entry(profile_id).or_default();
+            match bucket.get(&key) {
+                None => {
+                    bucket.insert(key, cand);
+                }
+                Some(existing) => {
+                    let better = binding_source_rank(cand.binding_source)
+                        > binding_source_rank(existing.binding_source)
+                        || (cand.binding_source == existing.binding_source
+                            && cand.clone_status == CloneStatus::Ready
+                            && existing.clone_status != CloneStatus::Ready);
+                    if better {
+                        bucket.insert(key, cand);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut pools_by_profile: BTreeMap<i64, Vec<VoiceProfileUsagePool>> = BTreeMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT mbp.voice_profile_id, mb.sex, mb.race, mb.creature_category \
+             FROM metadata_binding_profile mbp \
+             JOIN metadata_binding mb ON mb.id = mbp.binding_id \
+             WHERE mb.project_id=?1 \
+             ORDER BY mbp.voice_profile_id, mb.sex, mb.race, mb.creature_category",
+        )?;
+        let rows = stmt.query_map(params![project_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (profile_id, sex, race, creature_category) = row?;
+            let (sex_label, race_label, creature_category_label) =
+                label_resolver(sex, race, creature_category);
+            pools_by_profile
+                .entry(profile_id)
+                .or_default()
+                .push(VoiceProfileUsagePool {
+                    sex,
+                    race,
+                    creature_category,
+                    sex_label,
+                    race_label,
+                    creature_category_label,
+                });
+        }
+    }
+
+    let mut profile_ids: std::collections::BTreeSet<i64> = by_profile.keys().copied().collect();
+    profile_ids.extend(pools_by_profile.keys().copied());
+
+    let mut out = Vec::new();
+    for profile_id in profile_ids {
+        let mut characters: Vec<VoiceProfileUsageCharacter> = by_profile
+            .remove(&profile_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(identity_key, cand)| {
+                let display_name = display_by_key
+                    .get(&identity_key)
+                    .cloned()
+                    .unwrap_or_else(|| cand.cre_resref.clone());
+                let cre_resref = cre_by_key
+                    .get(&identity_key)
+                    .cloned()
+                    .unwrap_or(cand.cre_resref);
+                VoiceProfileUsageCharacter {
+                    identity_key,
+                    display_name,
+                    cre_resref,
+                    binding_source: cand.binding_source,
+                    clone_status: cand.clone_status,
+                }
+            })
+            .collect();
+        characters.sort_by(|a, b| {
+            a.display_name
+                .to_ascii_lowercase()
+                .cmp(&b.display_name.to_ascii_lowercase())
+                .then_with(|| a.identity_key.cmp(&b.identity_key))
+        });
+        let pools = pools_by_profile.remove(&profile_id).unwrap_or_default();
+        out.push(VoiceProfileUsageEntry {
+            voice_profile_id: profile_id,
+            character_count: characters.len() as i64,
+            pool_count: pools.len() as i64,
+            characters,
+            pools,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,5 +925,68 @@ mod tests {
             )),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn list_voice_profile_usage_reports_characters_and_pools() {
+        let conn = db();
+        conn.execute(
+            "INSERT INTO speaker(project_id,cre_resref,display_name,long_name_strref,sex,provenance_json) \
+             VALUES(1,'C','Guard',20,1,'{}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO voice_profile(project_id,display_name,origin,availability,created_at,updated_at) \
+             VALUES(1,'Custom','imported','available','now','now'),\
+                    (1,'Unused','imported','available','now','now')",
+            [],
+        )
+        .unwrap();
+        let custom_id = 1i64;
+        let unused_id = 2i64;
+
+        // Speakers 1+2 share identity group; bind both clones to custom profile.
+        conn.execute(
+            "INSERT INTO clone(speaker_id, voice_profile_id, binding_source, status) \
+             VALUES(1,?1,'override','ready'),(2,?1,'override','ready'),(3,?1,'generic','ready')",
+            params![custom_id],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO metadata_binding(project_id,sex,race,creature_category) VALUES(1,1,6,1)",
+            [],
+        )
+        .unwrap();
+        let binding_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO metadata_binding_profile(binding_id,voice_profile_id,sort_order) VALUES(?1,?2,0)",
+            params![binding_id, custom_id],
+        )
+        .unwrap();
+
+        let usage = list_voice_profile_usage(&conn, 1, |sex, race, cat| {
+            (
+                format!("sex{sex}"),
+                format!("race{race}"),
+                format!("cat{cat}"),
+            )
+        })
+        .unwrap();
+        assert!(
+            usage.iter().all(|e| e.voice_profile_id != unused_id),
+            "unused profiles omitted"
+        );
+        let custom = usage
+            .iter()
+            .find(|e| e.voice_profile_id == custom_id)
+            .expect("custom profile usage");
+        // Speakers A+B share identity group "10:0"; Guard is "20:1" → 2 characters.
+        assert_eq!(custom.character_count, 2);
+        assert_eq!(custom.pool_count, 1);
+        assert_eq!(custom.pools[0].sex_label, "sex1");
+        assert!(custom.characters.iter().any(|c| c.display_name == "A"));
+        assert!(custom.characters.iter().any(|c| c.display_name == "Guard"));
     }
 }

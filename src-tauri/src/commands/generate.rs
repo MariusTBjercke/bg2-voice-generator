@@ -1721,6 +1721,124 @@ pub async fn list_generatable_lines(
     }).await
 }
 
+/// Server-paged Generation list: shared scope filter, total count, one page of rows,
+/// and batch-button summary counts (full filtered set, not just the page).
+#[tauri::command]
+pub async fn list_generatable_lines_page(
+    state: State<'_, AppState>,
+    game_dir: String,
+    scope: Option<crate::models::GenerationListScope>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<crate::models::GeneratableLinesPage, AppError> {
+    let scope = scope.unwrap_or_default();
+    let offset = offset.unwrap_or(0);
+    let limit = limit.unwrap_or(100).clamp(1, 200);
+    let db_path = state.db_path();
+    // Recover orphaned files under the writer lock once, then page from a reader.
+    {
+        let conn = state.db.lock().await;
+        let project_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM project WHERE game_root=?1",
+                params![game_dir],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(project_id) = project_id {
+            let workspace = workspace_dir(&db_path, project_id);
+            let _ = recover_orphaned_generation_files(&conn, project_id, &workspace)?;
+        }
+    }
+    let game_dir_for_read = game_dir.clone();
+    run_db_read(&state, move |conn| {
+        let project_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM project WHERE game_root=?1",
+                params![game_dir_for_read],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(project_id) = project_id else {
+            return Ok(crate::models::GeneratableLinesPage {
+                rows: Vec::new(),
+                total: 0,
+                summary: crate::models::GeneratableLinesPageSummary::default(),
+            });
+        };
+        let generated_dir = workspace_dir(&db_path, project_id).join("generated");
+        crate::db::generation_scope::generatable_lines_page(
+            conn,
+            project_id,
+            &scope,
+            offset,
+            limit,
+            Some(generated_dir.as_path()),
+        )
+    })
+    .await
+}
+
+/// ID-only list for batch generate / remove under the current Generation scope.
+#[tauri::command]
+pub async fn list_generatable_line_ids(
+    state: State<'_, AppState>,
+    game_dir: String,
+    scope: Option<crate::models::GenerationListScope>,
+    mode: String,
+) -> Result<Vec<i64>, AppError> {
+    let scope = scope.unwrap_or_default();
+    let mode = crate::db::generation_scope::GenerationBatchIdMode::parse(&mode)?;
+    run_db_read(&state, move |conn| {
+        let project_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM project WHERE game_root=?1",
+                params![game_dir],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(project_id) = project_id else {
+            return Ok(Vec::new());
+        };
+        crate::db::generation_scope::generatable_line_ids(conn, project_id, &scope, mode)
+    })
+    .await
+}
+
+/// Lightweight Generation filter facets (distinct DLGs / donors / line statuses).
+#[tauri::command]
+pub async fn list_generation_filter_options(
+    state: State<'_, AppState>,
+    game_dir: String,
+) -> Result<crate::models::GenerationFilterOptions, AppError> {
+    run_db_read(&state, move |conn| {
+        let project_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM project WHERE game_root=?1",
+                params![game_dir],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(project_id) = project_id else {
+            return Ok(crate::models::GenerationFilterOptions::default());
+        };
+        crate::db::generation_scope::generation_filter_options(conn, project_id)
+    })
+    .await
+}
+
+/// Page-scoped render candidates for the visible Generation lines.
+#[tauri::command]
+pub async fn list_render_candidates_for_lines(
+    state: State<'_, AppState>,
+    line_ids: Vec<i64>,
+) -> Result<Vec<RenderCandidate>, AppError> {
+    run_db_read(&state, move |conn| {
+        crate::db::generation_scope::candidates_for_line_ids(conn, &line_ids)
+    })
+    .await
+}
+
 /// A line that already has a rendered clip on disk, mirrored as `CompletedGeneration`
 /// in `src/lib/types/index.ts`. Lets the generation screen restore its per-line
 /// "generated" status after a tab switch without re-rendering.

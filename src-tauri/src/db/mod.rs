@@ -7,6 +7,7 @@ pub mod binding_audit;
 pub mod export;
 pub mod follow_binding;
 pub mod generation;
+pub mod generation_scope;
 pub mod harvest;
 pub mod metadata_binding;
 pub mod queries;

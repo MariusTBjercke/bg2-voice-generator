@@ -123,7 +123,11 @@ export function setSavedFilter(screen: SimpleFilterScreen, values: FilterValues)
 export function setSavedFilter(screen: FilterScreen, values: FilterValues | GenerationScope): void {
   const saved = screen === "generation"
     ? normalizeGenerationScope(values)
-    : { search: values.search, facets: { ...(values as FilterValues).facets } };
+    : {
+        search: (values as FilterValues).search,
+        facets: { ...(values as FilterValues).facets },
+        ...((values as FilterValues).sort ? { sort: (values as FilterValues).sort } : {}),
+      };
   filterCache.update((c) => ({
     ...c,
     byScreen: { ...c.byScreen, [screen]: saved } as ScreenFilters,

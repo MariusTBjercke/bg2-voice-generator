@@ -3,6 +3,7 @@ import type {
   SampleDecision,
   SampleProvenance,
   SampleScore,
+  SoundResrefUsageEntry,
 } from "$lib/types";
 
 /** Parse `scores_json` on a reference sample; returns null when missing or invalid. */
@@ -151,6 +152,22 @@ export function groupSamplesBySoundResref(
 /** Sample id to bind/preview for a collapsed sound group. */
 export function pickSampleIdForSoundGroup(group: SoundSampleGroup): number {
   return (bestApprovedSampleForBinding(group.siblings) ?? group.representative).id;
+}
+
+/**
+ * Look up project-wide usage for a sound resref (case-insensitive).
+ * Returns null when the sound is missing or used by only one character.
+ */
+export function usageForSound(
+  usageByResref: Map<string, SoundResrefUsageEntry> | Record<string, SoundResrefUsageEntry>,
+  soundResref: string,
+): SoundResrefUsageEntry | null {
+  const key = soundResref.trim().toLowerCase();
+  if (!key) return null;
+  const entry =
+    usageByResref instanceof Map ? usageByResref.get(key) : usageByResref[key];
+  if (!entry || entry.character_count <= 1) return null;
+  return entry;
 }
 
 /**

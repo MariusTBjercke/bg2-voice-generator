@@ -992,6 +992,98 @@ pub struct BlockedLinesPage {
     pub token_total: usize,
 }
 
+/// Filter scope for server-paged Generation list commands (mirrors frontend `GenerationScope`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerationListScope {
+    #[serde(default)]
+    pub search: String,
+    #[serde(default)]
+    pub speakers: Vec<String>,
+    #[serde(default)]
+    pub sexes: Vec<String>,
+    #[serde(default)]
+    pub races: Vec<String>,
+    #[serde(default)]
+    pub creature_categories: Vec<String>,
+    #[serde(default)]
+    pub binding_modes: Vec<String>,
+    #[serde(default)]
+    pub donors: Vec<String>,
+    #[serde(default)]
+    pub dlgs: Vec<String>,
+    #[serde(default)]
+    pub render_states: Vec<String>,
+    #[serde(default)]
+    pub line_states: Vec<String>,
+    #[serde(default)]
+    pub pack_audio: Vec<String>,
+    #[serde(default)]
+    pub min_length: String,
+    #[serde(default)]
+    pub max_length: String,
+    #[serde(default)]
+    pub needs_review: bool,
+    #[serde(default)]
+    pub sort: String,
+    /// Session-only render facets (`running` / `failed`) — client passes known line ids.
+    #[serde(default)]
+    pub session_line_ids: Vec<i64>,
+}
+
+/// One row on a Generation list page (line + clip/diagnostics facets for the UI).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeneratableLinePageRow {
+    pub line: GeneratableLine,
+    pub output_path: Option<String>,
+    pub voice_changed: bool,
+    pub text_changed: bool,
+    pub diagnostic_flag_count: usize,
+    pub has_ready_clone: bool,
+}
+
+/// Batch-button totals under the current Generation scope (full filtered set, not one page).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct GeneratableLinesPageSummary {
+    pub missing: usize,
+    pub voice_changed_ready: usize,
+    pub text_changed_ready: usize,
+    pub changed_ready: usize,
+    pub regeneratable: usize,
+    pub saved: usize,
+    pub orphan_clips: usize,
+}
+
+/// Server-paged Generation list: light total + one page of heavy rows + batch summaries.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeneratableLinesPage {
+    pub rows: Vec<GeneratableLinePageRow>,
+    pub total: usize,
+    pub summary: GeneratableLinesPageSummary,
+}
+
+/// Donor facet for Generation filter dropdowns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GenerationFilterDonorOption {
+    pub value: String,
+    pub label: String,
+}
+
+/// Lightweight Generation filter facets (no full line inventory).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct GenerationFilterOptions {
+    pub dlgs: Vec<String>,
+    pub donors: Vec<GenerationFilterDonorOption>,
+    pub line_states: Vec<String>,
+}
+
+/// One batched synthesis-preview row (`list_line_synthesis_previews`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LineSynthesisPreviewRow {
+    pub line_id: i64,
+    pub preview: SynthesisPreview,
+}
+
 /// A harvested reference clip candidate (`reference_sample`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReferenceSample {
@@ -1273,6 +1365,64 @@ pub struct BindingGroupSummary {
     pub member_cre_resrefs: Vec<String>,
     pub shares_voice: bool,
     pub shared_personal_primary_sample: bool,
+}
+
+/// One display identity group that has a harvested sample for a given sound resref.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SoundResrefUsageCharacter {
+    pub identity_key: String,
+    pub display_name: String,
+    pub cre_resref: String,
+    pub decision: SampleDecision,
+    /// `automatic` / `manual_only`, or null when provenance is missing.
+    pub eligibility: Option<String>,
+    /// True when a ready personal bind (`default`/`override`) uses this sound resref.
+    pub bound: bool,
+    pub sample_id: i64,
+}
+
+/// Project-wide reverse lookup: which characters have / bind a game sound resref.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SoundResrefUsageEntry {
+    pub source_sound_resref: String,
+    /// Distinct display identity groups with any `reference_sample` for this resref.
+    pub character_count: i64,
+    /// Groups whose ready personal bind uses a sample with this resref.
+    pub bound_character_count: i64,
+    pub characters: Vec<SoundResrefUsageCharacter>,
+}
+
+/// One display identity group whose clone points at a voice library profile.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct VoiceProfileUsageCharacter {
+    pub identity_key: String,
+    pub display_name: String,
+    pub cre_resref: String,
+    pub binding_source: BindingSource,
+    pub clone_status: CloneStatus,
+}
+
+/// One demographic pool that includes a voice library profile.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct VoiceProfileUsagePool {
+    pub sex: i64,
+    pub race: i64,
+    pub creature_category: i64,
+    pub sex_label: String,
+    pub race_label: String,
+    pub creature_category_label: String,
+}
+
+/// Project-wide reverse lookup: which characters / pools use a voice profile.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct VoiceProfileUsageEntry {
+    pub voice_profile_id: i64,
+    /// Distinct display identity groups with `clone.voice_profile_id` set to this profile.
+    pub character_count: i64,
+    /// Demographic pools that list this profile.
+    pub pool_count: i64,
+    pub characters: Vec<VoiceProfileUsageCharacter>,
+    pub pools: Vec<VoiceProfileUsagePool>,
 }
 
 /// A generated WeiDU pack export record (`export`).
@@ -1788,6 +1938,107 @@ mod contract_tests {
                 rows: Vec::new(),
                 total: 0,
                 token_total: 0,
+            }),
+        );
+        expect(
+            vec![
+                "search",
+                "speakers",
+                "sexes",
+                "races",
+                "creatureCategories",
+                "bindingModes",
+                "donors",
+                "dlgs",
+                "renderStates",
+                "lineStates",
+                "packAudio",
+                "minLength",
+                "maxLength",
+                "needsReview",
+                "sort",
+                "sessionLineIds",
+            ],
+            keys(&GenerationListScope::default()),
+        );
+        expect(
+            vec![
+                "line",
+                "output_path",
+                "voice_changed",
+                "text_changed",
+                "diagnostic_flag_count",
+                "has_ready_clone",
+            ],
+            keys(&GeneratableLinePageRow {
+                line: GeneratableLine {
+                    id: 0,
+                    project_id: 0,
+                    strref: 0,
+                    dlg_resref: None,
+                    state_index: None,
+                    text: String::new(),
+                    flags: 0,
+                    existing_sound_resref: None,
+                    kind: LineKind::default(),
+                    is_voiced: false,
+                    has_tokens: false,
+                    token_mask: 0,
+                    shared_group_id: None,
+                    speaker_id: None,
+                    attribution_confidence: 0.0,
+                    status: LineStatus::default(),
+                },
+                output_path: None,
+                voice_changed: false,
+                text_changed: false,
+                diagnostic_flag_count: 0,
+                has_ready_clone: false,
+            }),
+        );
+        expect(
+            vec![
+                "missing",
+                "voice_changed_ready",
+                "text_changed_ready",
+                "changed_ready",
+                "regeneratable",
+                "saved",
+                "orphan_clips",
+            ],
+            keys(&GeneratableLinesPageSummary::default()),
+        );
+        expect(
+            vec!["rows", "total", "summary"],
+            keys(&GeneratableLinesPage {
+                rows: Vec::new(),
+                total: 0,
+                summary: GeneratableLinesPageSummary::default(),
+            }),
+        );
+        expect(
+            vec!["value", "label"],
+            keys(&GenerationFilterDonorOption {
+                value: String::new(),
+                label: String::new(),
+            }),
+        );
+        expect(
+            vec!["dlgs", "donors", "line_states"],
+            keys(&GenerationFilterOptions::default()),
+        );
+        expect(
+            vec!["line_id", "preview"],
+            keys(&LineSynthesisPreviewRow {
+                line_id: 0,
+                preview: SynthesisPreview {
+                    display_text: String::new(),
+                    resolved_text: String::new(),
+                    source: SynthesisTextSource::Plain,
+                    shared_line_count: 0,
+                    applied_rules: Vec::new(),
+                    applied_tag_rules: Vec::new(),
+                },
             }),
         );
         expect(
@@ -2358,6 +2609,58 @@ mod contract_tests {
                 "shared_personal_primary_sample",
             ],
             keys(&BindingGroupSummary::default()),
+        );
+        expect(
+            vec![
+                "identity_key",
+                "display_name",
+                "cre_resref",
+                "decision",
+                "eligibility",
+                "bound",
+                "sample_id",
+            ],
+            keys(&SoundResrefUsageCharacter::default()),
+        );
+        expect(
+            vec![
+                "source_sound_resref",
+                "character_count",
+                "bound_character_count",
+                "characters",
+            ],
+            keys(&SoundResrefUsageEntry::default()),
+        );
+        expect(
+            vec![
+                "identity_key",
+                "display_name",
+                "cre_resref",
+                "binding_source",
+                "clone_status",
+            ],
+            keys(&VoiceProfileUsageCharacter::default()),
+        );
+        expect(
+            vec![
+                "sex",
+                "race",
+                "creature_category",
+                "sex_label",
+                "race_label",
+                "creature_category_label",
+            ],
+            keys(&VoiceProfileUsagePool::default()),
+        );
+        expect(
+            vec![
+                "voice_profile_id",
+                "character_count",
+                "pool_count",
+                "characters",
+                "pools",
+            ],
+            keys(&VoiceProfileUsageEntry::default()),
         );
         expect(
             vec![

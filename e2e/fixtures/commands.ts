@@ -31,6 +31,7 @@ import {
   settings,
   speakerGroups,
   speakers,
+  soundResrefUsage,
   synthesisSummary,
   synthesisAuditSummary,
   listSynthesisDecisions,
@@ -43,6 +44,7 @@ import {
   markSynthesisReview,
   unmarkSynthesisReview,
   voiceProfiles,
+  voiceProfileUsage,
   resetSynthesisAgentState,
   resetSynthesisFixtures,
 } from "./data";
@@ -451,16 +453,29 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
       };
       const query = String(arg<string | undefined>(args, "query") ?? "").trim().toLowerCase();
       const reason = String(arg<string | undefined>(args, "reason") ?? "all");
+      const sort = String(arg<string | undefined>(args, "sort") ?? "dlg_state");
       const filtered = blockedLines.filter((line) =>
         (reason === "all" || reasonFor(line) === reason)
         && (!query || [line.strref, `${line.dlg_resref ?? ""}:${line.state_index ?? ""}`, line.text]
           .some((value) => String(value).toLowerCase().includes(query))),
       );
+      const sorted = filtered.slice().sort((a, b) => {
+        const dlgKey = (line: (typeof blockedLines)[number]) =>
+          `${line.dlg_resref ?? ""}\0${String(line.state_index ?? Number.MAX_SAFE_INTEGER).padStart(12, "0")}\0${String(line.strref).padStart(12, "0")}`;
+        switch (sort) {
+          case "strref_asc": return a.strref - b.strref;
+          case "strref_desc": return b.strref - a.strref;
+          case "text_asc": return a.text.localeCompare(b.text, undefined, { sensitivity: "base" }) || dlgKey(a).localeCompare(dlgKey(b));
+          case "text_desc": return b.text.localeCompare(a.text, undefined, { sensitivity: "base" }) || dlgKey(a).localeCompare(dlgKey(b));
+          case "reason": return reasonFor(a).localeCompare(reasonFor(b)) || dlgKey(a).localeCompare(dlgKey(b));
+          default: return dlgKey(a).localeCompare(dlgKey(b));
+        }
+      });
       const offset = Number(arg<number | undefined>(args, "offset") ?? 0);
       const limit = Number(arg<number | undefined>(args, "limit") ?? 100);
       return {
-        rows: filtered.slice(offset, offset + limit),
-        total: filtered.length,
+        rows: sorted.slice(offset, offset + limit),
+        total: sorted.length,
         token_total: blockedLines.filter((line) => reasonFor(line) === "dynamic token").length,
       };
     }
@@ -504,6 +519,11 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
       if (!group) return [];
       const variantIds = new Set(group.variants.map((v) => v.speaker_id));
       return referenceSamples.filter((s) => variantIds.has(s.speaker_id));
+    }
+
+    case "list_sound_resref_usage": {
+      requireGameDir(args);
+      return soundResrefUsage;
     }
 
     case "set_line_synthesis_override": {
@@ -562,9 +582,135 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
       return lines;
     }
 
+    case "list_generatable_lines_page": {
+      requireGameDir(args);
+      const completed = new Set(JSON.parse(localStorage.getItem("e2e.completed-generation-ids") ?? "[]") as number[]);
+      const voiceChanged = new Set(JSON.parse(localStorage.getItem("e2e.voice-changed-generation-ids") ?? "[]") as number[]);
+      const scope = (arg<Record<string, unknown> | undefined>(args, "scope") ?? {}) as Record<string, unknown>;
+      const search = String(scope.search ?? "").trim().toLowerCase();
+      const renderStates = Array.isArray(scope.renderStates) ? scope.renderStates as string[] : [];
+      const lineStates = Array.isArray(scope.lineStates) ? scope.lineStates as string[] : [];
+      const speakers = Array.isArray(scope.speakers) ? scope.speakers as string[] : [];
+      const packAudio = Array.isArray(scope.packAudio) ? scope.packAudio as string[] : [];
+      const needsReview = scope.needsReview === true;
+      const sessionIds = new Set(Array.isArray(scope.sessionLineIds) ? scope.sessionLineIds as number[] : []);
+      const speakerIdSet = new Set<number>();
+      if (speakers.length) {
+        for (const group of speakerGroups) {
+          if (!speakers.includes(group.identity_key) && !speakers.includes(String(group.long_name_strref ?? ""))) continue;
+          for (const variant of group.variants) speakerIdSet.add(variant.speaker_id);
+        }
+        for (const key of speakers) {
+          if (/^\d+$/.test(key)) speakerIdSet.add(Number(key));
+        }
+      }
+      const matching = generatableLines.filter((line) => {
+        const eligible = line.status === "ready" || line.status === "exported" || completed.has(line.id);
+        if (!eligible) return false;
+        const state = sessionIds.has(line.id) ? "failed" : completed.has(line.id)
+          ? (voiceChanged.has(line.id) ? "voice_changed" : "generated")
+          : "missing";
+        const pack = line.is_voiced || line.existing_sound_resref ? "present" : "absent";
+        const flagCount = line.id === 1 || line.strref === 22570 ? 3 : 0;
+        return (!search || `${line.strref} ${line.dlg_resref ?? ""} ${line.text}`.toLowerCase().includes(search))
+          && (!lineStates.length || lineStates.includes(line.status))
+          && (!speakers.length || (line.speaker_id !== null && speakerIdSet.has(line.speaker_id)))
+          && (!packAudio.length || packAudio.includes(pack))
+          && (!needsReview || flagCount > 0)
+          && (!renderStates.length || renderStates.includes(state)
+            || (state === "voice_changed" && renderStates.includes("generated")));
+      }).sort((a, b) => {
+        const dlg = (a.dlg_resref ?? "").localeCompare(b.dlg_resref ?? "");
+        if (dlg !== 0) return dlg;
+        const state = (a.state_index ?? 0) - (b.state_index ?? 0);
+        if (state !== 0) return state;
+        return a.strref - b.strref;
+      });
+      const ready = matching.filter((line) => line.status === "ready" || line.status === "exported");
+      const saved = matching.filter((line) => completed.has(line.id));
+      const orphanClips = matching.filter((line) =>
+        (line.status === "blocked" || line.status === "skipped") && completed.has(line.id),
+      ).length;
+      const offset = Number(arg<number | undefined>(args, "offset") ?? 0);
+      const limit = Number(arg<number | undefined>(args, "limit") ?? 100);
+      const page = {
+        rows: matching.slice(offset, offset + limit).map((line) => ({
+          line,
+          output_path: completed.has(line.id) ? `C:\\fixture\\generated\\${line.id}.ogg` : null,
+          voice_changed: voiceChanged.has(line.id),
+          text_changed: false,
+          diagnostic_flag_count: line.id === 1 || line.strref === 22570 ? 3 : 0,
+          has_ready_clone: true,
+        })),
+        total: matching.length,
+        summary: {
+          missing: ready.filter((line) => !completed.has(line.id)).length,
+          voice_changed_ready: ready.filter((line) => voiceChanged.has(line.id)).length,
+          text_changed_ready: 0,
+          changed_ready: ready.filter((line) => voiceChanged.has(line.id)).length,
+          regeneratable: ready.length,
+          saved: saved.length,
+          orphan_clips: orphanClips,
+        },
+      };
+      return optionallyDelayed("e2e.delay-generatable-ms", page);
+    }
+
+    case "list_generatable_line_ids": {
+      requireGameDir(args);
+      const mode = arg<string>(args, "mode");
+      const completed = new Set(JSON.parse(localStorage.getItem("e2e.completed-generation-ids") ?? "[]") as number[]);
+      const stale = new Set(JSON.parse(localStorage.getItem("e2e.voice-changed-generation-ids") ?? "[]") as number[]);
+      const scope = (arg<Record<string, unknown> | undefined>(args, "scope") ?? {}) as Record<string, unknown>;
+      const speakers = Array.isArray(scope.speakers) ? scope.speakers as string[] : [];
+      const packAudio = Array.isArray(scope.packAudio) ? scope.packAudio as string[] : [];
+      const speakerIdSet = new Set<number>();
+      if (speakers.length) {
+        for (const group of speakerGroups) {
+          if (!speakers.includes(group.identity_key) && !speakers.includes(String(group.long_name_strref ?? ""))) continue;
+          for (const variant of group.variants) speakerIdSet.add(variant.speaker_id);
+        }
+      }
+      const filtered = generatableLines.filter((line) => {
+        const eligible = line.status === "ready" || line.status === "exported" || completed.has(line.id);
+        if (!eligible) return false;
+        if (line.status !== "ready" && line.status !== "exported") return false;
+        if (speakers.length && (line.speaker_id === null || !speakerIdSet.has(line.speaker_id))) return false;
+        const pack = line.is_voiced || line.existing_sound_resref ? "present" : "absent";
+        if (packAudio.length && !packAudio.includes(pack)) return false;
+        return true;
+      });
+      return filtered.filter((line) =>
+        mode === "missing" ? !completed.has(line.id)
+          : mode === "voice_changed" ? stale.has(line.id)
+          : mode === "text_changed" ? false
+          : mode === "changed" ? stale.has(line.id)
+          : mode === "saved" ? completed.has(line.id)
+          : true,
+      ).map((line) => line.id);
+    }
+
+    case "list_generation_filter_options":
+      requireGameDir(args);
+      return {
+        dlgs: [...new Set(generatableLines.flatMap((line) => line.dlg_resref ? [line.dlg_resref] : []))],
+        donors: effectiveBindings.flatMap((binding) => binding.donor_speaker_id === null
+          ? [] : [{ value: String(binding.donor_speaker_id), label: binding.donor_display_name ?? String(binding.donor_speaker_id) }]),
+        line_states: ["ready", "exported", "blocked", "skipped"],
+      };
+
+    case "list_line_synthesis_previews":
+      return arg<number[]>(args, "lineIds").map((lineId) => ({ line_id: lineId, preview: getSynthesisPreview(lineId) }));
+
     case "list_render_candidates":
       requireGameDir(args);
       return JSON.parse(localStorage.getItem("e2e.render-candidates") ?? "[]");
+
+    case "list_render_candidates_for_lines": {
+      const lineIds = new Set(arg<number[]>(args, "lineIds"));
+      return (JSON.parse(localStorage.getItem("e2e.render-candidates") ?? "[]") as Array<{ line_id: number }>)
+        .filter((candidate) => lineIds.has(candidate.line_id));
+    }
 
     case "list_generation_diagnostics":
       requireGameDir(args);
@@ -643,6 +789,10 @@ export function handleMockCommand(cmd: string, args: InvokeArgs): unknown {
     case "list_voice_profiles":
       requireGameDir(args);
       return voiceProfiles;
+
+    case "list_voice_profile_usage":
+      requireGameDir(args);
+      return voiceProfileUsage;
 
     case "select_voice_reference_files":
       return ["C:\\fixture\\imports\\custom-voice.wav"];

@@ -15,6 +15,14 @@ test.describe("Harvest manual-only fallback", () => {
     await expect(page.getByText("No characters match your search.")).toBeVisible();
   });
 
+  test("sorts characters by name", async ({ page }) => {
+    await expect(page.getByLabel("Sort", { exact: true })).toHaveValue("name_asc");
+    const firstAsc = await page.locator(".group-row").first().innerText();
+    await page.getByLabel("Sort", { exact: true }).selectOption("name_desc");
+    const firstDesc = await page.locator(".group-row").first().innerText();
+    expect(firstDesc).not.toEqual(firstAsc);
+  });
+
   test("fills uncovered exact-character voices without changing the safe action", async ({ page }) => {
     await page.getByText("Advanced actions", { exact: true }).click();
     const fallback = page.getByRole("button", { name: "Fill gaps with manual-only" });
@@ -79,5 +87,15 @@ test.describe("Harvest manual-only fallback", () => {
     expect(styles[1].height).toBe(styles[2].height);
     expect(styles[0].fontSize).toBe(styles[1].fontSize);
     expect(styles[1].fontSize).toBe(styles[2].fontSize);
+  });
+
+  test("shows shared sound usage and lists characters", async ({ page }) => {
+    await page.getByRole("button", { name: /Xzar/ }).first().click();
+    await expect(page.getByText("Used by 2 characters")).toBeVisible();
+    await expect(page.getByText("· 1 bound")).toBeVisible();
+    await page.getByRole("button", { name: /Expand characters using sthma06/ }).click();
+    await expect(page.locator(".sound-usage .usage-jump").filter({ hasText: "Montaron" })).toBeVisible();
+    await page.locator(".sound-usage .usage-jump").filter({ hasText: "Montaron" }).click();
+    await expect(page.getByRole("heading", { name: /Montaron/ })).toBeVisible();
   });
 });

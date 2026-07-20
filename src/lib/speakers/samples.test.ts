@@ -7,7 +7,9 @@ import {
   groupSamplesBySoundResref,
   pickSampleIdForSoundGroup,
   sortSamplesByOverallScore,
+  usageForSound,
 } from "./samples";
+import type { SoundResrefUsageEntry } from "$lib/types";
 
 function sample(
   id: number,
@@ -161,5 +163,25 @@ describe("formatSoundSampleOptionLabel", () => {
       }),
     ]);
     expect(pickSampleIdForSoundGroup(groups[0]!)).toBe(1);
+  });
+});
+
+describe("usageForSound", () => {
+  const entry = (count: number): SoundResrefUsageEntry => ({
+    source_sound_resref: "sthma06",
+    character_count: count,
+    bound_character_count: 0,
+    characters: [],
+  });
+
+  it("returns null for singleton or missing sounds", () => {
+    const map = new Map([["sthma06", entry(1)]]);
+    expect(usageForSound(map, "sthma06")).toBeNull();
+    expect(usageForSound(map, "other")).toBeNull();
+  });
+
+  it("matches case-insensitively when shared", () => {
+    const map = new Map([["sthma06", entry(3)]]);
+    expect(usageForSound(map, "STHMA06")?.character_count).toBe(3);
   });
 });

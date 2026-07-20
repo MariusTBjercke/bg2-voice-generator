@@ -18,6 +18,8 @@ export interface DictionaryUiPreferences {
   pronunciationTestText: string;
   tagTestText: string;
   placeholderAdvancedOpen: boolean;
+  pronunciationSort: string;
+  tagSort: string;
 }
 
 export interface BindingPreviewPreferences {
@@ -43,6 +45,7 @@ export interface InstallUiPreferences {
     expandedGroupKey: string | null;
     selectedIdentityKey: string | null;
     demographicSearch: string;
+    demographicSort: string;
     demographicGroupPage: number;
     previewText: string;
     previewA: BindingPreviewPreferences;
@@ -66,6 +69,8 @@ export const defaultDictionaryUiPreferences = (): DictionaryUiPreferences => ({
   pronunciationTestText: "B-b-b-but... I... I... wwaaAAAAHHHH!",
   tagTestText: "Bah! *sigh* This is annoying.",
   placeholderAdvancedOpen: false,
+  pronunciationSort: "find_asc",
+  tagSort: "find_asc",
 });
 
 export const defaultReviewUiPreferences = (): ReviewUiPreferences => ({
@@ -86,6 +91,7 @@ export const defaultInstallUiPreferences = (): InstallUiPreferences => ({
     expandedGroupKey: null,
     selectedIdentityKey: null,
     demographicSearch: "",
+    demographicSort: "label_asc",
     demographicGroupPage: 0,
     previewText: "A fine evening for a little adventure.",
     previewA: { settingsSource: "saved", reference: "single" },
@@ -135,6 +141,8 @@ export function normalizeDictionaryUiPreferences(value: unknown): DictionaryUiPr
     placeholderAdvancedOpen: typeof source.placeholderAdvancedOpen === "boolean"
       ? source.placeholderAdvancedOpen
       : defaults.placeholderAdvancedOpen,
+    pronunciationSort: string(source.pronunciationSort, defaults.pronunciationSort),
+    tagSort: string(source.tagSort, defaults.tagSort),
   };
 }
 
@@ -182,6 +190,7 @@ export function normalizeInstallUiPreferences(value: unknown): InstallUiPreferen
       expandedGroupKey: nullableString(binding.expandedGroupKey),
       selectedIdentityKey: nullableString(binding.selectedIdentityKey),
       demographicSearch: string(binding.demographicSearch),
+      demographicSort: string(binding.demographicSort, defaults.binding.demographicSort),
       demographicGroupPage: nonNegativeInt(
         binding.demographicGroupPage,
         defaults.binding.demographicGroupPage,
