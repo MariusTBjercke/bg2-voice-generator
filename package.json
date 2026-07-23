@@ -1,6 +1,6 @@
 {
   "name": "bg2-voice-generator",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "BG2 Voice Generator - desktop app that scans a BG2EE install, generates missing dialogue voiceovers locally, and exports a native WeiDU voice pack.",
   "private": true,
   "type": "module",

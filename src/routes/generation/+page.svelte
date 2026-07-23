@@ -1236,7 +1236,7 @@
         {/if}
       </div>
 
-      {#if lineTotal > 0}
+      {#if lineTotal > 0 || filterCount > 0}
         <div class="scope-editor">
           <div class="scope-toolbar">
             <label class="scope-search">
@@ -1473,6 +1473,11 @@
         </p>
       {:else if !linesLoaded}
         <p class="hint">Preparing line list…</p>
+      {:else if lineTotal === 0 && filterCount > 0}
+        <p class="hint">
+          No lines match the current filters. Clear search/facets above (or use
+          <strong>Clear all</strong>) to see the full generatable list again.
+        </p>
       {:else if lineTotal === 0}
         <p class="hint">
           No generatable lines yet. You need an <a href="/attribution">Attribution</a>

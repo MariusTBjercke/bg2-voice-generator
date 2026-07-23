@@ -1,6 +1,6 @@
 [package]
 name = "bg2-voice-generator"
-version = "0.2.0"
+version = "0.2.1"
 description = "BG2 Voice Generator"
 edition = "2021"
 # tao -> dlopen2 -> dlopen2_derive ships edition 2024, which only parses on Rust

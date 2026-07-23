@@ -96,6 +96,16 @@ test.describe("Generation screen", () => {
     await expect(page.getByRole("heading", { name: "Generatable lines (104)" })).toBeVisible();
   });
 
+  test("keeps filters and Clear all when sticky scope matches nothing", async ({ page }) => {
+    await page.getByPlaceholder("strref, DLG/state, text, or speaker…").fill("zzz-no-such-line");
+    await expect(page.getByRole("heading", { name: "Generatable lines (0)" })).toBeVisible();
+    await expect(page.getByText("No lines match the current filters.")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Clear all", exact: true })).toBeVisible();
+
+    await page.getByRole("button", { name: "Clear all", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Generatable lines (104)" })).toBeVisible();
+  });
+
   test("defaults to dialogue order and can filter or sort needs-review lines", async ({ page }) => {
     await expect(page.getByLabel("Sort", { exact: true })).toHaveValue("dlg_state");
     // Ready lines only: montdlg (#33001) sorts before xzardlg (#22570).

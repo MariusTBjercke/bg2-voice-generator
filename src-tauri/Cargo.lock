@@ -300,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "bg2-voice-generator"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "log",
